@@ -1,0 +1,982 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Cobalt Desktop - Premium Media Downloader</title>
+  <meta name="description" content="A lightweight, premium Downie-like media downloader built with Tauri v2 and Svelte 5, powered by Cobalt Core. Bypass Electron crashes with a native Rust core.">
+  
+  <!-- Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+  
+  <style>
+    :root {
+      --font-primary: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+      --font-display: 'Outfit', sans-serif;
+      
+      /* Matching app's exact color palette */
+      --bg-app: #070910;
+      --bg-gradient: radial-gradient(circle at 50% -20%, #1e1b4b 0%, #070910 60%);
+      --bg-card: rgba(14, 17, 27, 0.8);
+      --bg-card-hover: rgba(21, 25, 39, 0.9);
+      --bg-input: rgba(3, 5, 10, 0.6);
+      
+      --border-color: rgba(255, 255, 255, 0.08);
+      --border-hover: rgba(255, 255, 255, 0.15);
+      --border-focus: rgba(99, 102, 241, 0.5);
+      
+      --text-primary: #f8fafc;
+      --text-secondary: #94a3b8;
+      --text-muted: #64748b;
+      
+      --accent-primary: #6366f1;
+      --accent-secondary: #4f46e5;
+      --accent-gradient: linear-gradient(135deg, #818cf8 0%, #6366f1 50%, #4f46e5 100%);
+      --success-gradient: linear-gradient(135deg, #34d399 0%, #10b981 100%);
+      --danger-gradient: linear-gradient(135deg, #f87171 0%, #ef4444 100%);
+      
+      --shadow-sm: 0 2px 8px -2px rgba(0, 0, 0, 0.5);
+      --shadow-md: 0 8px 20px -6px rgba(0, 0, 0, 0.6);
+      --shadow-lg: 0 16px 36px -12px rgba(0, 0, 0, 0.7);
+      
+      --radius-sm: 8px;
+      --radius-md: 16px;
+      --radius-lg: 24px;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    html {
+      scroll-behavior: smooth;
+    }
+
+    body {
+      background-color: var(--bg-app);
+      background-image: var(--bg-gradient);
+      color: var(--text-primary);
+      font-family: var(--font-primary);
+      -webkit-font-smoothing: antialiased;
+      overflow-x: hidden;
+      line-height: 1.6;
+    }
+
+    /* Scrollbar */
+    ::-webkit-scrollbar {
+      width: 8px;
+      height: 8px;
+    }
+    ::-webkit-scrollbar-track {
+      background: var(--bg-app);
+    }
+    ::-webkit-scrollbar-thumb {
+      background: rgba(255, 255, 255, 0.1);
+      border-radius: 4px;
+    }
+    ::-webkit-scrollbar-thumb:hover {
+      background: rgba(255, 255, 255, 0.2);
+    }
+
+    /* Layout Containers */
+    header.site-header {
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100%;
+      z-index: 100;
+      background: rgba(7, 9, 16, 0.6);
+      backdrop-filter: blur(12px);
+      border-bottom: 1px solid var(--border-color);
+      transition: background 0.3s;
+    }
+
+    .nav-container {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 1.25rem 2rem;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .logo {
+      font-family: var(--font-display);
+      font-size: 1.5rem;
+      font-weight: 700;
+      letter-spacing: 0.15em;
+      background: var(--accent-gradient);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      text-decoration: none;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+
+    .logo-dot {
+      width: 8px;
+      height: 8px;
+      background: var(--accent-primary);
+      border-radius: 50%;
+      display: inline-block;
+      box-shadow: 0 0 10px var(--accent-primary);
+    }
+
+    .nav-links {
+      display: flex;
+      gap: 2rem;
+      align-items: center;
+      list-style: none;
+    }
+
+    .nav-links a {
+      color: var(--text-secondary);
+      text-decoration: none;
+      font-size: 0.95rem;
+      font-weight: 500;
+      transition: color 0.2s;
+    }
+
+    .nav-links a:hover {
+      color: var(--text-primary);
+    }
+
+    .nav-btn {
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid var(--border-color);
+      padding: 0.5rem 1.25rem;
+      border-radius: var(--radius-sm);
+      color: var(--text-primary) !important;
+      transition: all 0.3s !important;
+    }
+
+    .nav-btn:hover {
+      background: var(--accent-gradient);
+      border-color: transparent;
+      box-shadow: 0 0 15px rgba(99, 102, 241, 0.4);
+    }
+
+    main {
+      padding-top: 80px;
+    }
+
+    .section-container {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 4rem 2rem;
+    }
+
+    /* Hero Section */
+    .hero {
+      text-align: center;
+      position: relative;
+      padding-top: 5rem;
+      padding-bottom: 2rem;
+    }
+
+    .hero-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+      background: rgba(99, 102, 241, 0.1);
+      border: 1px solid rgba(99, 102, 241, 0.2);
+      padding: 0.35rem 1rem;
+      border-radius: 9999px;
+      color: #818cf8;
+      font-size: 0.85rem;
+      font-weight: 600;
+      margin-bottom: 2rem;
+      font-family: var(--font-display);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+
+    .hero h1 {
+      font-family: var(--font-display);
+      font-size: clamp(2.5rem, 5vw, 4.5rem);
+      line-height: 1.15;
+      font-weight: 700;
+      margin-bottom: 1.5rem;
+      letter-spacing: -0.02em;
+    }
+
+    .hero h1 span {
+      background: var(--accent-gradient);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+
+    .hero-subtitle {
+      max-width: 750px;
+      margin: 0 auto 2.5rem auto;
+      color: var(--text-secondary);
+      font-size: clamp(1.1rem, 2vw, 1.25rem);
+      font-weight: 400;
+    }
+
+    .hero-cta {
+      display: flex;
+      justify-content: center;
+      gap: 1rem;
+      margin-bottom: 4rem;
+      flex-wrap: wrap;
+    }
+
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 0.85rem 2rem;
+      border-radius: var(--radius-sm);
+      font-size: 1rem;
+      font-weight: 600;
+      text-decoration: none;
+      transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+      cursor: pointer;
+    }
+
+    .btn-primary {
+      background: var(--accent-gradient);
+      color: white;
+      box-shadow: 0 4px 20px rgba(99, 102, 241, 0.35);
+    }
+
+    .btn-primary:hover {
+      box-shadow: 0 4px 30px rgba(99, 102, 241, 0.55);
+      transform: translateY(-2px);
+    }
+
+    .btn-secondary {
+      background: rgba(255, 255, 255, 0.04);
+      border: 1px solid var(--border-color);
+      color: var(--text-primary);
+    }
+
+    .btn-secondary:hover {
+      background: rgba(255, 255, 255, 0.08);
+      border-color: var(--border-hover);
+      transform: translateY(-2px);
+    }
+
+    /* Mock App Interface Preview */
+    .app-preview-container {
+      perspective: 1000px;
+      margin-bottom: 6rem;
+    }
+
+    .app-window {
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-md);
+      box-shadow: var(--shadow-lg), 0 0 40px rgba(99, 102, 241, 0.1);
+      overflow: hidden;
+      max-width: 880px;
+      margin: 0 auto;
+      transition: transform 0.6s cubic-bezier(0.25, 1, 0.5, 1);
+      backdrop-filter: blur(20px);
+      text-align: left;
+    }
+
+    .app-window:hover {
+      transform: translateY(-5px) rotateX(1deg);
+      border-color: var(--border-hover);
+    }
+
+    /* Window Titlebar */
+    .titlebar {
+      height: 48px;
+      background: rgba(0, 0, 0, 0.2);
+      border-bottom: 1px solid var(--border-color);
+      display: flex;
+      align-items: center;
+      padding: 0 1rem;
+      position: relative;
+    }
+
+    .window-dots {
+      display: flex;
+      gap: 6px;
+    }
+
+    .dot {
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+    }
+
+    .dot-close { background: #ff5f56; }
+    .dot-minimize { background: #ffbd2e; }
+    .dot-maximize { background: #27c93f; }
+
+    .window-title {
+      position: absolute;
+      left: 50%;
+      transform: translateX(-50%);
+      font-size: 0.8rem;
+      letter-spacing: 0.1em;
+      font-weight: 600;
+      color: var(--text-secondary);
+      font-family: var(--font-display);
+    }
+
+    /* App Workspace */
+    .app-layout {
+      display: grid;
+      grid-template-columns: 200px 1fr;
+      height: 480px;
+    }
+
+    .app-sidebar {
+      background: rgba(0, 0, 0, 0.15);
+      border-right: 1px solid var(--border-color);
+      padding: 1.5rem 1rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.5rem;
+    }
+
+    .sidebar-item {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      padding: 0.6rem 0.8rem;
+      border-radius: 6px;
+      font-size: 0.9rem;
+      color: var(--text-secondary);
+      cursor: pointer;
+      font-weight: 500;
+    }
+
+    .sidebar-item.active {
+      background: rgba(99, 102, 241, 0.1);
+      color: var(--text-primary);
+      border-left: 2px solid var(--accent-primary);
+    }
+
+    .sidebar-spacer {
+      flex: 1;
+    }
+
+    .app-content {
+      padding: 1.75rem;
+      display: flex;
+      flex-direction: column;
+      gap: 1.5rem;
+      overflow-y: auto;
+    }
+
+    /* Search/Download input bar */
+    .mock-input-container {
+      display: flex;
+      gap: 0.75rem;
+    }
+
+    .mock-input {
+      flex: 1;
+      background: var(--bg-input);
+      border: 1px solid var(--border-color);
+      padding: 0.75rem 1rem;
+      border-radius: 8px;
+      color: var(--text-secondary);
+      font-size: 0.9rem;
+      display: flex;
+      align-items: center;
+    }
+
+    .mock-btn {
+      background: var(--accent-gradient);
+      color: white;
+      border: none;
+      padding: 0.75rem 1.5rem;
+      border-radius: 8px;
+      font-weight: 600;
+      font-size: 0.9rem;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+
+    /* Task cards */
+    .task-list {
+      display: flex;
+      flex-direction: column;
+      gap: 0.75rem;
+    }
+
+    .task-card {
+      background: rgba(255, 255, 255, 0.02);
+      border: 1px solid var(--border-color);
+      border-radius: 8px;
+      padding: 1rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.5rem;
+      position: relative;
+    }
+
+    .task-header {
+      display: flex;
+      justify-content: space-between;
+      font-size: 0.85rem;
+    }
+
+    .task-title {
+      font-weight: 600;
+      color: var(--text-primary);
+    }
+
+    .task-status {
+      font-weight: 700;
+      text-transform: uppercase;
+      font-size: 0.75rem;
+      padding: 0.1rem 0.4rem;
+      border-radius: 4px;
+      letter-spacing: 0.05em;
+    }
+
+    .status-downloading {
+      background: rgba(99, 102, 241, 0.15);
+      color: #818cf8;
+    }
+
+    .status-completed {
+      background: rgba(16, 185, 129, 0.15);
+      color: #34d399;
+    }
+
+    .task-progress-track {
+      height: 6px;
+      background: rgba(255, 255, 255, 0.05);
+      border-radius: 3px;
+      overflow: hidden;
+    }
+
+    .task-progress-fill {
+      height: 100%;
+      background: var(--accent-gradient);
+      border-radius: 3px;
+      transition: width 0.3s ease;
+    }
+
+    .task-footer {
+      display: flex;
+      justify-content: space-between;
+      font-size: 0.8rem;
+      color: var(--text-secondary);
+    }
+
+    /* Features Section */
+    .section-title {
+      font-family: var(--font-display);
+      font-size: 2.25rem;
+      font-weight: 700;
+      text-align: center;
+      margin-bottom: 1rem;
+    }
+
+    .section-subtitle {
+      color: var(--text-secondary);
+      text-align: center;
+      max-width: 600px;
+      margin: 0 auto 3.5rem auto;
+    }
+
+    .features-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+      gap: 1.5rem;
+      margin-bottom: 4rem;
+    }
+
+    .feature-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      padding: 2.25rem 2rem;
+      border-radius: var(--radius-md);
+      transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+      display: flex;
+      flex-direction: column;
+      gap: 1rem;
+    }
+
+    .feature-card:hover {
+      background: var(--bg-card-hover);
+      border-color: var(--border-hover);
+      transform: translateY(-4px);
+      box-shadow: var(--shadow-md);
+    }
+
+    .feature-icon-wrapper {
+      width: 48px;
+      height: 48px;
+      border-radius: 10px;
+      background: rgba(99, 102, 241, 0.1);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: var(--accent-primary);
+      margin-bottom: 0.5rem;
+    }
+
+    .feature-card h3 {
+      font-family: var(--font-display);
+      font-size: 1.35rem;
+      font-weight: 600;
+    }
+
+    .feature-card p {
+      color: var(--text-secondary);
+      font-size: 0.95rem;
+      line-height: 1.6;
+    }
+
+    /* Architecture / Decoupled Section */
+    .arch-panel {
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-md);
+      padding: 3rem;
+      margin: 4rem 0;
+      display: grid;
+      grid-template-columns: 1.2fr 1fr;
+      gap: 3rem;
+      align-items: center;
+    }
+
+    @media (max-width: 768px) {
+      .arch-panel {
+        grid-template-columns: 1fr;
+        padding: 2rem;
+      }
+    }
+
+    .arch-details h2 {
+      font-family: var(--font-display);
+      font-size: 2rem;
+      margin-bottom: 1.25rem;
+    }
+
+    .arch-details p {
+      color: var(--text-secondary);
+      margin-bottom: 1.5rem;
+      font-size: 1rem;
+    }
+
+    .arch-details ul {
+      list-style: none;
+      display: flex;
+      flex-direction: column;
+      gap: 0.75rem;
+    }
+
+    .arch-details li {
+      display: flex;
+      align-items: flex-start;
+      gap: 0.75rem;
+      font-size: 0.95rem;
+      color: var(--text-secondary);
+    }
+
+    .arch-details li::before {
+      content: "✓";
+      color: #34d399;
+      font-weight: bold;
+    }
+
+    /* Visual architecture schema drawing */
+    .arch-schema {
+      display: flex;
+      flex-direction: column;
+      gap: 1.5rem;
+      background: rgba(0, 0, 0, 0.2);
+      border: 1px solid var(--border-color);
+      padding: 2rem;
+      border-radius: var(--radius-sm);
+    }
+
+    .schema-node {
+      border: 1px solid var(--border-color);
+      border-radius: 8px;
+      padding: 1rem;
+      text-align: center;
+      background: rgba(255, 255, 255, 0.02);
+      transition: all 0.3s;
+    }
+
+    .schema-node:hover {
+      border-color: var(--accent-primary);
+      background: rgba(99, 102, 241, 0.05);
+    }
+
+    .schema-node-title {
+      font-weight: 700;
+      font-size: 0.9rem;
+      margin-bottom: 0.25rem;
+      color: var(--text-primary);
+    }
+
+    .schema-node-desc {
+      font-size: 0.75rem;
+      color: var(--text-secondary);
+    }
+
+    .schema-arrow {
+      text-align: center;
+      color: var(--text-muted);
+      font-size: 0.85rem;
+      font-weight: 600;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      gap: 0.5rem;
+    }
+
+    .schema-arrow::before, .schema-arrow::after {
+      content: "";
+      height: 1px;
+      background: var(--border-color);
+      flex: 1;
+    }
+
+    /* CTA Section */
+    .cta-banner {
+      background: linear-gradient(135deg, rgba(99, 102, 241, 0.15) 0%, rgba(79, 70, 229, 0.05) 100%);
+      border: 1px solid rgba(99, 102, 241, 0.2);
+      border-radius: var(--radius-md);
+      padding: 4rem 2rem;
+      text-align: center;
+      margin-bottom: 4rem;
+    }
+
+    .cta-banner h2 {
+      font-family: var(--font-display);
+      font-size: 2.25rem;
+      font-weight: 700;
+      margin-bottom: 1rem;
+    }
+
+    .cta-banner p {
+      color: var(--text-secondary);
+      max-width: 600px;
+      margin: 0 auto 2.5rem auto;
+      font-size: 1.1rem;
+    }
+
+    /* Footer */
+    footer {
+      border-top: 1px solid var(--border-color);
+      padding: 3rem 2rem;
+      background: rgba(3, 5, 10, 0.5);
+    }
+
+    .footer-container {
+      max-width: 1200px;
+      margin: 0 auto;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 1.5rem;
+      font-size: 0.9rem;
+      color: var(--text-muted);
+    }
+
+    .footer-links {
+      display: flex;
+      gap: 1.5rem;
+      list-style: none;
+    }
+
+    .footer-links a {
+      color: var(--text-secondary);
+      text-decoration: none;
+      transition: color 0.2s;
+    }
+
+    .footer-links a:hover {
+      color: var(--text-primary);
+    }
+
+    /* SVG icons helper */
+    .icon {
+      width: 20px;
+      height: 20px;
+      stroke-width: 2;
+      stroke: currentColor;
+      fill: none;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+      display: inline-block;
+      vertical-align: middle;
+    }
+
+    /* Animations styling */
+    @keyframes progressPulse {
+      0% { opacity: 0.9; }
+      50% { opacity: 0.6; }
+      100% { opacity: 0.9; }
+    }
+
+    .pulse {
+      animation: progressPulse 2s infinite ease-in-out;
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Top Navigation Header -->
+  <header class="site-header">
+    <div class="nav-container">
+      <a href="#" class="logo">
+        COBALT <span class="logo-dot"></span>
+      </a>
+      <nav>
+        <ul class="nav-links">
+          <li><a href="#features">Features</a></li>
+          <li><a href="#architecture">Architecture</a></li>
+          <li><a href="#open-source">Open Source</a></li>
+          <li><a href="https://github.com/kresnikwang/cobalt-tauri-app" class="nav-btn" target="_blank">View GitHub</a></li>
+        </ul>
+      </nav>
+    </div>
+  </header>
+
+  <!-- Main Website Content -->
+  <main>
+    
+    <!-- Hero Section -->
+    <section class="section-container hero">
+      <div class="hero-badge">
+        <span style="display:inline-block; width:6px; height:6px; background:#10b981; border-radius:50%; box-shadow: 0 0 8px #10b981;"></span>
+        Coming Soon to GitHub
+      </div>
+      <h1>Lightweight Media Downloader<br><span>Powered by Tauri + Svelte 5</span></h1>
+      <p class="hero-subtitle">
+        A premium, high-performance desktop application decoupled into a compiled Rust core for system tasks and a glassmorphic WebKit UI. Bypasses Electron memory crashes on macOS.
+      </p>
+      
+      <div class="hero-cta">
+        <a href="#open-source" class="btn btn-primary" id="cta-download">
+          <svg class="icon" style="margin-right: 0.5rem;" viewBox="0 0 24 24"><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2 -2v-2" /><path d="M7 11l5 5l5 -5" /><path d="M12 4l0 12" /></svg>
+          Get Desktop App
+        </a>
+        <a href="https://github.com/kresnikwang/cobalt-tauri-app" class="btn btn-secondary" target="_blank" id="cta-github">
+          <svg class="icon" style="margin-right: 0.5rem;" viewBox="0 0 24 24"><path d="M9 19c-4.3 1.4 -4.3 -2.5 -6 -3m12 5v-3.5c0 -1 .1 -1.4 -.5 -2c2.8 -.3 5.5 -1.4 5.5 -6a4.6 4.6 0 0 0 -1.3 -3.2a4.2 4.2 0 0 0 -.1 -3.2s-1.1 -.3 -3.5 1.3a12.3 12.3 0 0 0 -6.2 0c-2.4 -1.6 -3.5 -1.3 -3.5 -1.3a4.2 4.2 0 0 0 -.1 3.2a4.6 4.6 0 0 0 -1.3 3.2c0 4.6 2.7 5.7 5.5 6c-.6 .6 -.6 1.2 -.5 2v3.5" /></svg>
+          Explore Source
+        </a>
+      </div>
+
+      <!-- Simulated Desktop App Window Frame Mockup -->
+      <div class="app-preview-container">
+        <div class="app-window">
+          <!-- Window Header bar -->
+          <div class="titlebar">
+            <div class="window-dots">
+              <div class="dot dot-close"></div>
+              <div class="dot dot-minimize"></div>
+              <div class="dot dot-maximize"></div>
+            </div>
+            <div class="window-title">COBALT DESKTOP</div>
+          </div>
+          <!-- Window layout -->
+          <div class="app-layout">
+            <!-- Sidebar -->
+            <div class="app-sidebar">
+              <div class="sidebar-item active">
+                <svg class="icon" viewBox="0 0 24 24"><path d="M20 11a8.1 8.1 0 0 0 -6.4 -6.4" /><path d="M20 15a8.1 8.1 0 0 1 -12.6 3.2" /><path d="M4 13a8.1 8.1 0 0 1 12.6 -10.2" /><path d="M4 9a8.1 8.1 0 0 0 6.4 6.4" /><path d="M12 8l0 4l2 2" /></svg>
+                Home
+              </div>
+              <div class="sidebar-item">
+                <svg class="icon" viewBox="0 0 24 24"><path d="M19 11h-12m12 0a2 2 0 0 1 2 2v6a2 2 0 0 1 -2 2h-12a2 2 0 0 1 -2 -2v-6a2 2 0 0 1 2 -2m0 0V5a2 2 0 0 1 2 -2h6a2 2 0 0 1 2 2v6" /></svg>
+                Remuxer
+              </div>
+              <div class="sidebar-spacer"></div>
+              <div class="sidebar-item">
+                <svg class="icon" viewBox="0 0 24 24"><path d="M10.325 4.317c.426 -1.756 2.924 -1.756 3.35 0a1.724 1.724 0 0 0 2.573 1.066c1.543 -.94 3.31 .826 2.37 2.37a1.724 1.724 0 0 0 1.065 2.572c1.756 .426 1.756 2.924 0 3.35a1.724 1.724 0 0 0 -1.066 2.573c.94 1.543 -.826 3.31 -2.37 2.37a1.724 1.724 0 0 0 -2.572 1.065c-.426 1.756 -2.924 1.756 -3.35 0a1.724 1.724 0 0 0 -2.573 -1.066c-1.543 .94 -3.31 -.826 -2.37 -2.37a1.724 1.724 0 0 0 -1.065 -2.572c-1.756 -.426 -1.756 -2.924 0 -3.35a1.724 1.724 0 0 0 1.066 -2.573c-.94 -1.543 .826 -3.31 2.37 -2.37c1 .608 2.296 .07 2.572 -1.065z" /><path d="M9 12a3 3 0 1 0 6 0a3 3 0 0 0 -6 0" /></svg>
+                Preferences
+              </div>
+            </div>
+            <!-- Main panel contents -->
+            <div class="app-content">
+              <!-- Search bar -->
+              <div class="mock-input-container">
+                <div class="mock-input">
+                  <span style="font-family: monospace; opacity: 0.8;">https://www.youtube.com/watch?v=dQw4w9WgXcQ</span>
+                </div>
+                <button class="mock-btn">
+                  <svg class="icon" viewBox="0 0 24 24"><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2 -2v-2" /><path d="M7 11l5 5l5 -5" /><path d="M12 4l0 12" /></svg>
+                  Analyze
+                </button>
+              </div>
+
+              <!-- Task list -->
+              <div class="task-list">
+                <!-- Task 1 (Active download) -->
+                <div class="task-card">
+                  <div class="task-header">
+                    <span class="task-title">YouTube - Dynamic Svelte 5 Rune Design & Basics</span>
+                    <span class="task-status status-downloading">Downloading</span>
+                  </div>
+                  <div class="task-progress-track">
+                    <div class="task-progress-fill" style="width: 68%;"></div>
+                  </div>
+                  <div class="task-footer">
+                    <span>68% · 128 MB / 188 MB</span>
+                    <span class="pulse" style="color:#818cf8; font-weight:600;">14.2 MB/s · ETA 00:04</span>
+                  </div>
+                </div>
+
+                <!-- Task 2 (Completed task) -->
+                <div class="task-card">
+                  <div class="task-header">
+                    <span class="task-title">Vimeo - High Performance Rust Compiler Optimization Tutorial</span>
+                    <span class="task-status status-completed">Completed</span>
+                  </div>
+                  <div class="task-progress-track">
+                    <div class="task-progress-fill" style="width: 100%; background: var(--success-gradient);"></div>
+                  </div>
+                  <div class="task-footer">
+                    <span>100% · 42.5 MB · Completed</span>
+                    <span style="color:#10b981; font-weight:600;">Finished</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Detailed Features Section -->
+    <section id="features" class="section-container" style="border-top: 1px solid var(--border-color);">
+      <h2 class="section-title">Engineered for Desktop Excellence</h2>
+      <p class="section-subtitle">A modern toolkit designed specifically to overcome Webview limitations, with premium Native optimizations built right in.</p>
+      
+      <div class="features-grid">
+        <!-- Feature 1 -->
+        <div class="feature-card">
+          <div class="feature-icon-wrapper">
+            <svg class="icon" viewBox="0 0 24 24"><path d="M3 19l18 0" /><path d="M5 6v13" /><path d="M19 6v13" /><path d="M5 8h14" /><path d="M8 12h8" /></svg>
+          </div>
+          <h3>macOS ARM64 Stability</h3>
+          <p>Specifically tuned for modern macOS targets. Spawning a compiled Rust core bypasses Electron's V8 CodeRange virtual memory crashes (prevalent on ARM64 macOS machines with 64KB pages).</p>
+        </div>
+
+        <!-- Feature 2 -->
+        <div class="feature-card">
+          <div class="feature-icon-wrapper">
+            <svg class="icon" viewBox="0 0 24 24"><path d="M12 4l0 12" /><path d="M7 11l5 5l5 -5" /><path d="M4 20l16 0" /></svg>
+          </div>
+          <h3>Native Rust Downloader</h3>
+          <p>Tauri Rust processes manage the actual multi-threaded scheduler and download pipelines natively. Progress updates and download speeds are sent cleanly via zero-lag IPC events.</p>
+        </div>
+
+        <!-- Feature 3 -->
+        <div class="feature-card">
+          <div class="feature-icon-wrapper">
+            <svg class="icon" viewBox="0 0 24 24"><path d="M8 19m-2 0a2 2 0 1 0 4 0a2 2 0 1 0 -4 0" /><path d="M18 19m-2 0a2 2 0 1 0 4 0a2 2 0 1 0 -4 0" /><path d="M2 5h2l2 9a2 2 0 0 0 2 1.5h10a2 2 0 0 0 2 -1.5l1.5 -7h-16.5" /></svg>
+          </div>
+          <h3>Clipboard Link Monitor</h3>
+          <p>Includes a background thread loop that monitors the system clipboard. When a video/audio link is copied, a premium toast slides up inside the application so you can download in one click.</p>
+        </div>
+
+        <!-- Feature 4 -->
+        <div class="feature-card">
+          <div class="feature-icon-wrapper">
+            <svg class="icon" viewBox="0 0 24 24"><path d="M19 11h-12m12 0a2 2 0 0 1 2 2v6a2 2 0 0 1 -2 2h-12a2 2 0 0 1 -2 -2v-6a2 2 0 0 1 2 -2m0 0V5a2 2 0 0 1 2 -2h6a2 2 0 0 1 2 2v6" /></svg>
+          </div>
+          <h3>FFmpeg Remux Tool</h3>
+          <p>Includes a dedicated Remuxing utility view. Drag and drop local audio or video files to repackage them instantly into MP4, WebM, MKV, MP3, etc. with zero re-encoding times.</p>
+        </div>
+
+        <!-- Feature 5 -->
+        <div class="feature-card">
+          <div class="feature-icon-wrapper">
+            <svg class="icon" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 18 0a9 9 0 0 0 -18 0" /><path d="M12 7v5l3 3" /></svg>
+          </div>
+          <h3>Smart Fallbacks & Proxies</h3>
+          <p>Configured with InnerTube fallback mechanisms for smooth YouTube downloads, and complete support for HTTP proxies (e.g. Clash, Clash Verge) to access restricted content.</p>
+        </div>
+
+        <!-- Feature 6 -->
+        <div class="feature-card">
+          <div class="feature-icon-wrapper">
+            <svg class="icon" viewBox="0 0 24 24"><path d="M12 22c5.523 0 10 -4.477 10 -10s-4.477 -10 -10 -10s-10 4.477 -10 10s4.477 10 10 10z" /><path d="M12 18.5v-13" /><path d="M8.5 9h7" /></svg>
+          </div>
+          <h3>Multilingual Interface</h3>
+          <p>Fully translated into English, Chinese (中文), and Russian (Русский). The app dynamically changes language terms instantly using Svelte 5 dynamic translation store.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- Architecture Section -->
+    <section id="architecture" class="section-container" style="border-top: 1px solid var(--border-color);">
+      <div class="arch-panel">
+        <div class="arch-details">
+          <h2>Decoupled & Clean Architecture</h2>
+          <p>Electron apps run backend node logic inside browser contexts. Cobalt Desktop takes a native, sandboxed approach by segregating responsibilities:</p>
+          <ul>
+            <li><strong>Svelte 5 Runes Viewport</strong>: A minimal, highly performant Webview layer rendering interactive reactive state without accessing system storage.</li>
+            <li><strong>Tauri Rust Core Scheduler</strong>: Coordinates downloading buffers, settings write/read, folder picker window dialogs, and subprocess health monitoring.</li>
+            <li><strong>Local Cobalt API Subprocess</strong>: Rust launches an independent Node.js Cobalt API instance on port 47301, automatically killing it on exit.</li>
+          </ul>
+        </div>
+        <div class="arch-schema">
+          <div class="schema-node">
+            <div class="schema-node-title">Svelte 5 Frontend</div>
+            <div class="schema-node-desc">Renders interface, emits user action events</div>
+          </div>
+          <div class="schema-arrow">IPC / tauri::invoke</div>
+          <div class="schema-node" style="border-color: #818cf8;">
+            <div class="schema-node-title">Rust Backend (lib.rs)</div>
+            <div class="schema-node-desc">Manages downloader scheduler, task queue, clipboard loops</div>
+          </div>
+          <div class="schema-arrow">Spawns Child Process / std::process::Command</div>
+          <div class="schema-node">
+            <div class="schema-node-title">Cobalt Node.js API (Port 47301)</div>
+            <div class="schema-node-desc">Resolves streaming tokens and handles content scraping</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- GitHub Release Section / CTA -->
+    <section id="open-source" class="section-container">
+      <div class="cta-banner">
+        <h2>Open Source Release Coming Soon</h2>
+        <p>
+          We are polishing the remaining distribution profiles (Apple Developer signing validation). The project will be fully open-sourced under the MIT license, and compile artifacts will be released publicly right on GitHub.
+        </p>
+        <div style="display: flex; gap: 1rem; justify-content: center; flex-wrap: wrap;">
+          <a href="https://github.com/kresnikwang/cobalt-tauri-app" class="btn btn-primary" target="_blank">
+            <svg class="icon" style="margin-right: 0.5rem;" viewBox="0 0 24 24"><path d="M9 19c-4.3 1.4 -4.3 -2.5 -6 -3m12 5v-3.5c0 -1 .1 -1.4 -.5 -2c2.8 -.3 5.5 -1.4 5.5 -6a4.6 4.6 0 0 0 -1.3 -3.2a4.2 4.2 0 0 0 -.1 -3.2s-1.1 -.3 -3.5 1.3a12.3 12.3 0 0 0 -6.2 0c-2.4 -1.6 -3.5 -1.3 -3.5 -1.3a4.2 4.2 0 0 0 -.1 3.2a4.6 4.6 0 0 0 -1.3 3.2c0 4.6 2.7 5.7 5.5 6c-.6 .6 -.6 1.2 -.5 2v3.5" /></svg>
+            Star on GitHub
+          </a>
+          <a href="#features" class="btn btn-secondary">Learn Features</a>
+        </div>
+      </div>
+    </section>
+
+  </main>
+
+  <!-- Footer Section -->
+  <footer>
+    <div class="footer-container">
+      <div>
+        <p>© 2026 Cobalt Desktop Client. Under MIT License.</p>
+        <p style="font-size: 0.75rem; margin-top: 0.25rem;">This site is hosted on GitHub Pages.</p>
+      </div>
+      <ul class="footer-links">
+        <li><a href="https://github.com/kresnikwang/cobalt-tauri-app" target="_blank">Repository</a></li>
+        <li><a href="https://github.com/imputnet/cobalt" target="_blank">Cobalt Core</a></li>
+      </ul>
+    </div>
+  </footer>
+
+</body>
+</html>
