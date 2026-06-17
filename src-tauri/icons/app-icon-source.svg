@@ -1,0 +1,73 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="174" y1="90" x2="850" y2="934" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#1b2330"/>
+      <stop offset="0.48" stop-color="#07111d"/>
+      <stop offset="1" stop-color="#03070d"/>
+    </linearGradient>
+    <radialGradient id="cyanGlow" cx="322" cy="260" r="600" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#35e7ff" stop-opacity="0.72"/>
+      <stop offset="0.42" stop-color="#1187ff" stop-opacity="0.28"/>
+      <stop offset="1" stop-color="#1187ff" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="coralGlow" cx="750" cy="300" r="430" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ff6b57" stop-opacity="0.45"/>
+      <stop offset="1" stop-color="#ff6b57" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="glass" x1="280" y1="188" x2="744" y2="836" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#62f3ff"/>
+      <stop offset="0.48" stop-color="#188dff"/>
+      <stop offset="1" stop-color="#1c3fff"/>
+    </linearGradient>
+    <linearGradient id="glassShade" x1="330" y1="210" x2="720" y2="820" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.62"/>
+      <stop offset="0.34" stop-color="#ffffff" stop-opacity="0.14"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0.03"/>
+    </linearGradient>
+    <linearGradient id="arrow" x1="512" y1="300" x2="512" y2="716" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#efffff"/>
+      <stop offset="0.55" stop-color="#aef7ff"/>
+      <stop offset="1" stop-color="#32c8ff"/>
+    </linearGradient>
+    <filter id="softShadow" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="30" stdDeviation="38" flood-color="#000000" flood-opacity="0.48"/>
+      <feDropShadow dx="0" dy="5" stdDeviation="8" flood-color="#6df3ff" flood-opacity="0.22"/>
+    </filter>
+    <filter id="innerGlow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="16" result="blur"/>
+      <feColorMatrix in="blur" type="matrix" values="0 0 0 0 0.3 0 0 0 0 0.95 0 0 0 0 1 0 0 0 0.65 0"/>
+      <feBlend in2="SourceGraphic" mode="screen"/>
+    </filter>
+    <clipPath id="clip">
+      <rect x="64" y="64" width="896" height="896" rx="206"/>
+    </clipPath>
+  </defs>
+
+  <rect width="1024" height="1024" fill="#03070d"/>
+  <rect x="64" y="64" width="896" height="896" rx="206" fill="url(#bg)"/>
+  <g clip-path="url(#clip)">
+    <rect x="64" y="64" width="896" height="896" fill="url(#cyanGlow)"/>
+    <rect x="64" y="64" width="896" height="896" fill="url(#coralGlow)"/>
+    <circle cx="236" cy="826" r="250" fill="#2fe6ff" opacity="0.09"/>
+    <circle cx="820" cy="170" r="185" fill="#ff765c" opacity="0.12"/>
+    <path d="M139 237c136-86 323-111 501-55 142 45 237 134 284 246" fill="none" stroke="#ffffff" stroke-width="2" opacity="0.16"/>
+  </g>
+
+  <rect x="75" y="75" width="874" height="874" rx="196" fill="none" stroke="#ffffff" stroke-opacity="0.12" stroke-width="3"/>
+
+  <g filter="url(#softShadow)">
+    <path d="M282 379c0-76 62-138 138-138h184c76 0 138 62 138 138v266c0 76-62 138-138 138H420c-76 0-138-62-138-138V379z" fill="#06131f" opacity="0.58"/>
+    <path d="M309 377c0-61 49-110 110-110h186c61 0 110 49 110 110v270c0 61-49 110-110 110H419c-61 0-110-49-110-110V377z" fill="url(#glass)" opacity="0.94"/>
+    <path d="M329 378c0-49 40-89 89-89h188c49 0 89 40 89 89v268c0 49-40 89-89 89H418c-49 0-89-40-89-89V378z" fill="url(#glassShade)"/>
+    <path d="M348 343c40-36 85-42 136-42h126c43 0 71 26 82 61" fill="none" stroke="#ffffff" stroke-width="19" stroke-linecap="round" opacity="0.36"/>
+    <path d="M590 485 445 400c-24-14-54 3-54 31v170c0 28 30 45 54 31l145-85c24-14 24-48 0-62z" fill="#06131f" opacity="0.42"/>
+  </g>
+
+  <g filter="url(#innerGlow)">
+    <path d="M512 313c34 0 62 28 62 62v173h61c26 0 39 31 21 49L535 718c-13 13-33 13-46 0L368 597c-18-18-5-49 21-49h61V375c0-34 28-62 62-62z" fill="url(#arrow)"/>
+    <path d="M512 336c21 0 39 17 39 39v229h66L512 709 407 604h66V375c0-22 18-39 39-39z" fill="#ffffff" opacity="0.22"/>
+  </g>
+
+  <path d="M318 280c43-47 107-77 179-77 109 0 200 68 231 162" fill="none" stroke="#66f1ff" stroke-width="19" stroke-linecap="round" opacity="0.56"/>
+  <path d="M695 720c-45 62-116 101-196 101-106 0-197-68-230-163" fill="none" stroke="#ff725f" stroke-width="17" stroke-linecap="round" opacity="0.7"/>
+</svg>
