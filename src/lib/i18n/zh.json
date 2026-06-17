@@ -17,6 +17,13 @@
     "empty.title": "暂无下载",
     "empty.subtitle": "在上方粘贴链接、拖放链接到此处，或复制链接到剪贴板。",
     "empty.sources": "支持的平台",
+    "home.save_to": "保存到",
+    "home.youtube_local": "YouTube 本地优先",
+    "platform.capability.local_first": "本地优先",
+    "platform.capability.cookie_hd": "高清解析",
+    "platform.capability.audio": "音频稳定",
+    "platform.capability.server_assist": "服务端辅助",
+    "platform.capability.basic": "基础支持",
 
     "task.status.queued": "排队中",
     "task.status.analyzing": "解析中",
@@ -69,6 +76,11 @@
     "settings.audio.opus": "Opus",
 
     "service.unknown": "网络媒体",
+    "error.youtube_cookies": "YouTube 登录状态已过期，请刷新服务器 Cookie",
+    "error.unauthorized": "服务鉴权失败，请检查服务器登录状态",
+    "error.media_gateway": "媒体服务器暂时不可用，请稍后重试",
+    "error.media_server": "媒体服务器解析失败",
+    "error.unknown": "未知错误",
 
     "remux.title": "转封装媒体文件",
     "remux.subtitle": "将视频或音频文件拖放到此，重新封装为新容器格式。无重编码 — 仅转封装。",

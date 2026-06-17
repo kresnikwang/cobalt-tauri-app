@@ -17,6 +17,13 @@
     "empty.title": "No downloads yet",
     "empty.subtitle": "Paste a URL above, drag a link here, or copy a URL to your clipboard.",
     "empty.sources": "Supported Sources",
+    "home.save_to": "Save to",
+    "home.youtube_local": "YouTube local-first",
+    "platform.capability.local_first": "Local first",
+    "platform.capability.cookie_hd": "HD resolve",
+    "platform.capability.audio": "Stable audio",
+    "platform.capability.server_assist": "Server assist",
+    "platform.capability.basic": "Basic support",
 
     "task.status.queued": "QUEUED",
     "task.status.analyzing": "ANALYZING",
@@ -69,6 +76,11 @@
     "settings.audio.opus": "Opus",
 
     "service.unknown": "Web Media",
+    "error.youtube_cookies": "YouTube login expired. Refresh server cookies.",
+    "error.unauthorized": "Service authorization failed. Check server login.",
+    "error.media_gateway": "Media server is temporarily unavailable.",
+    "error.media_server": "Media server failed to resolve this link.",
+    "error.unknown": "Unknown error",
 
     "remux.title": "Remux Media Files",
     "remux.subtitle": "Drag and drop video or audio files to remux them into a new container format. No re-encoding — just remuxing.",

@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use serde::{Serialize, Deserialize};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command as TokioCommand;
 use futures_util::StreamExt;
 use tauri::{Manager, Emitter};
@@ -470,6 +470,107 @@ fn ytdlp_error_text(stderr: &str) -> String {
         .to_string()
 }
 
+#[derive(Debug, Clone)]
+struct YtdlpProgress {
+    progress: f64,
+    downloaded_bytes: u64,
+    total_bytes: u64,
+    speed: Option<String>,
+    eta: Option<String>,
+}
+
+fn parse_size_to_bytes(value: &str) -> Option<u64> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("unknown") {
+        return None;
+    }
+
+    let number_part: String = trimmed
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect();
+    let unit_part = trimmed[number_part.len()..]
+        .trim()
+        .trim_end_matches("/s")
+        .trim()
+        .to_ascii_lowercase();
+
+    let number = number_part.parse::<f64>().ok()?;
+    let multiplier = match unit_part.as_str() {
+        "" | "b" | "bytes" => 1.0,
+        "kib" | "kb" | "k" => 1024.0,
+        "mib" | "mb" | "m" => 1024.0_f64.powi(2),
+        "gib" | "gb" | "g" => 1024.0_f64.powi(3),
+        "tib" | "tb" | "t" => 1024.0_f64.powi(4),
+        _ => return None,
+    };
+
+    Some((number * multiplier).round() as u64)
+}
+
+fn parse_ytdlp_progress_line(line: &str) -> Option<YtdlpProgress> {
+    let compact = line.replace('\r', "");
+    let text = compact.trim();
+    if !text.contains("[download]") || !text.contains('%') {
+        return None;
+    }
+
+    let percent_end = text.find('%')?;
+    let percent_start = text[..percent_end]
+        .rfind(|c: char| c.is_whitespace())
+        .map(|idx| idx + 1)
+        .unwrap_or(0);
+    let percent = text[percent_start..percent_end].trim().parse::<f64>().ok()?;
+    let progress = (percent / 100.0).clamp(0.0, 0.99);
+
+    let total_bytes = if let Some(of_pos) = text.find(" of ") {
+        let after_of = &text[of_pos + 4..];
+        let size_token = after_of
+            .split_whitespace()
+            .next()
+            .unwrap_or("");
+        parse_size_to_bytes(size_token).unwrap_or(0)
+    } else {
+        0
+    };
+
+    let downloaded_bytes = if total_bytes > 0 {
+        ((total_bytes as f64) * progress).round() as u64
+    } else {
+        0
+    };
+
+    let speed = text
+        .split(" at ")
+        .nth(1)
+        .and_then(|part| part.split(" ETA ").next())
+        .and_then(|value| {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                None
+            } else if trimmed.ends_with("/s") {
+                Some(trimmed.to_string())
+            } else {
+                Some(format!("{}/s", trimmed))
+            }
+        });
+
+    let eta = text
+        .split(" ETA ")
+        .nth(1)
+        .and_then(|value| value.split_whitespace().next())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+
+    Some(YtdlpProgress {
+        progress,
+        downloaded_bytes,
+        total_bytes,
+        speed,
+        eta,
+    })
+}
+
 async fn try_local_youtube_download(
     id: String,
     url: &str,
@@ -554,7 +655,61 @@ async fn try_local_youtube_download(
 
         let mut child = cmd.spawn()
             .map_err(|e| format!("Failed to start local yt-dlp: {}", e))?;
+        let mut stdout_pipe = child.stdout.take();
         let mut stderr_pipe = child.stderr.take();
+        let progress_state = state.clone();
+        let progress_app_handle = app_handle.clone();
+        let progress_id = id.clone();
+        let progress_task = stdout_pipe.take().map(|stdout_reader| {
+            tauri::async_runtime::spawn(async move {
+                let reader = BufReader::new(stdout_reader);
+                let mut lines = reader.lines();
+                let mut last_emit = std::time::Instant::now() - std::time::Duration::from_secs(1);
+
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let trimmed = line.trim();
+                    let mut next_update: Option<DownloadTask> = None;
+
+                    if let Some(progress) = parse_ytdlp_progress_line(trimmed) {
+                        let now = std::time::Instant::now();
+                        if now.duration_since(last_emit).as_millis() < 120 && progress.progress < 0.99 {
+                            continue;
+                        }
+
+                        let mut state_lock = progress_state.lock().unwrap();
+                        if let Some(task) = state_lock.tasks.get_mut(&progress_id) {
+                            task.status = "downloading".to_string();
+                            task.progress = progress.progress;
+                            if progress.total_bytes > 0 {
+                                task.total_bytes = progress.total_bytes;
+                                task.downloaded_bytes = progress.downloaded_bytes;
+                            }
+                            if let Some(speed) = progress.speed {
+                                task.speed = speed;
+                            }
+                            if let Some(eta) = progress.eta {
+                                task.eta = eta;
+                            }
+                            next_update = Some(task.clone());
+                        }
+                        last_emit = now;
+                    } else if trimmed.contains("[Merger]") || trimmed.contains("[ExtractAudio]") || trimmed.contains("Merging formats") {
+                        let mut state_lock = progress_state.lock().unwrap();
+                        if let Some(task) = state_lock.tasks.get_mut(&progress_id) {
+                            task.status = "merging".to_string();
+                            task.progress = task.progress.max(0.99);
+                            task.speed = "FFmpeg".to_string();
+                            task.eta = "--:--".to_string();
+                            next_update = Some(task.clone());
+                        }
+                    }
+
+                    if let Some(task) = next_update {
+                        let _ = progress_app_handle.emit("task-updated", task);
+                    }
+                }
+            })
+        });
         let stderr_task = tauri::async_runtime::spawn(async move {
             let mut stderr = String::new();
             if let Some(stderr_reader) = stderr_pipe.as_mut() {
@@ -567,10 +722,17 @@ async fn try_local_youtube_download(
             result = child.wait() => result,
             _ = &mut abort_rx => {
                 let _ = child.kill().await;
+                if let Some(handle) = progress_task {
+                    handle.abort();
+                }
                 let _ = std::fs::remove_file(&output_path);
                 return Ok(true);
             }
         };
+
+        if let Some(handle) = progress_task {
+            let _ = handle.await;
+        }
 
         match wait_result {
             Ok(status) if status.success() && output_path.exists() => {

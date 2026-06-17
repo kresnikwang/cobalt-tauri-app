@@ -10,14 +10,10 @@
     IconPlayerPlay,
     IconTrash,
     IconX,
-    IconCheck,
-    IconAlertCircle,
     IconClipboard,
     IconVideo,
     IconMusic,
-    IconCloudDownload,
-    IconRepeat,
-    IconLanguage
+    IconCloudDownload
   } from "@tabler/icons-svelte";
 
   import { t, getLocale, setLocale } from '$lib/i18n.svelte';
@@ -27,7 +23,6 @@
   let inputUrl = $state('');
   let isDragging = $state(false);
   let showSettings = $state(false);
-  let currentPage = $state<'home' | 'remux'>('home');
   let clipboardToast = $state<{ url: string; visible: boolean }>({ url: '', visible: false });
   let clipboardTimeout: any = null;
   
@@ -175,6 +170,41 @@
     const i = Math.floor(Math.log(bytes) / Math.log(k));
     return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
   }
+
+  function savePathLabel(path: string) {
+    const parts = path?.split(/[\\/]/).filter(Boolean) ?? [];
+    return parts.at(-1) || 'Downloads';
+  }
+
+  function qualityLabel() {
+    if (settings.downloadMode === 'audio') {
+      return settings.audioFormat === 'best' ? t('settings.audio.best') : settings.audioFormat.toUpperCase();
+    }
+    return settings.videoQuality === 'max' ? t('settings.quality.max') : `${settings.videoQuality}p`;
+  }
+
+  function platformCapability(name: string) {
+    const key = name.toLowerCase();
+    if (key.includes('youtube')) return t('platform.capability.local_first');
+    if (key.includes('bilibili')) return t('platform.capability.cookie_hd');
+    if (key.includes('soundcloud')) return t('platform.capability.audio');
+    if (key.includes('instagram') || key.includes('twitter') || key.includes('x') || key.includes('pinterest')) {
+      return t('platform.capability.server_assist');
+    }
+    return t('platform.capability.basic');
+  }
+
+  function humanTaskError(error?: string) {
+    const raw = error || '';
+    const lower = raw.toLowerCase();
+    if (lower.includes('youtube') && (lower.includes('cookies expired') || lower.includes('login cookies'))) {
+      return t('error.youtube_cookies');
+    }
+    if (lower.includes('401 unauthorized')) return t('error.unauthorized');
+    if (lower.includes('502 bad gateway')) return t('error.media_gateway');
+    if (lower.includes('media server error')) return t('error.media_server');
+    return raw || t('error.unknown');
+  }
 </script>
 
 <!-- Drag & Drop overlay -->
@@ -200,18 +230,6 @@
     <div class="header-title no-drag">
       <span class="gradient-text">COBALT</span>
     </div>
-    <nav class="header-nav no-drag">
-      <button class="nav-btn" class:active={currentPage === 'home'} onclick={() => currentPage = 'home'} title={t('nav.home')}>
-        <IconDownload size={16} />
-        <span>{t('nav.home')}</span>
-      </button>
-      <!--
-      <button class="nav-btn" class:active={currentPage === 'remux'} onclick={() => currentPage = 'remux'} title={t('nav.remux')}>
-        <IconRepeat size={16} />
-        <span>{t('nav.remux')}</span>
-      </button>
-      -->
-    </nav>
     <div class="header-actions no-drag">
       <button class="settings-btn" onclick={() => showSettings = !showSettings} title={t('settings.title')}>
         <IconSettings size={18} />
@@ -234,9 +252,14 @@
         <span>{t('analyze')}</span>
       </button>
     </div>
+    <div class="download-context-strip">
+      <span class="context-pill">{settings.downloadMode === 'audio' ? t('settings.audio_only') : t('settings.video_audio')}</span>
+      <span class="context-pill">{qualityLabel()}</span>
+      <span class="context-pill">{t('home.save_to')}: {savePathLabel(settings.savePath)}</span>
+      <span class="context-pill highlight">{t('home.youtube_local')}</span>
+    </div>
   </section>
 
-  {#if currentPage === 'home'}
   <!-- Tabs Navigation -->
   <nav class="tabs-nav">
     <div class="tabs-list">
@@ -283,6 +306,7 @@
             >
               <span class="platform-card-name" style="color: {platform.color}">{platform.name}</span>
               <span class="platform-card-domain">{platform.domain}</span>
+              <span class="platform-card-capability">{platformCapability(platform.name)}</span>
             </div>
           {/each}
         </div>
@@ -292,20 +316,21 @@
         {#each filteredTasks as task (task.id)}
           {@const service = getServiceInfo(task.url, t('service.unknown'))}
           <div class="task-card glass">
-            <!-- Site Icon Column -->
-            <div class="site-icon-col" style="background: {service.bg}; color: {service.color}">
+            <div class="service-icon" style="--service-bg: {service.bg}; --service-color: {service.color}">
               {#if settings.downloadMode === 'audio'}
-                <IconMusic size={20} />
+                <IconMusic size={18} />
               {:else}
-                <IconVideo size={20} />
+                <IconVideo size={18} />
               {/if}
-              <span class="service-label">{service.name}</span>
             </div>
 
             <!-- Main Info Column -->
             <div class="task-info-col">
               <div class="task-header">
-                <span class="task-title" title={task.title}>{task.title}</span>
+                <div class="task-title-group">
+                  <span class="task-title" title={task.title}>{task.title}</span>
+                  <span class="task-service" style="color: {service.color}">{service.name}</span>
+                </div>
                 <span class="task-status-badge {task.status}">{t(`task.status.${task.status}`)}</span>
               </div>
 
@@ -335,7 +360,7 @@
                 {:else if task.status === 'completed'}
                   <span class="stats-text success">{t('task.completed')}</span>
                 {:else if task.status === 'failed'}
-                  <span class="stats-text error" title={task.error}>Failed: {task.error || 'Unknown error'}</span>
+                  <span class="stats-text error" title={task.error}>{humanTaskError(task.error)}</span>
                 {:else if task.status === 'cancelled'}
                   <span class="stats-text warning">{t('task.cancelled')}</span>
                 {/if}
@@ -372,21 +397,6 @@
       </div>
     {/if}
   </section>
-  {:else}
-  <!-- Remux Page -->
-  <section class="remux-page">
-    <div class="remux-hero">
-      <IconRepeat size={48} color="var(--text-muted)" />
-      <h2>{t('remux.title')}</h2>
-      <p>{t('remux.subtitle')}</p>
-      <div class="remux-drop-zone">
-        <IconCloudDownload size={32} color="var(--text-muted)" />
-        <span>{t('remux.drop_zone')}</span>
-      </div>
-      <p class="remux-formats">{t('remux.supported')}</p>
-    </div>
-  </section>
-  {/if}
 
   <!-- Clipboard Toast Slide-up -->
   {#if clipboardToast.visible}
@@ -588,6 +598,10 @@
     color: var(--text-primary);
   }
 
+  .header-actions {
+    margin-left: auto;
+  }
+
   .gradient-text {
     background: var(--accent-gradient);
     -webkit-background-clip: text;
@@ -614,43 +628,9 @@
     color: var(--text-primary);
   }
 
-  /* Header Nav */
-  .header-nav {
-    display: flex;
-    gap: 4px;
-    background: rgba(0, 0, 0, 0.2);
-    padding: 3px;
-    border-radius: 10px;
-    border: 1px solid rgba(255, 255, 255, 0.04);
-  }
-
-  .nav-btn {
-    background: transparent;
-    border: none;
-    color: var(--text-secondary);
-    padding: 5px 10px;
-    font-size: 12px;
-    font-weight: 500;
-    border-radius: 7px;
-    cursor: pointer;
-    transition: all 0.2s;
-    display: flex;
-    align-items: center;
-    gap: 5px;
-  }
-
-  .nav-btn.active {
-    background: rgba(255, 255, 255, 0.08);
-    color: var(--text-primary);
-  }
-
-  .nav-btn:hover:not(.active) {
-    background: rgba(255, 255, 255, 0.04);
-  }
-
   /* URL Paste Section */
   .paste-section {
-    padding: 24px 20px 16px 20px;
+    padding: 22px 20px 14px 20px;
   }
 
   .input-glow-wrapper {
@@ -714,6 +694,38 @@
     color: var(--text-muted);
     box-shadow: none;
     cursor: not-allowed;
+  }
+
+  .download-context-strip {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 10px;
+    padding: 0 2px;
+  }
+
+  .context-pill {
+    height: 22px;
+    padding: 0 9px;
+    border-radius: 999px;
+    display: inline-flex;
+    align-items: center;
+    max-width: 220px;
+    color: var(--text-secondary);
+    background: rgba(255, 255, 255, 0.045);
+    border: 1px solid rgba(255, 255, 255, 0.055);
+    font-size: 10.5px;
+    font-weight: 600;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .context-pill.highlight {
+    color: var(--accent-primary);
+    background: rgba(99, 102, 241, 0.1);
+    border-color: rgba(99, 102, 241, 0.18);
   }
 
   /* Tabs Nav */
@@ -790,43 +802,37 @@
   .tasks-list {
     display: flex;
     flex-direction: column;
-    gap: 12px;
+    gap: 10px;
   }
 
   /* Task Card */
   .task-card {
-    border-radius: 14px;
+    border-radius: 12px;
     display: flex;
+    align-items: center;
     overflow: hidden;
-    height: 94px;
+    min-height: 76px;
+    padding: 10px 12px;
+    gap: 12px;
+    box-sizing: border-box;
   }
 
-  .site-icon-col {
-    width: 80px;
+  .service-icon {
+    width: 44px;
+    height: 44px;
+    flex: 0 0 44px;
+    border-radius: 12px;
+    color: var(--service-color);
+    background: var(--service-bg);
     display: flex;
-    flex-direction: column;
     align-items: center;
     justify-content: center;
-    border-right: 1px solid var(--border-color);
-    padding: 0 10px;
-  }
-
-  .service-label {
-    font-size: 9px;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-    margin-top: 6px;
-    text-align: center;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    width: 100%;
+    border: 1px solid rgba(255, 255, 255, 0.055);
   }
 
   .task-info-col {
     flex: 1;
-    padding: 12px 16px;
+    min-width: 0;
     display: flex;
     flex-direction: column;
     justify-content: space-between;
@@ -840,16 +846,32 @@
     gap: 12px;
   }
 
+  .task-title-group {
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+
   .task-title {
     font-size: 13.5px;
-    font-weight: 500;
+    font-weight: 600;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
-    flex: 1;
+    max-width: 100%;
+  }
+
+  .task-service {
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+    opacity: 0.85;
   }
 
   .task-status-badge {
+    flex: 0 0 auto;
     font-size: 8px;
     font-weight: 700;
     padding: 2px 6px;
@@ -867,7 +889,7 @@
 
   /* Progress bar styles */
   .progress-bar-wrapper {
-    margin: 8px 0;
+    margin: 7px 0;
   }
 
   .progress-bar-bg {
@@ -924,13 +946,17 @@
 
   .task-status-footer {
     display: flex;
-    justify-content: space-between;
+    align-items: center;
+    justify-content: flex-start;
+    gap: 12px;
+    min-width: 0;
     font-size: 11px;
     color: var(--text-secondary);
   }
 
   .stats-text {
     display: inline-block;
+    min-width: 0;
   }
 
   .stats-text.speed {
@@ -939,7 +965,7 @@
   }
 
   .stats-text.success { color: #10b981; }
-  .stats-text.error { color: #ef4444; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 250px; }
+  .stats-text.error { color: #ef4444; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 420px; }
   .stats-text.warning { color: var(--text-muted); }
 
   .animated-dots::after {
@@ -959,18 +985,17 @@
 
   /* Actions column */
   .task-actions-col {
-    width: 60px;
+    flex: 0 0 auto;
     display: flex;
-    flex-direction: column;
+    flex-direction: row;
     align-items: center;
     justify-content: center;
-    gap: 8px;
-    padding-right: 12px;
+    gap: 6px;
   }
 
   .action-circle-btn {
-    width: 28px;
-    height: 28px;
+    width: 26px;
+    height: 26px;
     border-radius: 50%;
     border: 1px solid var(--border-color);
     background: rgba(255, 255, 255, 0.03);
@@ -1008,8 +1033,8 @@
     align-items: center;
     justify-content: center;
     text-align: center;
-    padding: 60px 40px;
-    height: 320px;
+    padding: 44px 40px 34px;
+    min-height: 360px;
   }
 
   .empty-icon-pulse {
@@ -1376,7 +1401,8 @@
     flex-direction: column;
     align-items: center;
     justify-content: center;
-    padding: 10px 4px;
+    min-height: 62px;
+    padding: 9px 8px;
     border-radius: 10px;
     border: 1px solid rgba(255, 255, 255, 0.03);
     background: rgba(255, 255, 255, 0.02);
@@ -1407,62 +1433,17 @@
     letter-spacing: 0.2px;
   }
 
-  /* Remux Page */
-  .remux-page {
-    flex: 1;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    padding: 40px;
-    overflow-y: auto;
-  }
-
-  .remux-hero {
-    text-align: center;
-    max-width: 420px;
-  }
-
-  .remux-hero h2 {
-    font-family: var(--font-display);
-    font-size: 20px;
-    margin: 16px 0 8px 0;
+  .platform-card-capability {
+    margin-top: 6px;
+    max-width: 100%;
+    color: var(--text-secondary);
+    background: rgba(255, 255, 255, 0.045);
+    border-radius: 999px;
+    padding: 2px 7px;
+    font-size: 8.5px;
     font-weight: 600;
-  }
-
-  .remux-hero p {
-    color: var(--text-secondary);
-    font-size: 13px;
-    line-height: 1.5;
-    margin: 0 0 24px 0;
-  }
-
-  .remux-drop-zone {
-    border: 2px dashed var(--border-color);
-    border-radius: 20px;
-    padding: 48px 32px;
-    margin-bottom: 16px;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 12px;
-    background: rgba(255, 255, 255, 0.02);
-    transition: all 0.2s;
-    cursor: pointer;
-  }
-
-  .remux-drop-zone:hover {
-    border-color: var(--accent-primary);
-    background: rgba(99, 102, 241, 0.05);
-  }
-
-  .remux-drop-zone span {
-    color: var(--text-secondary);
-    font-size: 14px;
-    font-weight: 500;
-  }
-
-  .remux-formats {
-    font-size: 10px !important;
-    color: var(--text-muted) !important;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 </style>

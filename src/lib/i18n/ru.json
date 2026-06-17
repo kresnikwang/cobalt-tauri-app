@@ -17,6 +17,13 @@
     "empty.title": "Загрузок пока нет",
     "empty.subtitle": "Вставь ссылку выше, перетащи её сюда или скопируй в буфер обмена.",
     "empty.sources": "Поддерживаемые платформы",
+    "home.save_to": "Сохранить в",
+    "home.youtube_local": "YouTube локально",
+    "platform.capability.local_first": "Локально",
+    "platform.capability.cookie_hd": "HD-анализ",
+    "platform.capability.audio": "Аудио",
+    "platform.capability.server_assist": "Через сервер",
+    "platform.capability.basic": "Базово",
 
     "task.status.queued": "В ОЧЕРЕДИ",
     "task.status.analyzing": "АНАЛИЗ",
@@ -69,6 +76,11 @@
     "settings.audio.opus": "Opus",
 
     "service.unknown": "Медиа",
+    "error.youtube_cookies": "Вход YouTube истек. Обновите cookies сервера.",
+    "error.unauthorized": "Ошибка авторизации сервиса. Проверьте вход на сервере.",
+    "error.media_gateway": "Медиасервер временно недоступен.",
+    "error.media_server": "Медиасервер не смог обработать ссылку.",
+    "error.unknown": "Неизвестная ошибка",
 
     "remux.title": "Ремукс медиафайлов",
     "remux.subtitle": "Перетащите видео или аудио файлы для ремукса в новый контейнер. Без перекодирования — только ремукс.",
