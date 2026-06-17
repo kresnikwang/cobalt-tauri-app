@@ -1,4 +1,4 @@
-name: Release
+name: Release Draft Creator
 
 on:
   push:
@@ -7,57 +7,27 @@ on:
   workflow_dispatch:
 
 jobs:
-  release:
+  create-draft:
     permissions:
       contents: write
-    runs-on: macos-latest
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - name: Create GitHub Draft Release
+        uses: softprops/action-gh-release@v2
         with:
-          node-version: 20
-
-      - name: Install pnpm
-        uses: pnpm/action-setup@v3
-        with:
-          version: 8
-
-      - name: Install dependencies
-        run: pnpm install
-
-      - name: Download yt-dlp binary
-        run: |
-          mkdir -p src-tauri/binaries
-          curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o src-tauri/binaries/yt-dlp
-          chmod +x src-tauri/binaries/yt-dlp
-
-      - name: Prepare release bundle (API + Node)
-        run: pnpm prepare:release-bundle
-
-      - name: Verify build environment
-        run: pnpm release:check
-
-      - name: Build and Release Tauri App
-        uses: tauri-apps/tauri-action@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Force ad-hoc signing on macOS if Apple Developer certificates are not set up
-          APPLE_SIGNING_IDENTITY: "-"
-        with:
-          tagName: v__VERSION__
-          releaseName: 'Cobalt Desktop v__VERSION__'
-          releaseBody: |
-            Cobalt Desktop release v__VERSION__.
+          draft: true
+          prerelease: false
+          tag_name: ${{ github.ref_name }}
+          name: 'Cobalt Desktop ${{ github.ref_name }}'
+          body: |
+            Cobalt Desktop Release ${{ github.ref_name }}.
             
             ### Installation
-            - **macOS**: Download the `.dmg` or `.app.zip` (compatible with macOS 26+ and ARM64 / Intel).
+            - **macOS**: Download the `.dmg` or `.app.zip` below (compiled locally).
             
-            *Note: This release is signed ad-hoc. If macOS Gatekeeper blocks it, right-click the app and choose "Open" or go to System Settings > Privacy & Security to allow it.*
-          releaseDraft: true
-          prerelease: false
+            *Note: To run the app on macOS, you may need to right-click the app and choose "Open" to bypass gatekeeper warnings.*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
