@@ -44,7 +44,7 @@ jobs:
         run: pnpm release:check
 
       - name: Build and Release Tauri App
-        uses: tauri-apps/tauri-action@v2
+        uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Force ad-hoc signing on macOS if Apple Developer certificates are not set up
