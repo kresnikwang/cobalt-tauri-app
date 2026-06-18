@@ -287,8 +287,19 @@ fn is_bilibili_url(url: &str) -> bool {
     false
 }
 
+fn is_dailymotion_url(url: &str) -> bool {
+    if let Ok(parsed) = reqwest::Url::parse(url) {
+        if let Some(host) = parsed.host_str().map(|h| h.trim_start_matches("www.").to_ascii_lowercase()) {
+            return host == "dailymotion.com"
+                || host.ends_with(".dailymotion.com")
+                || host == "dai.ly";
+        }
+    }
+    false
+}
+
 fn is_local_ytdlp_url(url: &str) -> bool {
-    is_youtube_url(url) || is_bilibili_url(url)
+    is_youtube_url(url) || is_bilibili_url(url) || is_dailymotion_url(url)
 }
 
 fn should_relay_download_through_server(url: &str) -> bool {
@@ -416,6 +427,32 @@ fn bilibili_video_id(url: &str) -> Option<String> {
             }
         }
     }
+    None
+}
+
+fn dailymotion_video_id(url: &str) -> Option<String> {
+    if let Some(pos) = url.find("/video/") {
+        let value = &url[pos + "/video/".len()..];
+        let id = value
+            .split(|c: char| c == '?' || c == '#' || c == '/' || c == '_' || c.is_whitespace())
+            .next()
+            .unwrap_or("");
+        if !id.is_empty() {
+            return Some(id.to_string());
+        }
+    }
+
+    if let Some(pos) = url.find("dai.ly/") {
+        let value = &url[pos + "dai.ly/".len()..];
+        let id = value
+            .split(|c: char| c == '?' || c == '#' || c == '/' || c.is_whitespace())
+            .next()
+            .unwrap_or("");
+        if !id.is_empty() {
+            return Some(id.to_string());
+        }
+    }
+
     None
 }
 
@@ -668,12 +705,27 @@ async fn try_local_ytdlp_download(
     }
 
     let is_youtube = is_youtube_url(url);
-    let source_name = if is_youtube { "YouTube" } else { "Bilibili" };
-    let source_prefix = if is_youtube { "youtube" } else { "bilibili" };
+    let is_bilibili = is_bilibili_url(url);
+    let source_name = if is_youtube {
+        "YouTube"
+    } else if is_bilibili {
+        "Bilibili"
+    } else {
+        "Dailymotion"
+    };
+    let source_prefix = if is_youtube {
+        "youtube"
+    } else if is_bilibili {
+        "bilibili"
+    } else {
+        "dailymotion"
+    };
     let video_id = if is_youtube {
         youtube_video_id(url)
-    } else {
+    } else if is_bilibili {
         bilibili_video_id(url)
+    } else {
+        dailymotion_video_id(url)
     }.unwrap_or_else(|| id.clone());
     let audio_format = ytdlp_audio_format(settings);
     let filename = if settings.download_mode == "audio" {
@@ -716,9 +768,14 @@ async fn try_local_ytdlp_download(
         sources.extend(chrome_cookie_sources().into_iter().map(Some));
         sources.extend([Some("safari".to_string()), Some("firefox".to_string())]);
         sources
-    } else {
+    } else if is_bilibili {
         let mut sources: Vec<Option<String>> = chrome_cookie_sources().into_iter().map(Some).collect();
         sources.extend([Some("safari".to_string()), Some("firefox".to_string()), None]);
+        sources
+    } else {
+        let mut sources = vec![None];
+        sources.extend(chrome_cookie_sources().into_iter().map(Some));
+        sources.extend([Some("safari".to_string()), Some("firefox".to_string())]);
         sources
     };
     let mut last_error = String::from("Local yt-dlp download failed");
@@ -783,7 +840,7 @@ async fn try_local_ytdlp_download(
         let progress_state = state.clone();
         let progress_app_handle = app_handle.clone();
         let progress_id = id.clone();
-        let aggregate_bilibili_progress = !is_youtube && settings.download_mode == "video";
+        let aggregate_bilibili_progress = is_bilibili && settings.download_mode == "video";
         let progress_task = stdout_pipe.take().map(|stdout_reader| {
             tauri::async_runtime::spawn(async move {
                 let reader = BufReader::new(stdout_reader);
@@ -1026,7 +1083,13 @@ async fn run_download_task(id: String, state: Arc<Mutex<AppState>>, app_handle: 
     }
 
     if is_local_ytdlp_url(&url_to_download) {
-        let local_source_name = if is_youtube_url(&url_to_download) { "YouTube" } else { "Bilibili" };
+        let local_source_name = if is_youtube_url(&url_to_download) {
+            "YouTube"
+        } else if is_bilibili_url(&url_to_download) {
+            "Bilibili"
+        } else {
+            "Dailymotion"
+        };
         match try_local_ytdlp_download(
             id.clone(),
             &url_to_download,
@@ -1040,8 +1103,12 @@ async fn run_download_task(id: String, state: Arc<Mutex<AppState>>, app_handle: 
             }
             Ok(false) => {}
             Err(e) => {
-                update_task_failed(id, format!("Local {} download failed: {}", local_source_name, e), &state, &app_handle);
-                return;
+                if local_source_name == "Dailymotion" {
+                    println!("Local Dailymotion download failed, falling back to remote service: {}", e);
+                } else {
+                    update_task_failed(id, format!("Local {} download failed: {}", local_source_name, e), &state, &app_handle);
+                    return;
+                }
             }
         }
     }

@@ -8,6 +8,14 @@ pnpm release:check
 pnpm prepare:release-bundle
 ```
 
+If pnpm reports ignored build scripts for `esbuild`, `ffmpeg-static`, or `syscall-napi`, approve the required build scripts once:
+
+```bash
+pnpm approve-builds esbuild ffmpeg-static syscall-napi
+```
+
+The repository also stores these allow rules in `pnpm-workspace.yaml`. The release bundle script writes the same rules into the temporary bundled API directory before installing production dependencies.
+
 Verify the bundled API can start without the workspace:
 
 ```bash
@@ -26,8 +34,24 @@ Open `http://127.0.0.1:47319/` and confirm it returns Cobalt server info.
 ## Build
 
 ```bash
-pnpm tauri build
+pnpm release:build
 ```
+
+`release:build` runs:
+
+```bash
+pnpm prepare:release-bundle
+pnpm release:check
+pnpm tauri build --bundles app
+```
+
+The preparation step copies:
+
+- `src-tauri/binaries/node`
+- `src-tauri/binaries/ffmpeg`
+- `src-tauri/bundled-api`
+
+Keep `src-tauri/binaries/yt-dlp` available as well. It is used for local YouTube and Bilibili downloads. For packaged builds, avoid re-signing `yt-dlp` itself with Developer ID; ad-hoc signing the final `.app` bundle is fine for local testing.
 
 The app bundle is written to:
 

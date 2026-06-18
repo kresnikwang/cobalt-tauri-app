@@ -187,6 +187,7 @@
     const key = name.toLowerCase();
     if (key.includes('youtube')) return t('platform.capability.local_first');
     if (key.includes('bilibili')) return t('platform.capability.cookie_hd');
+    if (key.includes('dailymotion')) return t('platform.capability.local_first');
     if (key.includes('soundcloud')) return t('platform.capability.audio');
     if (key.includes('instagram') || key.includes('twitter') || key.includes('x') || key.includes('pinterest')) {
       return t('platform.capability.server_assist');
