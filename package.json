@@ -8,7 +8,7 @@
     "build": "vite build",
     "prepare:release-bundle": "node scripts/prepare-release-bundle.mjs",
     "release:check": "pnpm check && cargo check --manifest-path src-tauri/Cargo.toml",
-    "release:build": "pnpm release:check && pnpm tauri build --bundles app",
+    "release:build": "pnpm prepare:release-bundle && pnpm release:check && pnpm tauri build --bundles app",
     "preview": "vite preview",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
     "check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",

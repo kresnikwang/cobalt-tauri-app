@@ -30,7 +30,8 @@
     "targets": "all",
     "resources": [
       "binaries/yt-dlp",
-      "binaries/node"
+      "binaries/node",
+      "binaries/ffmpeg"
     ],
     "icon": [
       "icons/32x32.png",

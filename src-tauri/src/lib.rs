@@ -276,6 +276,21 @@ fn is_youtube_url(url: &str) -> bool {
     false
 }
 
+fn is_bilibili_url(url: &str) -> bool {
+    if let Ok(parsed) = reqwest::Url::parse(url) {
+        if let Some(host) = parsed.host_str().map(|h| h.trim_start_matches("www.").to_ascii_lowercase()) {
+            return host == "bilibili.com"
+                || host.ends_with(".bilibili.com")
+                || host == "b23.tv";
+        }
+    }
+    false
+}
+
+fn is_local_ytdlp_url(url: &str) -> bool {
+    is_youtube_url(url) || is_bilibili_url(url)
+}
+
 fn should_relay_download_through_server(url: &str) -> bool {
     let Ok(parsed) = reqwest::Url::parse(url) else {
         return true;
@@ -388,6 +403,22 @@ fn youtube_video_id(url: &str) -> Option<String> {
     None
 }
 
+fn bilibili_video_id(url: &str) -> Option<String> {
+    for marker in ["BV", "av"] {
+        if let Some(pos) = url.find(marker) {
+            let value = &url[pos..];
+            let id = value
+                .split(|c: char| c == '?' || c == '#' || c == '/' || c == '&' || c.is_whitespace())
+                .next()
+                .unwrap_or("");
+            if id.len() > marker.len() {
+                return Some(id.to_string());
+            }
+        }
+    }
+    None
+}
+
 fn unique_output_path(save_dir: &std::path::Path, filename: &str) -> PathBuf {
     let safe_filename = std::path::Path::new(filename)
         .file_name()
@@ -440,9 +471,57 @@ fn resolve_node_path(app_handle: &tauri::AppHandle) -> Option<PathBuf> {
     .find(|path| path.exists())
 }
 
+fn resolve_ffmpeg_path(app_handle: &tauri::AppHandle) -> Option<PathBuf> {
+    [
+        app_handle.path().resolve("binaries/ffmpeg", BaseDirectory::Resource).ok(),
+        Some(PathBuf::from("src-tauri/binaries/ffmpeg")),
+        Some(PathBuf::from("/opt/homebrew/bin/ffmpeg")),
+        Some(PathBuf::from("/usr/local/bin/ffmpeg")),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|path| path.exists())
+}
+
+fn chrome_cookie_sources() -> Vec<String> {
+    let mut sources = vec!["chrome:Default".to_string()];
+    if let Some(home) = std::env::var_os("HOME") {
+        let chrome_root = PathBuf::from(home).join("Library/Application Support/Google/Chrome");
+        if let Ok(entries) = std::fs::read_dir(chrome_root) {
+            let mut profiles: Vec<String> = entries
+                .flatten()
+                .filter_map(|entry| {
+                    let file_type = entry.file_type().ok()?;
+                    if !file_type.is_dir() {
+                        return None;
+                    }
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    if name.starts_with("Profile ") {
+                        Some(format!("chrome:{}", name))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            profiles.sort();
+            sources.extend(profiles);
+        }
+    }
+    sources.push("chrome".to_string());
+    sources.dedup();
+    sources
+}
+
+fn ytdlp_audio_format(settings: &Settings) -> String {
+    match settings.audio_format.as_str() {
+        "mp3" | "ogg" | "wav" | "opus" | "m4a" => settings.audio_format.clone(),
+        _ => "m4a".to_string(),
+    }
+}
+
 fn ytdlp_format(settings: &Settings) -> String {
     if settings.download_mode == "audio" {
-        return "bestaudio[ext=m4a]/bestaudio/best".to_string();
+        return "bestaudio/best".to_string();
     }
 
     match settings.video_quality.as_str() {
@@ -460,6 +539,12 @@ fn ytdlp_error_text(stderr: &str) -> String {
     }
     if lower.contains("cookies are no longer valid") {
         return "Local YouTube cookies are expired. Please refresh browser login and try again.".to_string();
+    }
+    if lower.contains("http error 412") || lower.contains("precondition failed") {
+        return "Bilibili rejected this request with HTTP 412. Please open Bilibili in Chrome, refresh the page, then retry.".to_string();
+    }
+    if lower.contains("login") || lower.contains("not logged in") || lower.contains("请先登录") || lower.contains("登录") {
+        return "Bilibili login cookies were not accepted. Please make sure Bilibili is logged in with the active Chrome profile.".to_string();
     }
     stderr.lines()
         .rev()
@@ -571,22 +656,30 @@ fn parse_ytdlp_progress_line(line: &str) -> Option<YtdlpProgress> {
     })
 }
 
-async fn try_local_youtube_download(
+async fn try_local_ytdlp_download(
     id: String,
     url: &str,
     settings: &Settings,
     state: &Arc<Mutex<AppState>>,
     app_handle: &tauri::AppHandle,
 ) -> Result<bool, String> {
-    if !is_youtube_url(url) {
+    if !is_local_ytdlp_url(url) {
         return Ok(false);
     }
 
-    let video_id = youtube_video_id(url).unwrap_or_else(|| id.clone());
-    let filename = if settings.download_mode == "audio" {
-        format!("youtube_{}.m4a", video_id)
+    let is_youtube = is_youtube_url(url);
+    let source_name = if is_youtube { "YouTube" } else { "Bilibili" };
+    let source_prefix = if is_youtube { "youtube" } else { "bilibili" };
+    let video_id = if is_youtube {
+        youtube_video_id(url)
     } else {
-        format!("youtube_{}.mp4", video_id)
+        bilibili_video_id(url)
+    }.unwrap_or_else(|| id.clone());
+    let audio_format = ytdlp_audio_format(settings);
+    let filename = if settings.download_mode == "audio" {
+        format!("{}_{}.{}", source_prefix, video_id, audio_format)
+    } else {
+        format!("{}_{}.mp4", source_prefix, video_id)
     };
 
     let save_path = PathBuf::from(&settings.save_path);
@@ -603,7 +696,7 @@ async fn try_local_youtube_download(
             task.output_path = Some(output_path.to_string_lossy().into_owned());
             task.total_bytes = 0;
             task.progress = 0.0;
-            task.speed = "Local yt-dlp".to_string();
+            task.speed = format!("Local {}", source_name);
             task.eta = "--:--".to_string();
             let _ = app_handle.emit("task-updated", task.clone());
             save_tasks(&state_lock.tasks, &state_lock.tasks_path);
@@ -616,8 +709,18 @@ async fn try_local_youtube_download(
 
     let ytdlp_path = resolve_ytdlp_path(app_handle);
     let node_path = resolve_node_path(app_handle);
+    let ffmpeg_path = resolve_ffmpeg_path(app_handle);
     let format = ytdlp_format(settings);
-    let cookie_attempts: Vec<Option<&str>> = vec![None, Some("chrome"), Some("safari"), Some("firefox")];
+    let cookie_attempts: Vec<Option<String>> = if is_youtube {
+        let mut sources = vec![None];
+        sources.extend(chrome_cookie_sources().into_iter().map(Some));
+        sources.extend([Some("safari".to_string()), Some("firefox".to_string())]);
+        sources
+    } else {
+        let mut sources: Vec<Option<String>> = chrome_cookie_sources().into_iter().map(Some).collect();
+        sources.extend([Some("safari".to_string()), Some("firefox".to_string()), None]);
+        sources
+    };
     let mut last_error = String::from("Local yt-dlp download failed");
 
     for browser in cookie_attempts {
@@ -627,10 +730,6 @@ async fn try_local_youtube_download(
         cmd.arg("--no-playlist")
             .arg("--newline")
             .arg("--no-part")
-            .arg("--remote-components")
-            .arg("ejs:github")
-            .arg("--extractor-args")
-            .arg("youtube:player_client=mweb,web")
             .arg("-f")
             .arg(&format)
             .arg("-o")
@@ -639,12 +738,36 @@ async fn try_local_youtube_download(
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
+        if is_youtube {
+            cmd.arg("--remote-components")
+                .arg("ejs:github")
+                .arg("--extractor-args")
+                .arg("youtube:player_client=mweb,web");
+        }
+
+        if settings.download_mode == "video" {
+            cmd.arg("--merge-output-format").arg("mp4");
+        }
+
+        if settings.download_mode == "audio" {
+            cmd.arg("--extract-audio")
+                .arg("--audio-format")
+                .arg(&audio_format)
+                .arg("--audio-quality")
+                .arg("0");
+        }
+
+        if let Some(ffmpeg_path) = &ffmpeg_path {
+            cmd.arg("--ffmpeg-location")
+                .arg(ffmpeg_path);
+        }
+
         if let Some(node_path) = &node_path {
             cmd.arg("--js-runtimes")
                 .arg(format!("node:{}", node_path.to_string_lossy()));
         }
 
-        if let Some(browser) = browser {
+        if let Some(browser) = browser.as_deref() {
             cmd.arg("--cookies-from-browser").arg(browser);
         }
 
@@ -660,27 +783,44 @@ async fn try_local_youtube_download(
         let progress_state = state.clone();
         let progress_app_handle = app_handle.clone();
         let progress_id = id.clone();
+        let aggregate_bilibili_progress = !is_youtube && settings.download_mode == "video";
         let progress_task = stdout_pipe.take().map(|stdout_reader| {
             tauri::async_runtime::spawn(async move {
                 let reader = BufReader::new(stdout_reader);
                 let mut lines = reader.lines();
                 let mut last_emit = std::time::Instant::now() - std::time::Duration::from_secs(1);
+                let mut download_stage = 0usize;
+                let mut destination_count = 0usize;
+                let mut last_mapped_progress = 0.0f64;
 
                 while let Ok(Some(line)) = lines.next_line().await {
                     let trimmed = line.trim();
                     let mut next_update: Option<DownloadTask> = None;
 
-                    if let Some(progress) = parse_ytdlp_progress_line(trimmed) {
+                    if trimmed.contains("[download] Destination:") {
+                        download_stage = destination_count;
+                        destination_count += 1;
+                    } else if let Some(progress) = parse_ytdlp_progress_line(trimmed) {
                         let now = std::time::Instant::now();
-                        if now.duration_since(last_emit).as_millis() < 120 && progress.progress < 0.99 {
+                        let mapped_progress = if aggregate_bilibili_progress {
+                            match download_stage {
+                                0 => progress.progress * 0.55,
+                                1 => 0.55 + progress.progress * 0.35,
+                                _ => 0.90 + progress.progress * 0.08,
+                            }
+                        } else {
+                            progress.progress
+                        }.max(last_mapped_progress).min(0.99);
+
+                        if now.duration_since(last_emit).as_millis() < 120 && mapped_progress < 0.99 {
                             continue;
                         }
 
                         let mut state_lock = progress_state.lock().unwrap();
                         if let Some(task) = state_lock.tasks.get_mut(&progress_id) {
                             task.status = "downloading".to_string();
-                            task.progress = progress.progress;
-                            if progress.total_bytes > 0 {
+                            task.progress = mapped_progress;
+                            if progress.total_bytes > 0 && !aggregate_bilibili_progress {
                                 task.total_bytes = progress.total_bytes;
                                 task.downloaded_bytes = progress.downloaded_bytes;
                             }
@@ -692,6 +832,7 @@ async fn try_local_youtube_download(
                             }
                             next_update = Some(task.clone());
                         }
+                        last_mapped_progress = mapped_progress;
                         last_emit = now;
                     } else if trimmed.contains("[Merger]") || trimmed.contains("[ExtractAudio]") || trimmed.contains("Merging formats") {
                         let mut state_lock = progress_state.lock().unwrap();
@@ -884,8 +1025,9 @@ async fn run_download_task(id: String, state: Arc<Mutex<AppState>>, app_handle: 
         return;
     }
 
-    if is_youtube_url(&url_to_download) {
-        match try_local_youtube_download(
+    if is_local_ytdlp_url(&url_to_download) {
+        let local_source_name = if is_youtube_url(&url_to_download) { "YouTube" } else { "Bilibili" };
+        match try_local_ytdlp_download(
             id.clone(),
             &url_to_download,
             &settings,
@@ -898,7 +1040,7 @@ async fn run_download_task(id: String, state: Arc<Mutex<AppState>>, app_handle: 
             }
             Ok(false) => {}
             Err(e) => {
-                update_task_failed(id, format!("Local YouTube download failed: {}", e), &state, &app_handle);
+                update_task_failed(id, format!("Local {} download failed: {}", local_source_name, e), &state, &app_handle);
                 return;
             }
         }

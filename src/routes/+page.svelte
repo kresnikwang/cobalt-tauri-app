@@ -1059,7 +1059,8 @@
   .empty-state p {
     color: var(--text-secondary);
     font-size: 13px;
-    max-width: 320px;
+    width: min(100%, 520px);
+    text-wrap: balance;
     margin: 0 0 32px 0;
     line-height: 1.5;
   }

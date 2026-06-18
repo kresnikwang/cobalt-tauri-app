@@ -1,3 +1,7 @@
 packages:
   - "."
   - "api"
+allowBuilds:
+  esbuild: true
+  ffmpeg-static: true
+  syscall-napi: true
