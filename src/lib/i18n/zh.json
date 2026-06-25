@@ -1,7 +1,5 @@
 {
     "app.title": "COBALT",
-    "nav.home": "首页",
-    "nav.remux": "转封装",
     "input.placeholder": "粘贴视频/音频链接...",
     "analyze": "解析",
 
@@ -52,7 +50,7 @@
     "settings.audio_format": "音频格式",
     "settings.clipboard": "剪贴板链接监控",
     "settings.api": "远程服务",
-    "settings.api.url": "Cobalt API 地址",
+    "settings.api.url": "媒体服务器地址",
     "settings.api.hint": "例如 https://api.example.com",
     "settings.api.note": "本地 App 会连接此服务解析并下载媒体",
     "settings.proxy": "代理",
@@ -80,10 +78,5 @@
     "error.unauthorized": "服务鉴权失败，请检查服务器登录状态",
     "error.media_gateway": "媒体服务器暂时不可用，请稍后重试",
     "error.media_server": "媒体服务器解析失败",
-    "error.unknown": "未知错误",
-
-    "remux.title": "转封装媒体文件",
-    "remux.subtitle": "将视频或音频文件拖放到此，重新封装为新容器格式。无重编码 — 仅转封装。",
-    "remux.drop_zone": "将文件拖到此处",
-    "remux.supported": "支持格式: MP4, WebM, MKV, MOV, MP3, OGG, Opus, WAV, FLAC, AAC"
+    "error.unknown": "未知错误"
 }

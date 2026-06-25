@@ -60,101 +60,6 @@ pub struct DownloadTask {
     pub output_path: Option<String>,
 }
 
-pub struct CobaltServer {
-    child: Option<std::process::Child>,
-    /// When false, the server was started by an earlier (orphaned) process
-    /// and we don't own its handle — so we must not kill it on Drop.
-    owns_process: bool,
-}
-
-impl Drop for CobaltServer {
-    fn drop(&mut self) {
-        // Only clean up the process we spawned ourselves. If the port was
-        // already taken by an orphaned process from a previous run, killing
-        // it would break other app instances that might be sharing it.
-        if !self.owns_process {
-            println!("Cobalt server is an external (pre-existing) process, leaving it running.");
-            return;
-        }
-        if let Some(child) = self.child.as_mut() {
-            println!("Killing Cobalt server child process (PID: {})...", child.id());
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
-}
-
-/// TCP connect probe to see if something is already listening on the Cobalt port.
-/// Uses a short 200ms timeout so it doesn't block startup.
-fn is_cobalt_port_open() -> bool {
-    use std::net::TcpStream;
-    use std::time::Duration;
-    let addr = "127.0.0.1:47301";
-    match TcpStream::connect_timeout(
-        &addr.parse().unwrap(),
-        Duration::from_millis(200),
-    ) {
-        Ok(_) => true,
-        Err(_) => false,
-    }
-}
-
-/// Poll the Cobalt port until it accepts a connection, or give up after `timeout_secs`.
-/// Returns true if the server became reachable in time.
-fn wait_for_server_ready(timeout_secs: u64) -> bool {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
-    while std::time::Instant::now() < deadline {
-        if is_cobalt_port_open() {
-            return true;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(150));
-    }
-    false
-}
-
-/// Kills any process currently listening on the specified port.
-fn kill_process_on_port(port: u16) {
-    #[cfg(unix)]
-    {
-        println!("Checking for processes occupying port {}...", port);
-        if let Ok(output) = Command::new("lsof")
-            .args(&["-t", &format!("-i:{}", port)])
-            .output()
-        {
-            let pids = String::from_utf8_lossy(&output.stdout);
-            for pid in pids.lines() {
-                if let Ok(pid_val) = pid.trim().parse::<i32>() {
-                    println!("Killing orphaned process {} on port {}", pid_val, port);
-                    let _ = Command::new("kill")
-                        .args(&["-9", &pid_val.to_string()])
-                        .status();
-                }
-            }
-        }
-    }
-    #[cfg(windows)]
-    {
-        println!("Checking for Windows processes occupying port {}...", port);
-        if let Ok(output) = Command::new("cmd")
-            .args(&["/C", &format!("netstat -ano | findstr :{}", port)])
-            .output()
-        {
-            let output_str = String::from_utf8_lossy(&output.stdout);
-            for line in output_str.lines() {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if let Some(pid_str) = parts.last() {
-                    if let Ok(pid_val) = pid_str.trim().parse::<u32>() {
-                        println!("Killing orphaned process {} on port {}", pid_val, port);
-                        let _ = Command::new("taskkill")
-                            .args(&["/F", "/PID", &pid_val.to_string()])
-                            .status();
-                    }
-                }
-            }
-        }
-    }
-}
-
 fn save_tasks(tasks: &HashMap<String, DownloadTask>, path: &std::path::Path) {
     if let Ok(content) = serde_json::to_string_pretty(tasks) {
         let _ = std::fs::write(path, content);
@@ -167,90 +72,6 @@ pub struct AppState {
     pub cancellations: HashMap<String, tokio::sync::oneshot::Sender<()>>,
     pub settings_path: PathBuf,
     pub tasks_path: PathBuf,
-    pub cobalt_server: Option<CobaltServer>,
-}
-
-fn start_cobalt_server(settings: &Settings, app_handle: Option<&tauri::AppHandle>) -> Option<CobaltServer> {
-    println!("Starting local Cobalt server in Rust...");
-    
-    // Clean up any process occupying port 47301 first to avoid port conflict
-    kill_process_on_port(47301);
-    
-    let bundled_api_path = app_handle
-        .and_then(|handle| handle.path().resolve("bundled-api/src/cobalt.js", BaseDirectory::Resource).ok())
-        .filter(|path| path.exists());
-
-    let bundled_node_path = app_handle
-        .and_then(|handle| handle.path().resolve("bin/node", BaseDirectory::Resource).ok())
-        .filter(|path| path.exists());
-
-    // Resolve path to api/src/cobalt.js. Packaged builds use bundled
-    // resources; development keeps the old workspace-relative fallbacks.
-    let mut api_path = bundled_api_path.unwrap_or_else(|| PathBuf::from("../api/src/cobalt.js"));
-    if !api_path.exists() {
-        api_path = PathBuf::from("api/src/cobalt.js");
-    }
-    if !api_path.exists() {
-        api_path = PathBuf::from("../../api/src/cobalt.js");
-    }
-
-    if !api_path.exists() {
-        eprintln!("Could not find cobalt.js API at {:?}", api_path);
-        return None;
-    }
-
-    let node_bin = bundled_node_path.unwrap_or_else(|| PathBuf::from("node"));
-    let api_root = api_path
-        .parent()
-        .and_then(|src_dir| src_dir.parent())
-        .map(|path| path.to_path_buf());
-    let mut cmd = Command::new(node_bin);
-    cmd.arg(&api_path);
-    if let Some(api_root) = api_root {
-        cmd.current_dir(api_root);
-    }
-
-    // Set environment variables
-    cmd.env("API_URL", "http://127.0.0.1:47301");
-    cmd.env("API_PORT", "47301");
-    cmd.env("API_LISTEN_ADDRESS", "127.0.0.1");
-    cmd.env("YOUTUBE_ALLOW_BETTER_AUDIO", "1");
-    cmd.env("FORCE_LOCAL_PROCESSING", "never");
-    cmd.env("ENABLE_DEPRECATED_YOUTUBE_HLS", "always");
-    cmd.env("DURATION_LIMIT", "86400");
-
-    if settings.proxy_enabled && !settings.proxy_url.trim().is_empty() {
-        let proxy = settings.proxy_url.trim();
-        cmd.env("HTTP_PROXY", proxy);
-        cmd.env("HTTPS_PROXY", proxy);
-        cmd.env("NO_PROXY", "localhost,127.0.0.1,::1");
-        println!("Cobalt Server Proxy enabled: {}", proxy);
-    }
-
-    cmd.stdout(Stdio::inherit());
-    cmd.stderr(Stdio::inherit());
-
-    match cmd.spawn() {
-        Ok(child) => {
-            println!("Cobalt server spawned with PID: {}", child.id());
-            
-            // Wait for port 47301 readiness to prevent early connection failure
-            if wait_for_server_ready(10) {
-                println!("Cobalt server is ready on port 47301.");
-            } else {
-                eprintln!("Cobalt server spawn succeeded, but failed to become ready within 10s.");
-            }
-            
-            Some(CobaltServer {
-                child: Some(child),
-                owns_process: true,
-            })
-        }
-        Err(e) => {
-            eprintln!("Failed to spawn Cobalt server: {}", e);
-            None
-        }
-    }
 }
 
 // -----------------------------------------------------------
@@ -330,8 +151,6 @@ fn should_relay_download_through_server(url: &str) -> bool {
         || host == "dailymotion.com"
         || host.ends_with(".dailymotion.com")
         || host == "dai.ly"
-        || host == "twitch.tv"
-        || host.ends_with(".twitch.tv")
 }
 
 fn normalized_api_url(settings: &Settings) -> String {
@@ -351,7 +170,7 @@ fn absolute_api_url(settings: &Settings, path_or_url: &str) -> String {
     }
 }
 
-async fn request_cobalt(payload: serde_json::Value, settings: &Settings, client: &reqwest::Client) -> Result<serde_json::Value, reqwest::Error> {
+async fn request_media_service(payload: serde_json::Value, settings: &Settings, client: &reqwest::Client) -> Result<serde_json::Value, reqwest::Error> {
     let res = client.post(normalized_api_url(settings))
         .header("Accept", "application/json")
         .header("Content-Type", "application/json")
@@ -362,7 +181,7 @@ async fn request_cobalt(payload: serde_json::Value, settings: &Settings, client:
     res.json::<serde_json::Value>().await
 }
 
-fn build_cobalt_payload(
+fn build_media_service_payload(
     url: &str,
     settings: &Settings,
     youtube_hls: bool,
@@ -972,19 +791,19 @@ async fn try_local_ytdlp_download(
     Err(last_error)
 }
 
-async fn request_cobalt_with_fallbacks(
+async fn request_media_service_with_fallbacks(
     url: &str,
     settings: &Settings,
     client: &reqwest::Client,
 ) -> Result<serde_json::Value, String> {
     if !is_youtube_url(url) {
-        return request_cobalt(
-            build_cobalt_payload(url, settings, false, None),
+        return request_media_service(
+            build_media_service_payload(url, settings, false, None),
             settings,
             client,
         )
         .await
-        .map_err(|e| format!("Cobalt API error: {}", e));
+        .map_err(|e| format!("Media service error: {}", e));
     }
 
     // Cookie-backed servers are most reliable with web-like clients for videos
@@ -1000,26 +819,26 @@ async fn request_cobalt_with_fallbacks(
         ("HLS_IOS", true, Some("IOS")),
     ];
 
-    let mut last_error = String::from("Unknown Cobalt API error");
+    let mut last_error = String::from("Unknown media service error");
 
     for (label, youtube_hls, innertube_client) in attempts {
-        let payload = build_cobalt_payload(url, settings, youtube_hls, innertube_client);
-        match request_cobalt(payload, settings, client).await {
+        let payload = build_media_service_payload(url, settings, youtube_hls, innertube_client);
+        match request_media_service(payload, settings, client).await {
             Ok(result) => {
                 if result.get("status").and_then(|s| s.as_str()) != Some("error") {
-                    println!("YouTube Cobalt request succeeded with {}.", label);
+                    println!("YouTube media service request succeeded with {}.", label);
                     return Ok(result);
                 }
 
                 last_error = result.get("text")
                     .and_then(|t| t.as_str())
                     .or_else(|| result.get("error").and_then(|e| e.get("code")).and_then(|c| c.as_str()))
-                    .unwrap_or("Unknown Cobalt API error")
+                    .unwrap_or("Unknown media service error")
                     .to_string();
-                println!("YouTube Cobalt request with {} failed: {}", label, last_error);
+                println!("YouTube media service request with {} failed: {}", label, last_error);
             }
             Err(e) => {
-                last_error = format!("Cobalt API error with {}: {}", label, e);
+                last_error = format!("Media service error with {}: {}", label, e);
                 println!("{}", last_error);
             }
         }
@@ -1128,7 +947,7 @@ async fn run_download_task(id: String, state: Arc<Mutex<AppState>>, app_handle: 
         }
     };
     
-    let result = match request_cobalt_with_fallbacks(&url_to_download, &settings, &client).await {
+    let result = match request_media_service_with_fallbacks(&url_to_download, &settings, &client).await {
         Ok(res) => res,
         Err(e) => {
             update_task_failed(id, e, &state, &app_handle);
@@ -1141,7 +960,7 @@ async fn run_download_task(id: String, state: Arc<Mutex<AppState>>, app_handle: 
         let err_msg = result.get("text")
             .and_then(|t| t.as_str())
             .or_else(|| result.get("error").and_then(|e| e.get("code")).and_then(|c| c.as_str()))
-            .unwrap_or("Unknown Cobalt API error");
+            .unwrap_or("Unknown media service error");
         update_task_failed(id, err_msg.to_string(), &state, &app_handle);
         return;
     }
@@ -1397,11 +1216,6 @@ fn save_settings(new_settings: Settings, state: tauri::State<'_, Arc<Mutex<AppSt
 }
 
 #[tauri::command]
-fn restart_app(app_handle: tauri::AppHandle) {
-    app_handle.restart();
-}
-
-#[tauri::command]
 fn select_directory() -> Option<String> {
     let folder = rfd::FileDialog::new()
         .pick_folder();
@@ -1553,31 +1367,6 @@ fn download_url(url: String, state: tauri::State<'_, Arc<Mutex<AppState>>>, app_
     task
 }
 
-#[tauri::command]
-fn restart_cobalt_server(state: tauri::State<'_, Arc<Mutex<AppState>>>, app_handle: tauri::AppHandle) -> Result<bool, String> {
-    let mut state = state.lock().unwrap();
-    
-    if let Some(mut server) = state.cobalt_server.take() {
-        if let Some(child) = server.child.as_mut() {
-            println!("Killing Cobalt server child process on restart (PID: {})...", child.id());
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
-    
-    kill_process_on_port(47301);
-    
-    let new_server = start_cobalt_server(&state.settings, Some(&app_handle));
-    let success = new_server.is_some();
-    state.cobalt_server = new_server;
-    
-    if success {
-        Ok(true)
-    } else {
-        Err("Failed to start Cobalt server".to_string())
-    }
-}
-
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1628,7 +1417,6 @@ pub fn run() {
                 cancellations: HashMap::new(),
                 settings_path,
                 tasks_path,
-                cobalt_server: None,
             }));
             
             app.manage(app_state.clone());
@@ -1667,8 +1455,6 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_settings,
             save_settings,
-            restart_app,
-            restart_cobalt_server,
             select_directory,
             reveal_in_finder,
             open_file,

@@ -13,8 +13,7 @@ export const platforms: ServicePlatform[] = [
   { name: 'Twitter / X', domain: 'x.com', color: '#ffffff', bg: 'rgba(255, 255, 255, 0.08)', keywords: ['twitter', 'x.com'] },
   { name: 'SoundCloud', domain: 'soundcloud.com', color: '#ff5500', bg: 'rgba(255, 85, 0, 0.15)', keywords: ['soundcloud'] },
   { name: 'Pinterest', domain: 'pinterest.com', color: '#bd081c', bg: 'rgba(189, 8, 28, 0.15)', keywords: ['pinterest'] },
-  { name: 'Dailymotion', domain: 'dailymotion.com', color: '#0066dc', bg: 'rgba(0, 102, 220, 0.15)', keywords: ['dailymotion'] },
-  { name: 'Streamable', domain: 'streamable.com', color: '#0f766e', bg: 'rgba(15, 118, 110, 0.15)', keywords: ['streamable.com'] }
+  { name: 'Dailymotion', domain: 'dailymotion.com', color: '#0066dc', bg: 'rgba(0, 102, 220, 0.15)', keywords: ['dailymotion'] }
 ];
 
 export function getServiceInfo(url: string, unknownLabel: string = 'Web Media') {

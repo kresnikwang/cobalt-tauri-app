@@ -1,7 +1,5 @@
 {
     "app.title": "COBALT",
-    "nav.home": "Home",
-    "nav.remux": "Remux",
     "input.placeholder": "Paste video/audio URL here...",
     "analyze": "Analyze",
 
@@ -52,7 +50,7 @@
     "settings.audio_format": "Audio Format",
     "settings.clipboard": "Clipboard Link Monitoring",
     "settings.api": "Remote Service",
-    "settings.api.url": "Cobalt API URL",
+    "settings.api.url": "Media Server URL",
     "settings.api.hint": "e.g. https://api.example.com",
     "settings.api.note": "The desktop app uses this service to resolve and stream media",
     "settings.proxy": "Proxy",
@@ -80,10 +78,5 @@
     "error.unauthorized": "Service authorization failed. Check server login.",
     "error.media_gateway": "Media server is temporarily unavailable.",
     "error.media_server": "Media server failed to resolve this link.",
-    "error.unknown": "Unknown error",
-
-    "remux.title": "Remux Media Files",
-    "remux.subtitle": "Drag and drop video or audio files to remux them into a new container format. No re-encoding — just remuxing.",
-    "remux.drop_zone": "Drop files here",
-    "remux.supported": "Supported: MP4, WebM, MKV, MOV, MP3, OGG, Opus, WAV, FLAC, AAC"
+    "error.unknown": "Unknown error"
 }

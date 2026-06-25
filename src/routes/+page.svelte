@@ -137,10 +137,6 @@
     await invoke('open_file', { path });
   }
 
-  async function restartApp() {
-    await invoke('restart_app');
-  }
-
   // Drag & Drop
   function handleDragOver(e: DragEvent) {
     e.preventDefault();
@@ -297,13 +293,9 @@
         <span class="platforms-title">{t('empty.sources')}</span>
         <div class="platforms-grid">
           {#each platforms as platform}
-            <!-- svelte-ignore a11y_click_events_have_key_events -->
-            <!-- svelte-ignore a11y_no_static_element_interactions -->
             <div 
               class="platform-card" 
               style="--color-glow: {platform.color}; --bg-glow: {platform.bg}"
-              onclick={() => inputUrl = `https://${platform.domain}/`}
-              title="Click to paste brand domain"
             >
               <span class="platform-card-name" style="color: {platform.color}">{platform.name}</span>
               <span class="platform-card-domain">{platform.domain}</span>
@@ -1351,24 +1343,6 @@
     font-size: 9px;
     color: var(--text-muted);
     font-style: italic;
-  }
-
-  .restart-btn {
-    background: rgba(255, 255, 255, 0.06);
-    border: 1px solid var(--border-color);
-    color: var(--text-primary);
-    padding: 8px 16px;
-    border-radius: 8px;
-    font-size: 12px;
-    font-weight: 500;
-    cursor: pointer;
-    transition: all 0.2s;
-    width: 100%;
-  }
-
-  .restart-btn:hover {
-    background: rgba(255, 255, 255, 0.1);
-    border-color: var(--accent-primary);
   }
 
   .settings-app-version {

@@ -1,7 +1,5 @@
 {
     "app.title": "COBALT",
-    "nav.home": "Главная",
-    "nav.remux": "Ремукс",
     "input.placeholder": "Вставь ссылку на видео/аудио...",
     "analyze": "Анализ",
 
@@ -52,7 +50,7 @@
     "settings.audio_format": "Формат аудио",
     "settings.clipboard": "Мониторинг буфера обмена",
     "settings.api": "Удаленный сервис",
-    "settings.api.url": "URL Cobalt API",
+    "settings.api.url": "URL медиасервера",
     "settings.api.hint": "например https://api.example.com",
     "settings.api.note": "Приложение использует этот сервис для обработки и загрузки медиа",
     "settings.proxy": "Прокси",
@@ -80,10 +78,5 @@
     "error.unauthorized": "Ошибка авторизации сервиса. Проверьте вход на сервере.",
     "error.media_gateway": "Медиасервер временно недоступен.",
     "error.media_server": "Медиасервер не смог обработать ссылку.",
-    "error.unknown": "Неизвестная ошибка",
-
-    "remux.title": "Ремукс медиафайлов",
-    "remux.subtitle": "Перетащите видео или аудио файлы для ремукса в новый контейнер. Без перекодирования — только ремукс.",
-    "remux.drop_zone": "Перетащите файлы сюда",
-    "remux.supported": "Поддерживаются: MP4, WebM, MKV, MOV, MP3, OGG, Opus, WAV, FLAC, AAC"
+    "error.unknown": "Неизвестная ошибка"
 }

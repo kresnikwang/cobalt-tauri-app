@@ -14,22 +14,15 @@ If pnpm reports ignored build scripts for `esbuild`, `ffmpeg-static`, or `syscal
 pnpm approve-builds esbuild ffmpeg-static syscall-napi
 ```
 
-The repository also stores these allow rules in `pnpm-workspace.yaml`. The release bundle script writes the same rules into the temporary bundled API directory before installing production dependencies.
+The repository also stores these allow rules in `pnpm-workspace.yaml`.
 
-Verify the bundled API can start without the workspace:
+Verify the bundled local runtimes exist:
 
 ```bash
-API_URL=http://127.0.0.1:47319 \
-API_PORT=47319 \
-API_LISTEN_ADDRESS=127.0.0.1 \
-YOUTUBE_ALLOW_BETTER_AUDIO=1 \
-FORCE_LOCAL_PROCESSING=never \
-ENABLE_DEPRECATED_YOUTUBE_HLS=always \
-DURATION_LIMIT=86400 \
-src-tauri/binaries/node src-tauri/bundled-api/src/cobalt.js
+test -x src-tauri/binaries/node
+test -x src-tauri/binaries/ffmpeg
+test -x src-tauri/binaries/yt-dlp
 ```
-
-Open `http://127.0.0.1:47319/` and confirm it returns Cobalt server info.
 
 ## Build
 
@@ -45,13 +38,13 @@ pnpm release:check
 pnpm tauri build --bundles app
 ```
 
-The preparation step copies:
+The preparation step copies or verifies:
 
 - `src-tauri/binaries/node`
 - `src-tauri/binaries/ffmpeg`
-- `src-tauri/bundled-api`
+- `src-tauri/binaries/yt-dlp`
 
-Keep `src-tauri/binaries/yt-dlp` available as well. It is used for local YouTube and Bilibili downloads. For packaged builds, avoid re-signing `yt-dlp` itself with Developer ID; ad-hoc signing the final `.app` bundle is fine for local testing.
+`yt-dlp` is used for local YouTube, Bilibili, and Dailymotion downloads. For packaged builds, avoid re-signing `yt-dlp` itself with Developer ID; ad-hoc signing the final `.app` bundle is fine for local testing.
 
 The app bundle is written to:
 
