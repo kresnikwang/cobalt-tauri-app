@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
+  import { fade, fly } from 'svelte/transition';
   import { invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
   
@@ -213,7 +214,7 @@
   ondrop={handleDrop}
 >
   {#if isDragging}
-    <div class="drop-overlay">
+    <div class="drop-overlay" transition:fade={{ duration: 160 }}>
       <div class="drop-card">
         <IconCloudDownload size={64} color="var(--accent-primary)" />
         <h2>{t('drop.title')}</h2>
@@ -228,7 +229,7 @@
       <span class="gradient-text">COBALT</span>
     </div>
     <div class="header-actions no-drag">
-      <button class="settings-btn" onclick={() => showSettings = !showSettings} title={t('settings.title')}>
+      <button class="settings-btn" onclick={() => showSettings = !showSettings} title={t('settings.title')} aria-label={t('settings.title')}>
         <IconSettings size={18} />
       </button>
     </div>
@@ -242,9 +243,12 @@
         placeholder={t('input.placeholder')}
         bind:value={inputUrl}
         onkeydown={(e) => e.key === 'Enter' && handleDownload()}
+        autocapitalize="off"
+        autocomplete="off"
+        spellcheck="false"
         class="url-input"
       />
-      <button class="download-trigger-btn" onclick={() => handleDownload()} disabled={!inputUrl}>
+      <button class="download-trigger-btn" onclick={() => handleDownload()} disabled={!inputUrl.trim()}>
         <IconDownload size={18} />
         <span>{t('analyze')}</span>
       </button>
@@ -261,16 +265,16 @@
   <nav class="tabs-nav">
     <div class="tabs-list">
       <button class="tab-btn" class:active={activeTab === 'all'} onclick={() => activeTab = 'all'}>
-        {t('tabs.all')} <span>{tasks.length}</span>
+        {t('tabs.all')} <span class="tab-count">{tasks.length}</span>
       </button>
       <button class="tab-btn" class:active={activeTab === 'downloading'} onclick={() => activeTab = 'downloading'}>
-        {t('tabs.downloading')} <span>{tasks.filter(t => ['downloading', 'analyzing', 'merging'].includes(t.status)).length}</span>
+        {t('tabs.downloading')} <span class="tab-count">{tasks.filter(t => ['downloading', 'analyzing', 'merging'].includes(t.status)).length}</span>
       </button>
       <button class="tab-btn" class:active={activeTab === 'completed'} onclick={() => activeTab = 'completed'}>
-        {t('tabs.completed')} <span>{tasks.filter(t => t.status === 'completed').length}</span>
+        {t('tabs.completed')} <span class="tab-count">{tasks.filter(t => t.status === 'completed').length}</span>
       </button>
       <button class="tab-btn" class:active={activeTab === 'failed'} onclick={() => activeTab = 'failed'}>
-        {t('tabs.failed')} <span>{tasks.filter(t => ['failed', 'cancelled'].includes(t.status)).length}</span>
+        {t('tabs.failed')} <span class="tab-count">{tasks.filter(t => ['failed', 'cancelled'].includes(t.status)).length}</span>
       </button>
     </div>
     {#if tasks.some(t => ['completed', 'failed', 'cancelled'].includes(t.status))}
@@ -293,10 +297,7 @@
         <span class="platforms-title">{t('empty.sources')}</span>
         <div class="platforms-grid">
           {#each platforms as platform}
-            <div 
-              class="platform-card" 
-              style="--color-glow: {platform.color}; --bg-glow: {platform.bg}"
-            >
+            <div class="platform-card">
               <span class="platform-card-name" style="color: {platform.color}">{platform.name}</span>
               <span class="platform-card-domain">{platform.domain}</span>
               <span class="platform-card-capability">{platformCapability(platform.name)}</span>
@@ -393,7 +394,7 @@
 
   <!-- Clipboard Toast Slide-up -->
   {#if clipboardToast.visible}
-    <div class="clipboard-toast glass">
+    <div class="clipboard-toast glass" in:fly={{ y: 12, duration: 220 }} out:fly={{ y: -8, duration: 140 }}>
       <div class="toast-content">
         <IconClipboard size={20} color="var(--accent-primary)" />
         <div class="toast-text">
@@ -412,11 +413,11 @@
   {#if showSettings}
     <!-- svelte-ignore a11y_click_events_have_key_events -->
     <!-- svelte-ignore a11y_no_static_element_interactions -->
-    <div class="settings-backdrop" onclick={() => showSettings = false}>
-      <div class="settings-panel glass" onclick={(e) => e.stopPropagation()}>
+    <div class="settings-backdrop" onclick={() => showSettings = false} transition:fade={{ duration: 160 }}>
+      <div class="settings-panel glass" role="dialog" aria-modal="true" aria-label={t('settings.title')} tabindex="-1" onclick={(e) => e.stopPropagation()} in:fly={{ x: 24, duration: 220 }} out:fly={{ x: 16, duration: 140 }}>
         <div class="settings-header">
           <h3>{t('settings.title')}</h3>
-          <button class="close-settings" onclick={() => showSettings = false}>
+          <button class="close-settings" onclick={() => showSettings = false} title={t('settings.title')} aria-label={t('settings.title')}>
             <IconX size={18} />
           </button>
         </div>
@@ -437,7 +438,7 @@
             <label for="save-path">{t('settings.save_folder')}</label>
             <div class="path-selector">
               <input type="text" readonly value={settings.savePath} id="save-path" class="path-input" />
-              <button class="btn-select-dir" onclick={selectDirectory}>
+              <button class="btn-select-dir" onclick={selectDirectory} title={t('settings.save_folder')} aria-label={t('settings.save_folder')}>
                 <IconFolder size={16} />
               </button>
             </div>
@@ -548,8 +549,8 @@
   .drop-card {
     background: var(--bg-card);
     border: 2px dashed var(--accent-primary);
-    border-radius: 20px;
-    padding: 40px;
+    border-radius: 18px;
+    padding: 36px;
     text-align: center;
     width: 80%;
     max-width: 400px;
@@ -564,16 +565,18 @@
     margin-top: 20px;
     margin-bottom: 8px;
     font-weight: 600;
+    text-wrap: balance;
   }
 
   .drop-card p {
     color: var(--text-secondary);
     margin: 0;
+    text-wrap: pretty;
   }
 
   /* Window Header */
   .window-header {
-    height: 52px;
+    min-height: 56px;
     padding-top: 12px; /* Margin for Traffic Lights on macOS */
     padding-left: 80px; /* Leave space for macOS Traffic Lights */
     padding-right: 20px;
@@ -587,7 +590,7 @@
     font-family: var(--font-display);
     font-size: 15px;
     font-weight: 700;
-    letter-spacing: 0.5px;
+    letter-spacing: 0;
     color: var(--text-primary);
   }
 
@@ -607,13 +610,15 @@
     border: none;
     color: var(--text-secondary);
     cursor: pointer;
-    width: 32px;
-    height: 32px;
+    width: 40px;
+    height: 40px;
     border-radius: 50%;
     display: flex;
     align-items: center;
     justify-content: center;
-    transition: all 0.2s;
+    transition-property: background-color, color, scale;
+    transition-duration: 150ms;
+    transition-timing-function: ease-out;
   }
 
   .settings-btn:hover {
@@ -621,9 +626,13 @@
     color: var(--text-primary);
   }
 
+  .settings-btn:active {
+    scale: 0.96;
+  }
+
   /* URL Paste Section */
   .paste-section {
-    padding: 22px 20px 14px 20px;
+    padding: 20px 20px 14px;
   }
 
   .input-glow-wrapper {
@@ -631,15 +640,18 @@
     align-items: center;
     background: var(--bg-input);
     border: 1px solid var(--border-color);
-    border-radius: 14px;
+    border-radius: 16px;
     padding: 4px 4px 4px 16px;
-    transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-    box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.3);
+    transition-property: border-color, box-shadow, background-color;
+    transition-duration: 180ms;
+    transition-timing-function: ease-out;
+    box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.34), 0 0 0 1px rgba(255, 255, 255, 0.015);
   }
 
   .input-glow-wrapper:focus-within {
-    border-color: var(--accent-primary);
-    box-shadow: 0 0 15px rgba(99, 102, 241, 0.3), inset 0 1px 2px rgba(0,0,0,0.4);
+    border-color: var(--border-focus);
+    background: rgba(9, 10, 14, 0.96);
+    box-shadow: 0 0 0 3px rgba(119, 133, 255, 0.12), inset 0 1px 2px rgba(0, 0, 0, 0.36);
   }
 
   .url-input {
@@ -649,37 +661,45 @@
     outline: none;
     color: var(--text-primary);
     font-size: 14px;
-    height: 38px;
+    height: 42px;
+    min-width: 0;
   }
 
   .url-input::placeholder {
     color: var(--text-muted);
   }
 
+  .url-input:focus-visible {
+    outline: none;
+  }
+
   .download-trigger-btn {
     background: var(--accent-gradient);
     border: none;
     color: white;
-    padding: 0 18px;
-    height: 38px;
-    border-radius: 10px;
+    padding: 0 14px 0 16px;
+    height: 42px;
+    border-radius: 12px;
     font-weight: 600;
     font-size: 13px;
     display: flex;
     align-items: center;
     gap: 6px;
     cursor: pointer;
-    transition: all 0.2s;
-    box-shadow: 0 4px 12px rgba(99, 102, 241, 0.3);
+    transition-property: transform, scale, box-shadow, background-color, color;
+    transition-duration: 150ms;
+    transition-timing-function: ease-out;
+    box-shadow: 0 5px 14px rgba(79, 91, 205, 0.28);
   }
 
   .download-trigger-btn:hover:not(:disabled) {
     transform: translateY(-1px);
-    box-shadow: 0 6px 16px rgba(99, 102, 241, 0.4);
+    box-shadow: 0 7px 18px rgba(79, 91, 205, 0.36);
   }
 
   .download-trigger-btn:active:not(:disabled) {
     transform: translateY(0);
+    scale: 0.96;
   }
 
   .download-trigger-btn:disabled {
@@ -707,7 +727,7 @@
     max-width: 220px;
     color: var(--text-secondary);
     background: rgba(255, 255, 255, 0.045);
-    border: 1px solid rgba(255, 255, 255, 0.055);
+    box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.055);
     font-size: 10.5px;
     font-weight: 600;
     white-space: nowrap;
@@ -718,7 +738,7 @@
   .context-pill.highlight {
     color: var(--accent-primary);
     background: rgba(99, 102, 241, 0.1);
-    border-color: rgba(99, 102, 241, 0.18);
+    box-shadow: 0 0 0 1px rgba(119, 133, 255, 0.2);
   }
 
   /* Tabs Nav */
@@ -727,7 +747,8 @@
     align-items: center;
     justify-content: space-between;
     padding: 0 20px;
-    margin-bottom: 12px;
+    margin-bottom: 14px;
+    gap: 12px;
   }
 
   .tabs-list {
@@ -735,20 +756,24 @@
     gap: 8px;
     background: rgba(0, 0, 0, 0.2);
     padding: 3px;
-    border-radius: 10px;
-    border: 1px solid rgba(255, 255, 255, 0.04);
+    border-radius: 13px;
+    box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.045);
+    overflow-x: auto;
   }
 
   .tab-btn {
     background: transparent;
     border: none;
     color: var(--text-secondary);
-    padding: 6px 12px;
+    min-height: 40px;
+    padding: 0 12px;
     font-size: 12px;
     font-weight: 500;
-    border-radius: 7px;
+    border-radius: 10px;
     cursor: pointer;
-    transition: all 0.2s;
+    transition-property: background-color, color, scale;
+    transition-duration: 150ms;
+    transition-timing-function: ease-out;
     display: flex;
     align-items: center;
     gap: 6px;
@@ -759,12 +784,22 @@
     color: var(--text-primary);
   }
 
+  .tab-btn:active {
+    scale: 0.96;
+  }
+
   .tab-btn span {
     background: rgba(255, 255, 255, 0.08);
     padding: 1px 6px;
     border-radius: 10px;
     font-size: 10px;
     color: var(--text-secondary);
+  }
+
+  .tab-count {
+    min-width: 1ch;
+    text-align: center;
+    font-variant-numeric: tabular-nums;
   }
 
   .tab-btn.active span {
@@ -778,11 +813,19 @@
     color: var(--text-muted);
     font-size: 11px;
     cursor: pointer;
-    transition: all 0.2s;
+    min-height: 40px;
+    padding: 0 4px;
+    transition-property: color, scale;
+    transition-duration: 150ms;
+    transition-timing-function: ease-out;
   }
 
   .clear-btn:hover {
     color: var(--text-secondary);
+  }
+
+  .clear-btn:active {
+    scale: 0.96;
   }
 
   /* Downloads Area */
@@ -800,7 +843,7 @@
 
   /* Task Card */
   .task-card {
-    border-radius: 12px;
+    border-radius: 16px;
     display: flex;
     align-items: center;
     overflow: hidden;
@@ -814,13 +857,13 @@
     width: 44px;
     height: 44px;
     flex: 0 0 44px;
-    border-radius: 12px;
+    border-radius: 10px;
     color: var(--service-color);
     background: var(--service-bg);
     display: flex;
     align-items: center;
     justify-content: center;
-    border: 1px solid rgba(255, 255, 255, 0.055);
+    box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.065);
   }
 
   .task-info-col {
@@ -853,13 +896,14 @@
     overflow: hidden;
     text-overflow: ellipsis;
     max-width: 100%;
+    text-wrap: pretty;
   }
 
   .task-service {
     font-size: 10px;
     font-weight: 700;
     text-transform: uppercase;
-    letter-spacing: 0.6px;
+    letter-spacing: 0;
     opacity: 0.85;
   }
 
@@ -869,7 +913,8 @@
     font-weight: 700;
     padding: 2px 6px;
     border-radius: 6px;
-    letter-spacing: 0.5px;
+    letter-spacing: 0;
+    font-variant-numeric: tabular-nums;
   }
 
   .task-status-badge.queued { background: rgba(255,255,255,0.08); color: var(--text-secondary); }
@@ -950,6 +995,7 @@
   .stats-text {
     display: inline-block;
     min-width: 0;
+    font-variant-numeric: tabular-nums;
   }
 
   .stats-text.speed {
@@ -987,36 +1033,42 @@
   }
 
   .action-circle-btn {
-    width: 26px;
-    height: 26px;
+    width: 40px;
+    height: 40px;
     border-radius: 50%;
-    border: 1px solid var(--border-color);
+    border: 0;
     background: rgba(255, 255, 255, 0.03);
     color: var(--text-secondary);
     display: flex;
     align-items: center;
     justify-content: center;
     cursor: pointer;
-    transition: all 0.2s;
+    box-shadow: var(--shadow-border);
+    transition-property: background-color, color, box-shadow, scale;
+    transition-duration: 150ms;
+    transition-timing-function: ease-out;
   }
 
   .action-circle-btn:hover {
     background: rgba(255, 255, 255, 0.08);
     color: var(--text-primary);
-    border-color: var(--border-hover);
-    transform: scale(1.05);
+    box-shadow: var(--shadow-border-hover);
   }
 
   .action-circle-btn.danger:hover {
     background: rgba(239, 68, 68, 0.15);
     color: #ef4444;
-    border-color: rgba(239, 68, 68, 0.3);
+    box-shadow: 0 0 0 1px rgba(239, 68, 68, 0.32);
   }
 
   .action-circle-btn.success:hover {
     background: rgba(16, 185, 129, 0.15);
     color: #10b981;
-    border-color: rgba(16, 185, 129, 0.3);
+    box-shadow: 0 0 0 1px rgba(16, 185, 129, 0.32);
+  }
+
+  .action-circle-btn:active {
+    scale: 0.96;
   }
 
   /* Empty State */
@@ -1026,7 +1078,7 @@
     align-items: center;
     justify-content: center;
     text-align: center;
-    padding: 44px 40px 34px;
+    padding: 38px 32px 34px;
     min-height: 360px;
   }
 
@@ -1039,7 +1091,7 @@
     align-items: center;
     justify-content: center;
     margin-bottom: 24px;
-    border: 1px solid rgba(255, 255, 255, 0.04);
+    box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.055), 0 12px 32px rgba(0, 0, 0, 0.2);
   }
 
   .empty-state h3 {
@@ -1047,13 +1099,14 @@
     font-size: 18px;
     margin: 0 0 8px 0;
     font-weight: 600;
+    text-wrap: balance;
   }
 
   .empty-state p {
     color: var(--text-secondary);
     font-size: 13px;
     width: min(100%, 520px);
-    text-wrap: balance;
+    text-wrap: pretty;
     margin: 0 0 32px 0;
     line-height: 1.5;
   }
@@ -1064,22 +1117,15 @@
     bottom: 20px;
     left: 20px;
     right: 20px;
-    border-radius: 14px;
+    border-radius: 16px;
     padding: 14px 16px;
     display: flex;
     justify-content: space-between;
     align-items: center;
     gap: 16px;
     z-index: 500;
-    box-shadow: var(--shadow-lg);
-    animation: slideUp 0.3s cubic-bezier(0.16, 1, 0.3, 1);
     background: rgba(22, 22, 33, 0.95);
-    border-color: rgba(99, 102, 241, 0.3);
-  }
-
-  @keyframes slideUp {
-    0% { transform: translateY(40px); opacity: 0; }
-    100% { transform: translateY(0); opacity: 1; }
+    box-shadow: 0 0 0 1px rgba(119, 133, 255, 0.28), var(--shadow-lg);
   }
 
   .toast-content {
@@ -1098,12 +1144,14 @@
     margin: 0 0 2px 0;
     font-size: 12.5px;
     font-weight: 600;
+    text-wrap: balance;
   }
 
   .toast-text p {
     margin: 0;
     font-size: 11px;
     color: var(--text-secondary);
+    text-wrap: pretty;
   }
 
   .truncate {
@@ -1121,10 +1169,13 @@
     border: none;
     font-size: 11px;
     font-weight: 600;
-    padding: 6px 12px;
-    border-radius: 8px;
+    min-height: 40px;
+    padding: 0 12px;
+    border-radius: 10px;
     cursor: pointer;
-    transition: all 0.2s;
+    transition-property: background-color, color, scale;
+    transition-duration: 150ms;
+    transition-timing-function: ease-out;
   }
 
   .toast-btn.primary {
@@ -1139,6 +1190,10 @@
 
   .toast-btn.secondary:hover {
     background: rgba(255, 255, 255, 0.12);
+  }
+
+  .toast-btn:active {
+    scale: 0.96;
   }
 
   /* Settings Panel Overlay */
@@ -1156,19 +1211,12 @@
   }
 
   .settings-panel {
-    width: 320px;
+    width: min(360px, 100%);
     height: 100%;
     background: rgba(20, 20, 30, 0.85);
-    border-left: 1px solid var(--border-color);
-    box-shadow: var(--shadow-lg);
+    box-shadow: -1px 0 0 rgba(255, 255, 255, 0.07), var(--shadow-lg);
     display: flex;
     flex-direction: column;
-    animation: slideIn 0.3s cubic-bezier(0.16, 1, 0.3, 1);
-  }
-
-  @keyframes slideIn {
-    0% { transform: translateX(100%); }
-    100% { transform: translateX(0); }
   }
 
   .settings-header {
@@ -1185,6 +1233,7 @@
     font-size: 15px;
     margin: 0;
     font-weight: 600;
+    text-wrap: balance;
   }
 
   .close-settings {
@@ -1192,17 +1241,24 @@
     border: none;
     color: var(--text-secondary);
     cursor: pointer;
-    width: 28px;
-    height: 28px;
+    width: 40px;
+    height: 40px;
     border-radius: 50%;
     display: flex;
     align-items: center;
     justify-content: center;
+    transition-property: background-color, color, scale;
+    transition-duration: 150ms;
+    transition-timing-function: ease-out;
   }
 
   .close-settings:hover {
     background: rgba(255, 255, 255, 0.08);
     color: var(--text-primary);
+  }
+
+  .close-settings:active {
+    scale: 0.96;
   }
 
   .settings-body {
@@ -1225,7 +1281,7 @@
     font-weight: 600;
     text-transform: uppercase;
     color: var(--text-secondary);
-    letter-spacing: 0.5px;
+    letter-spacing: 0;
   }
 
   .path-selector {
@@ -1237,40 +1293,49 @@
     flex: 1;
     background: var(--bg-input);
     border: 1px solid var(--border-color);
-    border-radius: 8px;
+    border-radius: 10px;
     color: var(--text-primary);
     padding: 0 10px;
     font-size: 12px;
-    height: 32px;
+    height: 40px;
     outline: none;
     text-overflow: ellipsis;
   }
 
   .btn-select-dir {
     background: rgba(255, 255, 255, 0.08);
-    border: 1px solid var(--border-color);
+    border: 0;
     color: var(--text-primary);
-    width: 32px;
-    height: 32px;
-    border-radius: 8px;
+    width: 40px;
+    height: 40px;
+    border-radius: 10px;
     cursor: pointer;
     display: flex;
     align-items: center;
     justify-content: center;
+    box-shadow: var(--shadow-border);
+    transition-property: background-color, box-shadow, scale;
+    transition-duration: 150ms;
+    transition-timing-function: ease-out;
   }
 
   .btn-select-dir:hover {
     background: rgba(255, 255, 255, 0.12);
+    box-shadow: var(--shadow-border-hover);
+  }
+
+  .btn-select-dir:active {
+    scale: 0.96;
   }
 
   .settings-select {
     background: var(--bg-input);
     border: 1px solid var(--border-color);
-    border-radius: 8px;
+    border-radius: 10px;
     color: var(--text-primary);
     padding: 0 10px;
     font-size: 12px;
-    height: 32px;
+    height: 40px;
     outline: none;
   }
 
@@ -1279,12 +1344,16 @@
     align-items: center;
     gap: 8px;
     cursor: pointer;
-    margin-top: 10px;
+    min-height: 40px;
+    margin-top: 6px;
   }
 
   .checkbox-item input {
     margin: 0;
     cursor: pointer;
+    width: 18px;
+    height: 18px;
+    accent-color: var(--accent-primary);
   }
 
   .checkbox-item label {
@@ -1311,7 +1380,7 @@
     font-size: 10px;
     font-weight: 700;
     text-transform: uppercase;
-    letter-spacing: 1px;
+    letter-spacing: 0;
     color: var(--accent-primary);
     margin-top: 4px;
   }
@@ -1319,11 +1388,11 @@
   .settings-input {
     background: var(--bg-input);
     border: 1px solid var(--border-color);
-    border-radius: 8px;
+    border-radius: 10px;
     color: var(--text-primary);
     padding: 0 10px;
     font-size: 12px;
-    height: 32px;
+    height: 40px;
     outline: none;
     width: 100%;
     box-sizing: border-box;
@@ -1340,9 +1409,10 @@
   }
 
   .setting-hint {
-    font-size: 9px;
+    font-size: 10px;
     color: var(--text-muted);
-    font-style: italic;
+    line-height: 1.45;
+    text-wrap: pretty;
   }
 
   .settings-app-version {
@@ -1357,7 +1427,7 @@
     font-size: 10px;
     font-weight: 700;
     text-transform: uppercase;
-    letter-spacing: 1.5px;
+    letter-spacing: 0;
     color: var(--text-muted);
     margin-top: 24px;
     margin-bottom: 14px;
@@ -1377,28 +1447,15 @@
     flex-direction: column;
     align-items: center;
     justify-content: center;
-    min-height: 62px;
-    padding: 9px 8px;
-    border-radius: 10px;
-    border: 1px solid rgba(255, 255, 255, 0.03);
-    background: rgba(255, 255, 255, 0.02);
-    cursor: pointer;
-    transition: all 0.2s cubic-bezier(0.25, 1, 0.5, 1);
-  }
-
-  .platform-card:hover {
-    background: rgba(255, 255, 255, 0.05);
-    border-color: var(--color-glow);
-    box-shadow: 0 4px 12px var(--bg-glow);
-    transform: translateY(-1px);
-  }
-
-  .platform-card:active {
-    transform: translateY(0);
+    min-height: 68px;
+    padding: 10px 8px;
+    border-radius: 12px;
+    background: rgba(255, 255, 255, 0.025);
+    box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.045);
   }
 
   .platform-card-name {
-    font-size: 11.5px;
+    font-size: 12px;
     font-weight: 600;
     margin-bottom: 2px;
   }
@@ -1406,7 +1463,7 @@
   .platform-card-domain {
     font-size: 8.5px;
     color: var(--text-muted);
-    letter-spacing: 0.2px;
+    letter-spacing: 0;
   }
 
   .platform-card-capability {
@@ -1421,5 +1478,54 @@
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+  }
+
+  @media (max-width: 600px) {
+    .window-header {
+      padding-right: 14px;
+    }
+
+    .paste-section,
+    .tabs-nav {
+      padding-left: 14px;
+      padding-right: 14px;
+    }
+
+    .downloads-area {
+      padding-left: 14px;
+      padding-right: 14px;
+    }
+
+    .tabs-list {
+      gap: 2px;
+      flex: 1;
+    }
+
+    .tab-btn {
+      justify-content: center;
+      padding: 0 9px;
+      white-space: nowrap;
+    }
+
+    .empty-state {
+      padding-left: 16px;
+      padding-right: 16px;
+    }
+
+    .platforms-grid {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .task-card {
+      gap: 10px;
+      padding-left: 10px;
+      padding-right: 10px;
+    }
+
+    .service-icon {
+      width: 40px;
+      height: 40px;
+      flex-basis: 40px;
+    }
   }
 </style>
