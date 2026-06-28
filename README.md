@@ -132,7 +132,7 @@ The output executable will be compiled and saved to:
 
 ### 🐙 GitHub Actions (Auto-Release CI)
 This repository includes a preconfigured GitHub Actions workflow at [.github/workflows/release.yml](.github/workflows/release.yml).
-- **Trigger**: Pushing a tag starting with `v` (e.g., `v0.1.0`) triggers the release runner.
+- **Trigger**: Pushing a tag starting with `v` (e.g., `v1.0.6`) triggers the release runner.
 - **Job**: The current workflow creates a GitHub Draft Release for tagged versions. Local signed builds are still produced from your macOS machine with `pnpm release:build`.
 
 ### 🌐 GitHub Pages (Project Landing Page)

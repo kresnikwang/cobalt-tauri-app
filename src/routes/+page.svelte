@@ -514,7 +514,7 @@
         </div>
 
         <div class="settings-footer">
-          <p class="settings-app-version">{t('settings.version', { version: '2.0.0' })}</p>
+          <p class="settings-app-version">{t('settings.version', { version: '1.0.6' })}</p>
         </div>
       </div>
     </div>
