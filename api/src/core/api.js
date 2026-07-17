@@ -404,12 +404,13 @@ export const runAPI = async (express, app, __dirname, isPrimary = true) => {
         }
 
         const filename = youtubeFilename(url);
+        // Prefer adaptive best (may need ffmpeg remux server-side when not streaming raw).
+        // Avoid mweb/web-only clients: without PO tokens they often collapse to ~360p progressive.
         const args = [
             "--cookies", ytdlpCookiesPath,
             "--js-runtimes", `node:${ytdlpNodePath}`,
             "--remote-components", "ejs:github",
-            "--extractor-args", "youtube:player_client=mweb,web",
-            "-f", "18/best[ext=mp4]/best",
+            "-f", "bestvideo*+bestaudio/best",
             "-o", "-",
             url
         ];

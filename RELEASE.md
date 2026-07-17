@@ -59,7 +59,7 @@ mkdir -p src-tauri/target/release/bundle/zip
 codesign --force --deep --sign - src-tauri/target/release/bundle/macos/Cobalt.app
 ditto -c -k --sequesterRsrc --keepParent \
   src-tauri/target/release/bundle/macos/Cobalt.app \
-  src-tauri/target/release/bundle/zip/Cobalt_1.0.6_aarch64.app.zip
+  src-tauri/target/release/bundle/zip/Cobalt_1.0.8_aarch64.app.zip
 ```
 
 ## Public macOS Distribution

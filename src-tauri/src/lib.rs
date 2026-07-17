@@ -299,6 +299,58 @@ fn unique_output_path(save_dir: &std::path::Path, filename: &str) -> PathBuf {
     output_path
 }
 
+const YTDLP_MEDIA_EXTS: &[&str] = &[
+    "mkv", "mp4", "webm", "m4a", "mp3", "opus", "ogg", "wav", "flac", "aac",
+];
+
+fn ytdlp_stem_has_output(save_dir: &std::path::Path, stem: &str) -> bool {
+    YTDLP_MEDIA_EXTS.iter().any(|ext| save_dir.join(format!("{}.{}", stem, ext)).exists())
+}
+
+/// Pick a collision-free basename for yt-dlp's `%(ext)s` template.
+fn unique_ytdlp_stem(save_dir: &std::path::Path, base: &str) -> String {
+    let safe_base = std::path::Path::new(base)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(base)
+        .to_string();
+    let mut stem = safe_base.clone();
+    let mut dup_index = 1;
+    while ytdlp_stem_has_output(save_dir, &stem) {
+        stem = format!("{} ({})", safe_base, dup_index);
+        dup_index += 1;
+    }
+    stem
+}
+
+fn resolve_ytdlp_output(save_dir: &std::path::Path, stem: &str) -> Option<PathBuf> {
+    YTDLP_MEDIA_EXTS
+        .iter()
+        .map(|ext| save_dir.join(format!("{}.{}", stem, ext)))
+        .find(|path| {
+            path.exists()
+                && std::fs::metadata(path)
+                    .map(|meta| meta.len() > 0)
+                    .unwrap_or(false)
+        })
+}
+
+fn remove_ytdlp_outputs(save_dir: &std::path::Path, stem: &str) {
+    let prefix = format!("{}.", stem);
+    if let Ok(entries) = std::fs::read_dir(save_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            // Final file (stem.ext) or yt-dlp intermediates (stem.f137.mp4, etc.).
+            if name == stem || name.starts_with(&prefix) {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+}
+
 fn resolve_ytdlp_path(app_handle: &tauri::AppHandle) -> PathBuf {
     let candidates = [
         app_handle.path().resolve("binaries/yt-dlp", BaseDirectory::Resource).ok(),
@@ -380,10 +432,16 @@ fn ytdlp_format(settings: &Settings) -> String {
         return "bestaudio/best".to_string();
     }
 
+    // Prefer H.264 + AAC so macOS QuickTime / Finder can play natively (mp4).
+    // Fall back to any adaptive best (VP9/AV1 + opus) when H.264 is unavailable.
+    // bestvideo* allows formats yt-dlp would otherwise deprioritize.
     match settings.video_quality.as_str() {
-        "max" => "best[ext=mp4]/best".to_string(),
+        "max" => {
+            "bestvideo*[vcodec^=avc1]+bestaudio[acodec^=mp4a]/bestvideo*[vcodec^=avc1]+bestaudio/bestvideo*+bestaudio/best"
+                .to_string()
+        }
         quality => format!(
-            "bestvideo[height<={quality}][ext=mp4]+bestaudio[ext=m4a]/best[height<={quality}][ext=mp4]/18/best"
+            "bestvideo*[vcodec^=avc1][height<={quality}]+bestaudio[acodec^=mp4a]/bestvideo*[vcodec^=avc1][height<={quality}]+bestaudio/bestvideo*[height<={quality}]+bestaudio/best[height<={quality}]/best"
         ),
     }
 }
@@ -547,24 +605,31 @@ async fn try_local_ytdlp_download(
         dailymotion_video_id(url)
     }.unwrap_or_else(|| id.clone());
     let audio_format = ytdlp_audio_format(settings);
-    let filename = if settings.download_mode == "audio" {
-        format!("{}_{}.{}", source_prefix, video_id, audio_format)
-    } else {
-        format!("{}_{}.mp4", source_prefix, video_id)
-    };
-
     let save_path = PathBuf::from(&settings.save_path);
     if !save_path.exists() {
         std::fs::create_dir_all(&save_path).ok();
     }
-    let output_path = unique_output_path(&save_path, &filename);
+
+    // Use yt-dlp's %(ext)s so best-quality AV1/VP9 merges can land as mkv/webm, not forced .mp4.
+    let output_stem = unique_ytdlp_stem(
+        &save_path,
+        &format!("{}_{}", source_prefix, video_id),
+    );
+    let output_template = save_path.join(format!("{}.%(ext)s", output_stem));
+    let provisional_filename = if settings.download_mode == "audio" {
+        format!("{}.{}", output_stem, audio_format)
+    } else {
+        // Prefer mp4 when H.264+AAC is available; %(ext)s may still resolve to mkv/webm.
+        format!("{}.mp4", output_stem)
+    };
+    let provisional_path = save_path.join(&provisional_filename);
 
     let mut abort_rx = {
         let mut state_lock = state.lock().unwrap();
         if let Some(task) = state_lock.tasks.get_mut(&id) {
-            task.title = filename.clone();
+            task.title = provisional_filename.clone();
             task.status = "downloading".to_string();
-            task.output_path = Some(output_path.to_string_lossy().into_owned());
+            task.output_path = Some(provisional_path.to_string_lossy().into_owned());
             task.total_bytes = 0;
             task.progress = 0.0;
             task.speed = format!("Local {}", source_name);
@@ -600,7 +665,7 @@ async fn try_local_ytdlp_download(
     let mut last_error = String::from("Local yt-dlp download failed");
 
     for browser in cookie_attempts {
-        let _ = std::fs::remove_file(&output_path);
+        remove_ytdlp_outputs(&save_path, &output_stem);
 
         let mut cmd = TokioCommand::new(&ytdlp_path);
         cmd.arg("--no-playlist")
@@ -609,20 +674,26 @@ async fn try_local_ytdlp_download(
             .arg("-f")
             .arg(&format)
             .arg("-o")
-            .arg(&output_path)
+            .arg(&output_template)
             .arg(url)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
         if is_youtube {
+            // Use yt-dlp defaults (android_vr etc.) so adaptive 720p–4K streams are available.
+            // Forcing mweb/web without PO tokens often collapses to progressive ~360p only.
             cmd.arg("--remote-components")
-                .arg("ejs:github")
-                .arg("--extractor-args")
-                .arg("youtube:player_client=mweb,web");
+                .arg("ejs:github");
         }
 
         if settings.download_mode == "video" {
-            cmd.arg("--merge-output-format").arg("mp4");
+            // Prefer mp4 for macOS playback when codecs allow (H.264/AAC).
+            // mkv/webm remain as fallbacks for AV1/VP9 + opus merges.
+            if is_youtube {
+                cmd.arg("--merge-output-format").arg("mp4/mkv/webm");
+            } else {
+                cmd.arg("--merge-output-format").arg("mp4");
+            }
         }
 
         if settings.download_mode == "audio" {
@@ -659,7 +730,9 @@ async fn try_local_ytdlp_download(
         let progress_state = state.clone();
         let progress_app_handle = app_handle.clone();
         let progress_id = id.clone();
-        let aggregate_bilibili_progress = is_bilibili && settings.download_mode == "video";
+        // Aggregate multi-stage progress for any DASH merge (YouTube/Bilibili video).
+        let aggregate_dash_progress = settings.download_mode == "video"
+            && (is_bilibili || is_youtube);
         let progress_task = stdout_pipe.take().map(|stdout_reader| {
             tauri::async_runtime::spawn(async move {
                 let reader = BufReader::new(stdout_reader);
@@ -678,7 +751,7 @@ async fn try_local_ytdlp_download(
                         destination_count += 1;
                     } else if let Some(progress) = parse_ytdlp_progress_line(trimmed) {
                         let now = std::time::Instant::now();
-                        let mapped_progress = if aggregate_bilibili_progress {
+                        let mapped_progress = if aggregate_dash_progress {
                             match download_stage {
                                 0 => progress.progress * 0.55,
                                 1 => 0.55 + progress.progress * 0.35,
@@ -696,7 +769,7 @@ async fn try_local_ytdlp_download(
                         if let Some(task) = state_lock.tasks.get_mut(&progress_id) {
                             task.status = "downloading".to_string();
                             task.progress = mapped_progress;
-                            if progress.total_bytes > 0 && !aggregate_bilibili_progress {
+                            if progress.total_bytes > 0 && !aggregate_dash_progress {
                                 task.total_bytes = progress.total_bytes;
                                 task.downloaded_bytes = progress.downloaded_bytes;
                             }
@@ -742,7 +815,7 @@ async fn try_local_ytdlp_download(
                 if let Some(handle) = progress_task {
                     handle.abort();
                 }
-                let _ = std::fs::remove_file(&output_path);
+                remove_ytdlp_outputs(&save_path, &output_stem);
                 return Ok(true);
             }
         };
@@ -752,24 +825,33 @@ async fn try_local_ytdlp_download(
         }
 
         match wait_result {
-            Ok(status) if status.success() && output_path.exists() => {
-                let downloaded_bytes = std::fs::metadata(&output_path)
-                    .map(|m| m.len())
-                    .unwrap_or(0);
-                if downloaded_bytes > 0 {
-                    let mut state_lock = state.lock().unwrap();
-                    state_lock.cancellations.remove(&id);
-                    if let Some(task) = state_lock.tasks.get_mut(&id) {
-                        task.status = "completed".to_string();
-                        task.progress = 1.0;
-                        task.downloaded_bytes = downloaded_bytes;
-                        task.total_bytes = downloaded_bytes;
-                        task.speed = "0 B/s".to_string();
-                        task.eta = "Done".to_string();
-                        let _ = app_handle.emit("task-updated", task.clone());
-                        save_tasks(&state_lock.tasks, &state_lock.tasks_path);
+            Ok(status) if status.success() => {
+                if let Some(final_path) = resolve_ytdlp_output(&save_path, &output_stem) {
+                    let downloaded_bytes = std::fs::metadata(&final_path)
+                        .map(|m| m.len())
+                        .unwrap_or(0);
+                    if downloaded_bytes > 0 {
+                        let final_name = final_path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or(&provisional_filename)
+                            .to_string();
+                        let mut state_lock = state.lock().unwrap();
+                        state_lock.cancellations.remove(&id);
+                        if let Some(task) = state_lock.tasks.get_mut(&id) {
+                            task.title = final_name;
+                            task.output_path = Some(final_path.to_string_lossy().into_owned());
+                            task.status = "completed".to_string();
+                            task.progress = 1.0;
+                            task.downloaded_bytes = downloaded_bytes;
+                            task.total_bytes = downloaded_bytes;
+                            task.speed = "0 B/s".to_string();
+                            task.eta = "Done".to_string();
+                            let _ = app_handle.emit("task-updated", task.clone());
+                            save_tasks(&state_lock.tasks, &state_lock.tasks_path);
+                        }
+                        return Ok(true);
                     }
-                    return Ok(true);
                 }
                 last_error = "Local yt-dlp produced a 0-byte file".to_string();
             }
@@ -783,7 +865,7 @@ async fn try_local_ytdlp_download(
         }
     }
 
-    let _ = std::fs::remove_file(&output_path);
+    remove_ytdlp_outputs(&save_path, &output_stem);
     {
         let mut state_lock = state.lock().unwrap();
         state_lock.cancellations.remove(&id);
@@ -1004,30 +1086,11 @@ async fn run_download_task(id: String, state: Arc<Mutex<AppState>>, app_handle: 
         return;
     }
     
-    let safe_filename = std::path::Path::new(&filename)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or(&filename);
-
     let save_path = std::path::PathBuf::from(&settings.save_path);
     if !save_path.exists() {
         std::fs::create_dir_all(&save_path).ok();
     }
-    let mut output_path = save_path.join(safe_filename);
-    let ext = output_path.extension()
-        .and_then(|s| s.to_str())
-        .map(|s| format!(".{}", s))
-        .unwrap_or_else(|| "".to_string());
-    let base = output_path.file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or(safe_filename)
-        .to_string();
-
-    let mut dup_index = 1;
-    while output_path.exists() {
-        output_path = save_path.join(format!("{} ({}){}", base, dup_index, ext));
-        dup_index += 1;
-    }
+    let output_path = unique_output_path(&save_path, &filename);
     
     let mut abort_rx = {
         let mut state_lock = state.lock().unwrap();
