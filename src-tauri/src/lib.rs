@@ -8,6 +8,9 @@ use tokio::process::Command as TokioCommand;
 use futures_util::StreamExt;
 use tauri::{Manager, Emitter};
 use tauri::path::BaseDirectory;
+use base64::Engine;
+
+mod sniffer;
 
 fn default_api_url() -> String {
     "http://43.156.122.169".to_string()
@@ -72,6 +75,7 @@ pub struct AppState {
     pub cancellations: HashMap<String, tokio::sync::oneshot::Sender<()>>,
     pub settings_path: PathBuf,
     pub tasks_path: PathBuf,
+    pub captured_downloads: HashMap<String, sniffer::DownloadDescriptor>,
 }
 
 // -----------------------------------------------------------
@@ -983,6 +987,12 @@ async fn run_download_task(id: String, state: Arc<Mutex<AppState>>, app_handle: 
         return;
     }
 
+    let captured_descriptor = { state.lock().unwrap().captured_downloads.remove(&id) };
+    if let Some(descriptor) = captured_descriptor {
+        download_captured_stream(id, descriptor, settings, state, app_handle).await;
+        return;
+    }
+
     if is_local_ytdlp_url(&url_to_download) {
         let local_source_name = if is_youtube_url(&url_to_download) {
             "YouTube"
@@ -1243,6 +1253,132 @@ async fn run_download_task(id: String, state: Arc<Mutex<AppState>>, app_handle: 
     process_queue(state, app_handle);
 }
 
+async fn download_captured_stream(id: String, descriptor: sniffer::DownloadDescriptor, settings: Settings, state: Arc<Mutex<AppState>>, app_handle: tauri::AppHandle) {
+    if descriptor.kind == "playlist" {
+        update_task_failed(id, "Playlist captures are not supported yet. Capture a direct video or audio request instead.".into(), &state, &app_handle);
+        return;
+    }
+    let mut builder = reqwest::Client::builder();
+    if settings.proxy_enabled && !settings.proxy_url.trim().is_empty() {
+        if let Ok(proxy) = reqwest::Proxy::all(settings.proxy_url.trim()) { builder = builder.proxy(proxy.no_proxy(reqwest::NoProxy::from_string("localhost,127.0.0.1"))); }
+    }
+    let client = match builder.build() { Ok(client) => client, Err(error) => { update_task_failed(id, format!("Failed to build HTTP client: {error}"), &state, &app_handle); return; } };
+    let save_path = PathBuf::from(&settings.save_path); let _ = std::fs::create_dir_all(&save_path); let output_path = unique_output_path(&save_path, &descriptor.filename);
+    let mut request = client.get(&descriptor.url);
+    for (name, value) in &descriptor.headers { request = request.header(name, value); }
+    let response = match request.send().await { Ok(response) => response, Err(error) => { update_task_failed(id, format!("Captured media request failed: {error}"), &state, &app_handle); return; } };
+    if !response.status().is_success() { update_task_failed(id, format!("Captured media server returned {}", response.status()), &state, &app_handle); return; }
+    let total_bytes = response.content_length().unwrap_or(0);
+    let mut abort_rx = { let mut lock = state.lock().unwrap(); let task = lock.tasks.get_mut(&id).unwrap(); task.title = descriptor.filename.clone(); task.status = "downloading".into(); task.total_bytes = total_bytes; task.output_path = Some(output_path.to_string_lossy().into_owned()); let _ = app_handle.emit("task-updated", task.clone()); let (tx, rx) = tokio::sync::oneshot::channel(); lock.cancellations.insert(id.clone(), tx); rx };
+    let mut file = match tokio::fs::File::create(&output_path).await { Ok(file) => file, Err(error) => { update_task_failed(id, format!("Disk write error: {error}"), &state, &app_handle); return; } };
+    let mut stream = response.bytes_stream(); let mut downloaded = 0u64; let mut last_update = std::time::Instant::now();
+    loop { tokio::select! {
+        _ = &mut abort_rx => { drop(file); let _ = std::fs::remove_file(&output_path); return; }
+        chunk = stream.next() => match chunk { Some(Ok(chunk)) => { if let Err(error) = file.write_all(&chunk).await { update_task_failed(id, format!("Disk write error: {error}"), &state, &app_handle); return; } downloaded += chunk.len() as u64; if last_update.elapsed().as_millis() >= 120 { let mut lock = state.lock().unwrap(); if let Some(task) = lock.tasks.get_mut(&id) { task.downloaded_bytes = downloaded; if total_bytes > 0 { task.progress = (downloaded as f64 / total_bytes as f64).min(0.99); } let _ = app_handle.emit("task-updated", task.clone()); } last_update = std::time::Instant::now(); } }, Some(Err(error)) => { update_task_failed(id, format!("Captured download error: {error}"), &state, &app_handle); return; }, None => break }
+    }}
+    if downloaded == 0 { update_task_failed(id, "No data received from captured media URL".into(), &state, &app_handle); return; }
+    if let Some(decode_key) = descriptor.decode_key.as_deref() {
+        if let Err(error) = decode_wechat_file(&output_path, decode_key) { let _ = std::fs::remove_file(&output_path); update_task_failed(id, format!("WeChat media decryption failed: {error}"), &state, &app_handle); return; }
+    }
+    let mut lock = state.lock().unwrap(); lock.cancellations.remove(&id); if let Some(task) = lock.tasks.get_mut(&id) { task.status="completed".into(); task.progress=1.0; task.downloaded_bytes=downloaded; task.eta="Done".into(); let _ = app_handle.emit("task-updated", task.clone()); save_tasks(&lock.tasks, &lock.tasks_path); } drop(lock); process_queue(state, app_handle);
+}
+
+fn decode_wechat_file(path: &std::path::Path, encoded_key: &str) -> Result<(), String> {
+    if encoded_key.is_empty() { return Ok(()); }
+    if let Ok(seed) = encoded_key.trim().parse::<u64>() {
+        return decode_wechat_isaac64(path, seed);
+    }
+    let key = base64::engine::general_purpose::STANDARD.decode(encoded_key).map_err(|error| error.to_string())?;
+    if key.is_empty() { return Ok(()); }
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let mut file = std::fs::OpenOptions::new().read(true).write(true).open(path).map_err(|error| error.to_string())?;
+    let mut bytes = vec![0; key.len()]; let count = file.read(&mut bytes).map_err(|error| error.to_string())?;
+    for (index, byte) in bytes.iter_mut().take(count).enumerate() { *byte ^= key[index]; }
+    file.seek(SeekFrom::Start(0)).map_err(|error| error.to_string())?;
+    file.write_all(&bytes[..count]).map_err(|error| error.to_string())?;
+    file.flush().map_err(|error| error.to_string())
+}
+
+struct Isaac64 { rand_cnt: usize, seed: [u64; 256], mm: [u64; 256], aa: u64, bb: u64, cc: u64 }
+impl Isaac64 {
+    fn new(key: u64) -> Self { let mut ctx = Self { rand_cnt: 255, seed: [0; 256], mm: [0; 256], aa: 0, bb: 0, cc: 0 }; ctx.init(key); ctx }
+    fn init(&mut self, key: u64) {
+        const GOLDEN: u64 = 0x9e3779b97f4a7c13;
+        let (mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h) = (GOLDEN, GOLDEN, GOLDEN, GOLDEN, GOLDEN, GOLDEN, GOLDEN, GOLDEN);
+        self.seed[0] = key;
+        for _ in 0..4 { isaac_mix(&mut a, &mut b, &mut c, &mut d, &mut e, &mut f, &mut g, &mut h); }
+        for i in (0..256).step_by(8) {
+            a = a.wrapping_add(self.seed[i]); b = b.wrapping_add(self.seed[i+1]); c = c.wrapping_add(self.seed[i+2]); d = d.wrapping_add(self.seed[i+3]);
+            e = e.wrapping_add(self.seed[i+4]); f = f.wrapping_add(self.seed[i+5]); g = g.wrapping_add(self.seed[i+6]); h = h.wrapping_add(self.seed[i+7]);
+            isaac_mix(&mut a, &mut b, &mut c, &mut d, &mut e, &mut f, &mut g, &mut h);
+            self.mm[i] = a; self.mm[i+1] = b; self.mm[i+2] = c; self.mm[i+3] = d; self.mm[i+4] = e; self.mm[i+5] = f; self.mm[i+6] = g; self.mm[i+7] = h;
+        }
+        for i in (0..256).step_by(8) {
+            a = a.wrapping_add(self.mm[i]); b = b.wrapping_add(self.mm[i+1]); c = c.wrapping_add(self.mm[i+2]); d = d.wrapping_add(self.mm[i+3]);
+            e = e.wrapping_add(self.mm[i+4]); f = f.wrapping_add(self.mm[i+5]); g = g.wrapping_add(self.mm[i+6]); h = h.wrapping_add(self.mm[i+7]);
+            isaac_mix(&mut a, &mut b, &mut c, &mut d, &mut e, &mut f, &mut g, &mut h);
+            self.mm[i] = a; self.mm[i+1] = b; self.mm[i+2] = c; self.mm[i+3] = d; self.mm[i+4] = e; self.mm[i+5] = f; self.mm[i+6] = g; self.mm[i+7] = h;
+        }
+        self.isaac64(); self.rand_cnt = 255;
+    }
+    fn next(&mut self) -> u64 {
+        let res = self.seed[self.rand_cnt];
+        if self.rand_cnt == 0 { self.isaac64(); self.rand_cnt = 255; } else { self.rand_cnt -= 1; }
+        res
+    }
+    fn isaac64(&mut self) {
+		self.cc = self.cc.wrapping_add(1);
+		self.bb = self.bb.wrapping_add(self.cc);
+		let mut a = self.aa;
+		let mut b = self.bb;
+        for i in (0..256).step_by(4) {
+			self.step(&mut a, &mut b, i, |x| !(x ^ (x << 21)));
+			self.step(&mut a, &mut b, i+1, |x| x ^ (x >> 5));
+			self.step(&mut a, &mut b, i+2, |x| x ^ (x << 12));
+			self.step(&mut a, &mut b, i+3, |x| x ^ (x >> 33));
+        }
+		self.bb = b;
+		self.aa = a;
+    }
+    fn step<F>(&mut self, a: &mut u64, b: &mut u64, i: usize, fn_op: F) where F: Fn(u64) -> u64 {
+        let x = self.mm[i]; *a = fn_op(*a).wrapping_add(self.mm[(i + 128) % 256]);
+        let y = self.mm[(x >> 3) as usize % 256].wrapping_add(*a).wrapping_add(*b);
+        self.mm[i] = y; *b = self.mm[(y >> 11) as usize % 256].wrapping_add(x); self.seed[i] = *b;
+    }
+}
+fn isaac_mix(a: &mut u64, b: &mut u64, c: &mut u64, d: &mut u64, e: &mut u64, f: &mut u64, g: &mut u64, h: &mut u64) {
+	*a = a.wrapping_sub(*e); *f ^= *h >> 9;  *h = h.wrapping_add(*a);
+	*b = b.wrapping_sub(*f); *g ^= *a << 9;  *a = a.wrapping_add(*b);
+	*c = c.wrapping_sub(*g); *h ^= *b >> 23; *b = b.wrapping_add(*c);
+	*d = d.wrapping_sub(*h); *a ^= *c << 15; *c = c.wrapping_add(*d);
+	*e = e.wrapping_sub(*a); *b ^= *d >> 14; *d = d.wrapping_add(*e);
+	*f = f.wrapping_sub(*b); *c ^= *e << 20; *e = e.wrapping_add(*f);
+	*g = g.wrapping_sub(*c); *d ^= *f >> 17; *f = f.wrapping_add(*g);
+	*h = h.wrapping_sub(*d); *e ^= *g << 14; *g = g.wrapping_add(*h);
+}
+fn xor_wechat_isaac64_prefix(bytes: &mut [u8], seed: u64) {
+	let mut isaac = Isaac64::new(seed);
+	for chunk in bytes.chunks_mut(8).take(131072 / 8) {
+		let random = isaac.next().to_be_bytes();
+		for (byte, key) in chunk.iter_mut().zip(random.iter()) {
+			*byte ^= key;
+		}
+	}
+}
+fn decode_wechat_isaac64(path: &std::path::Path, seed: u64) -> Result<(), String> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let mut file = std::fs::OpenOptions::new().read(true).write(true).open(path).map_err(|e| e.to_string())?;
+    let metadata = file.metadata().map_err(|e| e.to_string())?;
+    let len = metadata.len() as usize; if len == 0 { return Ok(()); }
+    let xor_len = std::cmp::min(131072, len);
+    let mut buf = vec![0u8; xor_len];
+    file.read_exact(&mut buf).map_err(|e| e.to_string())?;
+	xor_wechat_isaac64_prefix(&mut buf, seed);
+    file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+    file.write_all(&buf).map_err(|e| e.to_string())?;
+    file.flush().map_err(|e| e.to_string())
+}
+
 fn update_task_failed(id: String, error_msg: String, state: &Arc<Mutex<AppState>>, app_handle: &tauri::AppHandle) {
     let mut state_lock = state.lock().unwrap();
     state_lock.cancellations.remove(&id);
@@ -1430,6 +1566,56 @@ fn download_url(url: String, state: tauri::State<'_, Arc<Mutex<AppState>>>, app_
     task
 }
 
+#[tauri::command]
+fn get_sniffer_state(sniffer_state: tauri::State<'_, Arc<Mutex<sniffer::SnifferState>>>) -> sniffer::SnifferViewState {
+    sniffer_state.lock().unwrap().view()
+}
+
+#[tauri::command]
+fn start_sniffer(sniffer_state: tauri::State<'_, Arc<Mutex<sniffer::SnifferState>>>, state: tauri::State<'_, Arc<Mutex<AppState>>>, app_handle: tauri::AppHandle) -> Result<sniffer::SnifferViewState, String> {
+    let settings = state.lock().unwrap().settings.clone();
+    let upstream = if settings.proxy_enabled { Some(settings.proxy_url) } else { None };
+    sniffer::start(app_handle, sniffer_state.inner().clone(), upstream)
+}
+
+#[tauri::command]
+fn stop_sniffer(sniffer_state: tauri::State<'_, Arc<Mutex<sniffer::SnifferState>>>, app_handle: tauri::AppHandle) -> Result<sniffer::SnifferViewState, String> {
+    sniffer::stop(&app_handle, sniffer_state.inner())
+}
+
+#[tauri::command]
+fn clear_sniffer_captures(sniffer_state: tauri::State<'_, Arc<Mutex<sniffer::SnifferState>>>, app_handle: tauri::AppHandle) -> Result<sniffer::SnifferViewState, String> {
+    sniffer::clear(&app_handle, sniffer_state.inner())
+}
+
+#[tauri::command]
+fn install_sniffer_certificate(sniffer_state: tauri::State<'_, Arc<Mutex<sniffer::SnifferState>>>, app_handle: tauri::AppHandle) -> Result<sniffer::SnifferViewState, String> {
+    sniffer::install_certificate(&app_handle, sniffer_state.inner())
+}
+
+#[tauri::command]
+fn enable_sniffer_system_proxy(sniffer_state: tauri::State<'_, Arc<Mutex<sniffer::SnifferState>>>, app_handle: tauri::AppHandle) -> Result<sniffer::SnifferViewState, String> {
+    sniffer::enable_system_proxy(&app_handle, sniffer_state.inner())
+}
+
+#[tauri::command]
+fn restore_sniffer_system_proxy(sniffer_state: tauri::State<'_, Arc<Mutex<sniffer::SnifferState>>>, app_handle: tauri::AppHandle) -> Result<sniffer::SnifferViewState, String> {
+    let mut guard = sniffer_state.lock().map_err(|_| "Sniffer state is unavailable")?;
+    sniffer::restore_system_proxy(&mut guard)?;
+    let view = guard.view();
+    let _ = app_handle.emit("sniffer-updated", &view);
+    Ok(view)
+}
+
+#[tauri::command]
+fn download_captured_resource(resource_id: String, sniffer_state: tauri::State<'_, Arc<Mutex<sniffer::SnifferState>>>, state: tauri::State<'_, Arc<Mutex<AppState>>>, app_handle: tauri::AppHandle) -> Result<DownloadTask, String> {
+    let descriptor = sniffer::request_descriptor(sniffer_state.inner(), &resource_id)?;
+    let id = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos().to_string();
+    let task = DownloadTask { id:id.clone(), url:format!("capture://{resource_id}"), title:descriptor.filename.clone(), status:"queued".into(), progress:0.0, speed:"0 B/s".into(), downloaded_bytes:0, total_bytes:0, eta:"--:--".into(), error:None, output_path:None };
+    let mut lock = state.lock().unwrap(); lock.captured_downloads.insert(id.clone(), descriptor); lock.tasks.insert(id, task.clone()); save_tasks(&lock.tasks, &lock.tasks_path); drop(lock);
+    let _ = app_handle.emit("task-updated", task.clone()); process_queue(state.inner().clone(), app_handle); Ok(task)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1480,9 +1666,21 @@ pub fn run() {
                 cancellations: HashMap::new(),
                 settings_path,
                 tasks_path,
+                captured_downloads: HashMap::new(),
             }));
             
             app.manage(app_state.clone());
+            let sniffer_state = Arc::new(Mutex::new(sniffer::SnifferState::new(app_data_dir.join("resource-sniffer"))));
+            // A previous crash must not leave the machine pointed at a dead loopback proxy.
+            if let Ok(mut state) = sniffer_state.lock() {
+                if state.data_dir.join("sniffer-proxy-session.json").exists() {
+                    state.message = match sniffer::restore_system_proxy(&mut state) {
+                        Ok(()) => Some("Restored network proxy settings from the previous capture session.".into()),
+                        Err(error) => Some(format!("Cobalt could not restore the previous proxy automatically: {error}")),
+                    };
+                }
+            }
+            app.manage(sniffer_state);
             
             // Spawn background clipboard monitor
             let handle = app.handle().clone();
@@ -1525,8 +1723,53 @@ pub fn run() {
             cancel_task,
             delete_task,
             clear_completed,
-            download_url
+            download_url,
+            get_sniffer_state,
+            start_sniffer,
+            stop_sniffer,
+            clear_sniffer_captures,
+            install_sniffer_certificate,
+            enable_sniffer_system_proxy,
+            restore_sniffer_system_proxy,
+            download_captured_resource
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+	use super::{decode_wechat_file, xor_wechat_isaac64_prefix, Isaac64};
+    use std::io::Write;
+
+    #[test]
+    fn decrypts_only_the_wechat_key_prefix() {
+        let path = std::env::temp_dir().join(format!("cobalt-wechat-decrypt-{}.bin", std::process::id()));
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(&[0x11, 0x22, 0x33, 0x44]).unwrap();
+        drop(file);
+        decode_wechat_file(&path, "AQID").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), vec![0x10, 0x20, 0x30, 0x44]);
+        let _ = std::fs::remove_file(path);
+    }
+
+	#[test]
+	fn isaac64_matches_the_wechat_reference_vector() {
+		let mut isaac = Isaac64::new(1_234_567_890_123_456_789);
+		assert_eq!(isaac.next(), 0x981c44954c02d3c6);
+		assert_eq!(isaac.next(), 0x2fd66a014dfdf392);
+		assert_eq!(isaac.next(), 0x85b4e3e282339bff);
+		assert_eq!(isaac.next(), 0x6115553361443053);
+	}
+
+	#[test]
+	fn wechat_prefix_cipher_round_trips() {
+		let original: Vec<u8> = (0..140_000).map(|index| (index % 251) as u8).collect();
+		let mut encrypted = original.clone();
+		xor_wechat_isaac64_prefix(&mut encrypted, 42);
+		assert_ne!(&encrypted[..131072], &original[..131072]);
+		assert_eq!(&encrypted[131072..], &original[131072..]);
+		xor_wechat_isaac64_prefix(&mut encrypted, 42);
+		assert_eq!(encrypted, original);
+	}
 }

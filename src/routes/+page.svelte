@@ -14,7 +14,11 @@
     IconClipboard,
     IconVideo,
     IconMusic,
-    IconCloudDownload
+    IconCloudDownload,
+    IconRadar,
+    IconPlayerStop,
+    IconRefresh,
+    IconCheck
   } from "@tabler/icons-svelte";
 
   import { t, getLocale, setLocale } from '$lib/i18n.svelte';
@@ -24,6 +28,7 @@
   let inputUrl = $state('');
   let isDragging = $state(false);
   let showSettings = $state(false);
+  let inputMode = $state<'url' | 'sniffer'>('url');
   let clipboardToast = $state<{ url: string; visible: boolean }>({ url: '', visible: false });
   let clipboardTimeout: any = null;
   
@@ -43,6 +48,9 @@
   // Tasks List
   let tasks = $state<any[]>([]);
   let activeTab = $state<'all' | 'downloading' | 'completed' | 'failed'>('all');
+  let sniffer = $state<any>({ status: 'stopped', port: 8899, captures: [], message: null, supportedSources: [], certificateInstalled: false, proxyActive: false, wechatHooks: 0 });
+  let snifferBusy = $state(false);
+  let snifferError = $state('');
 
   // Filter tasks based on active tab using Svelte 5 $derived rune
   let filteredTasks = $derived(
@@ -57,12 +65,14 @@
 
   let unlistenTask: (() => void) | null = null;
   let unlistenClipboard: (() => void) | null = null;
+  let unlistenSniffer: (() => void) | null = null;
 
   onMount(async () => {
     // Get settings from Tauri backend
     settings = await invoke('get_settings');
     // Get current tasks
     tasks = await invoke('get_tasks');
+    sniffer = await invoke('get_sniffer_state');
 
     // Listen for task updates from Tauri Rust process
     unlistenTask = await listen('task-updated', (event) => {
@@ -87,11 +97,15 @@
         clipboardToast.visible = false;
       }, 8000);
     });
+    unlistenSniffer = await listen('sniffer-updated', (event) => {
+      sniffer = event.payload as any;
+    });
   });
 
   onDestroy(() => {
     if (unlistenTask) unlistenTask();
     if (unlistenClipboard) unlistenClipboard();
+    if (unlistenSniffer) unlistenSniffer();
     if (clipboardTimeout) clearTimeout(clipboardTimeout);
   });
 
@@ -103,6 +117,50 @@
     if (clipboardTimeout) clearTimeout(clipboardTimeout);
     
     await invoke('download_url', { url: cleanUrl });
+  }
+
+  async function startSniffer() {
+    snifferBusy = true;
+    snifferError = '';
+    try { sniffer = await invoke('start_sniffer'); }
+    catch (error) { snifferError = String(error); }
+    finally { snifferBusy = false; }
+  }
+
+  async function stopSniffer() {
+    snifferBusy = true;
+    try { sniffer = await invoke('stop_sniffer'); }
+    catch (error) { snifferError = String(error); }
+    finally { snifferBusy = false; }
+  }
+
+  async function clearSniffer() {
+    try { sniffer = await invoke('clear_sniffer_captures'); }
+    catch (error) { snifferError = String(error); }
+  }
+
+  async function installSnifferCertificate() {
+    snifferError = '';
+    try { sniffer = await invoke('install_sniffer_certificate'); }
+    catch (error) { snifferError = String(error); }
+  }
+
+  async function enableSnifferProxy() {
+    snifferError = '';
+    try { sniffer = await invoke('enable_sniffer_system_proxy'); }
+    catch (error) { snifferError = String(error); }
+  }
+
+  async function restoreSnifferProxy() {
+    snifferError = '';
+    try { sniffer = await invoke('restore_sniffer_system_proxy'); }
+    catch (error) { snifferError = String(error); }
+  }
+
+  async function downloadCapture(id: string) {
+    snifferError = '';
+    try { await invoke('download_captured_resource', { resourceId: id }); }
+    catch (error) { snifferError = String(error); }
   }
 
   async function selectDirectory() {
@@ -235,7 +293,13 @@
     </div>
   </header>
 
+  <div class="mode-switch" aria-label={t('sniffer.mode_label')}>
+    <button class:active={inputMode === 'url'} onclick={() => inputMode = 'url'}><IconDownload size={15} />{t('sniffer.mode_url')}</button>
+    <button class:active={inputMode === 'sniffer'} onclick={() => inputMode = 'sniffer'}><IconRadar size={15} />{t('sniffer.mode_capture')}</button>
+  </div>
+
   <!-- URL Paste Section -->
+  {#if inputMode === 'url'}
   <section class="paste-section">
     <div class="input-glow-wrapper">
       <input 
@@ -260,6 +324,63 @@
       <span class="context-pill highlight">{t('home.youtube_local')}</span>
     </div>
   </section>
+  {:else}
+  <section class="sniffer-section">
+    <div class="sniffer-heading">
+      <div>
+        <span class="eyebrow">{t('sniffer.eyebrow')}</span>
+        <h2>{t('sniffer.title')}</h2>
+        <p>{t('sniffer.description')}</p>
+      </div>
+      {#if sniffer.status === 'running' || sniffer.status === 'starting'}
+        <button class="sniffer-control stop" onclick={stopSniffer} disabled={snifferBusy}><IconPlayerStop size={16} />{t('sniffer.stop')}</button>
+      {:else}
+        <button class="sniffer-control" onclick={startSniffer} disabled={snifferBusy}><IconRadar size={16} />{t('sniffer.start')}</button>
+      {/if}
+    </div>
+    <div class="sniffer-notice">
+      <strong>{t('sniffer.proxy_title')}</strong>
+      <span>{t('sniffer.proxy_note', { port: sniffer.port })}</span>
+      <div class="sniffer-setup-actions">
+        <button class:complete={sniffer.certificateInstalled} onclick={installSnifferCertificate} disabled={sniffer.certificateInstalled || snifferBusy}>
+          {#if sniffer.certificateInstalled}<IconCheck size={14} />{/if}
+          {sniffer.certificateInstalled ? t('sniffer.certificate_installed') : t('sniffer.install_certificate')}
+        </button>
+        {#if sniffer.proxyActive}
+          <button class="complete" onclick={restoreSnifferProxy} disabled={snifferBusy}><IconCheck size={14} />{t('sniffer.proxy_enabled')}</button>
+        {:else}
+          <button onclick={enableSnifferProxy} disabled={sniffer.status !== 'running' || snifferBusy}>{t('sniffer.enable_proxy')}</button>
+        {/if}
+      </div>
+    </div>
+    {#if snifferError}
+      <p class="sniffer-error">{snifferError}</p>
+    {:else if sniffer.message}
+      <p class="sniffer-message">{sniffer.message}</p>
+    {/if}
+    <div class="sniffer-capture-header">
+      <span>{t('sniffer.captures')} <b>{sniffer.captures.length}</b></span>
+      {#if sniffer.status === 'running'}
+        <span class:ready={sniffer.proxyActive && sniffer.wechatHooks > 0} class="sniffer-hook-status">
+          {!sniffer.proxyActive ? t('sniffer.waiting_proxy') : sniffer.wechatHooks > 0 ? t('sniffer.hook_ready') : t('sniffer.waiting_hook')}
+        </span>
+      {/if}
+      <button class="capture-clear" onclick={clearSniffer} disabled={sniffer.captures.length === 0} title={t('sniffer.clear')}><IconRefresh size={15} /></button>
+    </div>
+    {#if sniffer.captures.length === 0}
+      <div class="sniffer-empty"><IconRadar size={28} /><span>{t('sniffer.empty')}</span></div>
+    {:else}
+      <div class="capture-list">
+        {#each sniffer.captures as capture (capture.id)}
+          <div class="capture-row">
+            <div class="capture-info"><strong title={capture.title}>{capture.title}</strong><span>{capture.source} · {capture.kind.toUpperCase()} · {capture.size > 0 ? formatBytes(capture.size) : t('task.unknown_size')}</span></div>
+            <button class="capture-download" onclick={() => downloadCapture(capture.id)} disabled={capture.kind === 'playlist'}><IconDownload size={15} />{capture.kind === 'playlist' ? 'HLS' : t('sniffer.download')}</button>
+          </div>
+        {/each}
+      </div>
+    {/if}
+  </section>
+  {/if}
 
   <!-- Tabs Navigation -->
   <nav class="tabs-nav">
@@ -378,9 +499,11 @@
                   <IconTrash size={14} />
                 </button>
               {:else}
-                <button class="action-circle-btn" onclick={() => handleDownload(task.url)} title="Retry">
-                  <IconPlayerPlay size={14} />
-                </button>
+                {#if !task.url.startsWith('capture://')}
+                  <button class="action-circle-btn" onclick={() => handleDownload(task.url)} title="Retry">
+                    <IconPlayerPlay size={14} />
+                  </button>
+                {/if}
                 <button class="action-circle-btn secondary" onclick={() => deleteTask(task.id)} title="Remove from List">
                   <IconTrash size={14} />
                 </button>
@@ -1420,6 +1543,66 @@
     font-size: 10px;
     color: var(--text-muted);
     text-align: center;
+  }
+
+  .mode-switch {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    margin: 16px 28px 0;
+    padding: 3px;
+    background: rgba(20, 23, 31, 0.9);
+    border: 1px solid var(--border-color);
+    border-radius: 7px;
+  }
+
+  .mode-switch button, .sniffer-control, .capture-download, .capture-clear {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 7px;
+    border: 0;
+    font: inherit;
+    cursor: pointer;
+  }
+  .mode-switch button { color: var(--text-muted); background: transparent; padding: 7px 11px; border-radius: 5px; font-size: 12px; }
+  .mode-switch button.active { color: #eef1ff; background: rgba(106, 92, 255, 0.24); }
+  .sniffer-section { margin: 16px 28px 0; padding: 20px; border: 1px solid var(--border-color); border-radius: 8px; background: rgba(15, 17, 24, 0.64); }
+  .sniffer-heading { display:flex; align-items:flex-start; justify-content:space-between; gap:18px; }
+  .eyebrow { display:block; margin-bottom:6px; color:var(--accent-primary); font-size:10px; font-weight:700; letter-spacing:1.4px; }
+  .sniffer-heading h2 { margin:0; color:var(--text-primary); font-size:18px; }
+  .sniffer-heading p { margin:7px 0 0; color:var(--text-muted); font-size:13px; line-height:1.55; }
+  .sniffer-control { flex:0 0 auto; padding:9px 12px; color:white; background:var(--accent-primary); border-radius:6px; font-size:12px; font-weight:650; }
+  .sniffer-control.stop { background:rgba(255, 94, 105, 0.86); }
+  .sniffer-control:disabled, .capture-clear:disabled, .capture-download:disabled { opacity:.48; cursor:not-allowed; }
+  .sniffer-notice { display:grid; gap:4px; margin-top:17px; padding:11px 12px; color:var(--text-muted); border-left:2px solid var(--accent-primary); background:rgba(106, 92, 255, .08); font-size:12px; line-height:1.55; }
+  .sniffer-notice strong { color:var(--text-primary); }
+  .sniffer-setup-actions { display:flex; flex-wrap:wrap; gap:7px; margin-top:6px; }
+  .sniffer-setup-actions button { padding:6px 8px; color:#dcd9ff; background:rgba(106,92,255,.16); border:1px solid rgba(130,118,255,.3); border-radius:5px; font:inherit; font-size:11px; cursor:pointer; }
+  .sniffer-setup-actions button:hover:not(:disabled) { background:rgba(106,92,255,.28); }
+  .sniffer-setup-actions button:disabled { opacity:.48; cursor:not-allowed; }
+  .sniffer-setup-actions button.complete { color:#9ae5c4; border-color:rgba(83,193,142,.35); background:rgba(83,193,142,.1); opacity:1; }
+  .sniffer-error { margin:11px 0 0; color:#ff7d85; font-size:12px; line-height:1.5; }
+  .sniffer-message { margin:11px 0 0; color:#9ae5c4; font-size:12px; line-height:1.5; }
+  .sniffer-capture-header { display:flex; align-items:center; justify-content:space-between; margin-top:17px; color:var(--text-secondary); font-size:13px; }
+  .sniffer-capture-header b { color:var(--accent-primary); }
+  .sniffer-hook-status { margin-left:auto; margin-right:7px; color:var(--text-muted); font-size:11px; }
+  .sniffer-hook-status.ready { color:#80d7af; }
+  .capture-clear { width:28px; height:28px; color:var(--text-muted); background:transparent; border-radius:5px; }
+  .capture-clear:hover:not(:disabled) { color:var(--text-primary); background:rgba(255,255,255,.06); }
+  .sniffer-empty { display:flex; flex-direction:column; align-items:center; gap:9px; padding:27px 10px 12px; color:var(--text-muted); text-align:center; font-size:12px; }
+  .capture-list { display:grid; gap:7px; margin-top:11px; max-height:230px; overflow:auto; }
+  .capture-row { display:flex; align-items:center; gap:12px; min-height:58px; padding:9px 10px; border:1px solid rgba(255,255,255,.07); border-radius:6px; background:rgba(255,255,255,.025); }
+  .capture-info { min-width:0; display:grid; gap:4px; flex:1; }
+  .capture-info strong { overflow:hidden; color:var(--text-primary); font-size:12px; text-overflow:ellipsis; white-space:nowrap; }
+  .capture-info span { color:var(--text-muted); font-size:11px; }
+  .capture-download { padding:7px 9px; color:#dcd9ff; background:rgba(106, 92, 255, .16); border-radius:5px; font-size:11px; font-weight:650; }
+  .capture-download:hover:not(:disabled) { background:rgba(106, 92, 255, .29); }
+
+  @media (max-width: 560px) {
+    .mode-switch, .sniffer-section { margin-left:16px; margin-right:16px; }
+    .sniffer-heading { flex-direction:column; }
+    .sniffer-control { width:100%; }
   }
 
   /* Supported platforms grid */

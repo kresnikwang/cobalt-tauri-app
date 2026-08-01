@@ -44,7 +44,10 @@ The preparation step copies or verifies:
 - `src-tauri/binaries/ffmpeg`
 - `src-tauri/binaries/yt-dlp`
 
-`yt-dlp` is used for local YouTube, Bilibili, and Dailymotion downloads. For packaged builds, avoid re-signing `yt-dlp` itself with Developer ID; ad-hoc signing the final `.app` bundle is fine for local testing.
+`yt-dlp` is used for local YouTube, Bilibili, and Dailymotion downloads. The
+post-build step signs its PyInstaller launcher with the dedicated
+`src-tauri/entitlements/yt-dlp.plist`; without disabled library validation, the
+launcher cannot load its embedded Python framework after Developer ID signing.
 
 The app bundle is written to:
 

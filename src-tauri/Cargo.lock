@@ -3814,6 +3814,7 @@ name = "tauri-app"
 version = "1.0.8"
 dependencies = [
  "arboard",
+ "base64 0.22.1",
  "futures-util",
  "reqwest 0.12.28",
  "rfd",
