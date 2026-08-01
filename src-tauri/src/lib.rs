@@ -1733,8 +1733,27 @@ pub fn run() {
             restore_sniffer_system_proxy,
             download_captured_resource
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app_handle, event| {
+            // Quitting must never leave the machine pointed at a dead loopback
+            // proxy. Cmd+Q (or any other exit path) restores the snapshot and
+            // stops the sidecar; the same file also acts as a crash-recovery
+            // marker on the next launch.
+            if let tauri::RunEvent::Exit = event {
+                if let Some(sniffer_state) = app_handle.try_state::<Arc<Mutex<sniffer::SnifferState>>>() {
+                    if let Ok(mut state) = sniffer_state.lock() {
+                        if state.proxy_active || state.data_dir.join("sniffer-proxy-session.json").exists() {
+                            let _ = sniffer::restore_system_proxy(&mut state);
+                        }
+                        if let Some(mut child) = state.child.take() {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                        }
+                    }
+                }
+            }
+        });
 }
 
 #[cfg(test)]

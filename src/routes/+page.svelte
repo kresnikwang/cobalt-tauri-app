@@ -18,7 +18,8 @@
     IconRadar,
     IconPlayerStop,
     IconRefresh,
-    IconCheck
+    IconCheck,
+    IconSearch
   } from "@tabler/icons-svelte";
 
   import { t, getLocale, setLocale } from '$lib/i18n.svelte';
@@ -48,9 +49,20 @@
   // Tasks List
   let tasks = $state<any[]>([]);
   let activeTab = $state<'all' | 'downloading' | 'completed' | 'failed'>('all');
-  let sniffer = $state<any>({ status: 'stopped', port: 8899, captures: [], message: null, supportedSources: [], certificateInstalled: false, proxyActive: false, wechatHooks: 0 });
+  let sniffer = $state<any>({ status: 'stopped', port: 8899, captures: [], message: null, supportedSources: [], certificateInstalled: false, proxyActive: false, wechatHooks: 0, tunProxyDetected: null });
   let snifferBusy = $state(false);
   let snifferError = $state('');
+  let captureSearch = $state('');
+  let thumbFailed = $state<Record<string, boolean>>({});
+
+  let filteredCaptures = $derived(
+    captureSearch.trim()
+      ? sniffer.captures.filter((c: any) => {
+          const q = captureSearch.trim().toLowerCase();
+          return (c.title || '').toLowerCase().includes(q) || (c.source || '').toLowerCase().includes(q);
+        })
+      : sniffer.captures
+  );
 
   // Filter tasks based on active tab using Svelte 5 $derived rune
   let filteredTasks = $derived(
@@ -341,6 +353,9 @@
     <div class="sniffer-notice">
       <strong>{t('sniffer.proxy_title')}</strong>
       <span>{t('sniffer.proxy_note', { port: sniffer.port })}</span>
+      {#if sniffer.tunProxyDetected}
+        <p class="sniffer-tun-warning">{t('sniffer.tun_warning', { app: sniffer.tunProxyDetected })}</p>
+      {/if}
       <div class="sniffer-setup-actions">
         <button class:complete={sniffer.certificateInstalled} onclick={installSnifferCertificate} disabled={sniffer.certificateInstalled || snifferBusy}>
           {#if sniffer.certificateInstalled}<IconCheck size={14} />{/if}
@@ -349,7 +364,7 @@
         {#if sniffer.proxyActive}
           <button class="complete" onclick={restoreSnifferProxy} disabled={snifferBusy}><IconCheck size={14} />{t('sniffer.proxy_enabled')}</button>
         {:else}
-          <button onclick={enableSnifferProxy} disabled={sniffer.status !== 'running' || snifferBusy}>{t('sniffer.enable_proxy')}</button>
+          <button onclick={enableSnifferProxy} disabled={sniffer.status !== 'running' || snifferBusy || !!sniffer.tunProxyDetected}>{t('sniffer.enable_proxy')}</button>
         {/if}
       </div>
     </div>
@@ -360,21 +375,39 @@
     {/if}
     <div class="sniffer-capture-header">
       <span>{t('sniffer.captures')} <b>{sniffer.captures.length}</b></span>
-      {#if sniffer.status === 'running'}
-        <span class:ready={sniffer.proxyActive && sniffer.wechatHooks > 0} class="sniffer-hook-status">
-          {!sniffer.proxyActive ? t('sniffer.waiting_proxy') : sniffer.wechatHooks > 0 ? t('sniffer.hook_ready') : t('sniffer.waiting_hook')}
-        </span>
-      {/if}
-      <button class="capture-clear" onclick={clearSniffer} disabled={sniffer.captures.length === 0} title={t('sniffer.clear')}><IconRefresh size={15} /></button>
+      <div class="capture-header-tools">
+        {#if sniffer.status === 'running'}
+          <span class:ready={sniffer.proxyActive && sniffer.wechatHooks > 0} class="sniffer-hook-status">
+            {!sniffer.proxyActive ? t('sniffer.waiting_proxy') : sniffer.wechatHooks > 0 ? t('sniffer.hook_ready') : t('sniffer.waiting_hook')}
+          </span>
+        {/if}
+        <input class="capture-search" type="search" placeholder={t('sniffer.search_placeholder')} bind:value={captureSearch} />
+        <button class="capture-clear" onclick={clearSniffer} disabled={sniffer.captures.length === 0} title={t('sniffer.clear')}><IconRefresh size={15} /></button>
+      </div>
     </div>
     {#if sniffer.captures.length === 0}
       <div class="sniffer-empty"><IconRadar size={28} /><span>{t('sniffer.empty')}</span></div>
+    {:else if filteredCaptures.length === 0}
+      <div class="sniffer-empty"><IconSearch size={24} /><span>{t('sniffer.no_match')}</span></div>
     {:else}
-      <div class="capture-list">
-        {#each sniffer.captures as capture (capture.id)}
-          <div class="capture-row">
-            <div class="capture-info"><strong title={capture.title}>{capture.title}</strong><span>{capture.source} · {capture.kind.toUpperCase()} · {capture.size > 0 ? formatBytes(capture.size) : t('task.unknown_size')}</span></div>
-            <button class="capture-download" onclick={() => downloadCapture(capture.id)} disabled={capture.kind === 'playlist'}><IconDownload size={15} />{capture.kind === 'playlist' ? 'HLS' : t('sniffer.download')}</button>
+      <div class="capture-grid">
+        {#each filteredCaptures as capture (capture.id)}
+          <div class="capture-card">
+            <div class="capture-thumb">
+              {#if capture.coverUrl && !thumbFailed[capture.coverUrl]}
+                <img src={capture.coverUrl} alt="" loading="lazy" referrerpolicy="no-referrer" onerror={() => (thumbFailed[capture.coverUrl] = true)} />
+              {:else}
+                <div class="capture-thumb-fallback"><IconVideo size={22} /></div>
+              {/if}
+              <span class="capture-kind-pill">{capture.kind === 'playlist' ? 'HLS' : capture.kind.toUpperCase()}</span>
+            </div>
+            <div class="capture-info">
+              <strong title={capture.title}>{capture.title}</strong>
+              <span>{capture.source} · {capture.size > 0 ? formatBytes(capture.size) : t('task.unknown_size')}</span>
+            </div>
+            <button class="capture-download" onclick={() => downloadCapture(capture.id)} disabled={capture.kind === 'playlist'}>
+              <IconDownload size={15} />{capture.kind === 'playlist' ? 'HLS' : t('sniffer.download')}
+            </button>
           </div>
         {/each}
       </div>
@@ -1577,6 +1610,7 @@
   .sniffer-control:disabled, .capture-clear:disabled, .capture-download:disabled { opacity:.48; cursor:not-allowed; }
   .sniffer-notice { display:grid; gap:4px; margin-top:17px; padding:11px 12px; color:var(--text-muted); border-left:2px solid var(--accent-primary); background:rgba(106, 92, 255, .08); font-size:12px; line-height:1.55; }
   .sniffer-notice strong { color:var(--text-primary); }
+  .sniffer-tun-warning { margin:6px 0 2px; padding:8px 10px; color:#ffd28a; border:1px solid rgba(255, 177, 66, .35); border-radius:6px; background:rgba(255, 177, 66, .1); font-size:12px; line-height:1.55; }
   .sniffer-setup-actions { display:flex; flex-wrap:wrap; gap:7px; margin-top:6px; }
   .sniffer-setup-actions button { padding:6px 8px; color:#dcd9ff; background:rgba(106,92,255,.16); border:1px solid rgba(130,118,255,.3); border-radius:5px; font:inherit; font-size:11px; cursor:pointer; }
   .sniffer-setup-actions button:hover:not(:disabled) { background:rgba(106,92,255,.28); }
@@ -1584,20 +1618,35 @@
   .sniffer-setup-actions button.complete { color:#9ae5c4; border-color:rgba(83,193,142,.35); background:rgba(83,193,142,.1); opacity:1; }
   .sniffer-error { margin:11px 0 0; color:#ff7d85; font-size:12px; line-height:1.5; }
   .sniffer-message { margin:11px 0 0; color:#9ae5c4; font-size:12px; line-height:1.5; }
-  .sniffer-capture-header { display:flex; align-items:center; justify-content:space-between; margin-top:17px; color:var(--text-secondary); font-size:13px; }
-  .sniffer-capture-header b { color:var(--accent-primary); }
-  .sniffer-hook-status { margin-left:auto; margin-right:7px; color:var(--text-muted); font-size:11px; }
+  .sniffer-capture-header { display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:10px; margin-top:17px; color:var(--text-secondary); font-size:13px; }
+  .sniffer-capture-header b { color:var(--accent-primary); font-variant-numeric:tabular-nums; }
+  .capture-header-tools { display:flex; align-items:center; gap:8px; margin-left:auto; }
+  .sniffer-hook-status { color:var(--text-muted); font-size:11px; }
   .sniffer-hook-status.ready { color:#80d7af; }
-  .capture-clear { width:28px; height:28px; color:var(--text-muted); background:transparent; border-radius:5px; }
+  .capture-search { width:200px; height:30px; padding:0 10px; color:var(--text-primary); background:rgba(255,255,255,.05); border:1px solid rgba(255,255,255,.09); border-radius:7px; font:inherit; font-size:12px; outline:none; transition:border-color .15s ease, box-shadow .15s ease; }
+  .capture-search::placeholder { color:var(--text-muted); }
+  .capture-search:focus { border-color:rgba(130,118,255,.5); box-shadow:0 0 0 3px rgba(106,92,255,.14); }
+  .capture-clear { width:30px; height:30px; color:var(--text-muted); background:transparent; border-radius:7px; transition:color .15s ease, background .15s ease, transform .12s ease; }
   .capture-clear:hover:not(:disabled) { color:var(--text-primary); background:rgba(255,255,255,.06); }
+  .capture-clear:active:not(:disabled) { transform:scale(.96); }
   .sniffer-empty { display:flex; flex-direction:column; align-items:center; gap:9px; padding:27px 10px 12px; color:var(--text-muted); text-align:center; font-size:12px; }
-  .capture-list { display:grid; gap:7px; margin-top:11px; max-height:230px; overflow:auto; }
-  .capture-row { display:flex; align-items:center; gap:12px; min-height:58px; padding:9px 10px; border:1px solid rgba(255,255,255,.07); border-radius:6px; background:rgba(255,255,255,.025); }
-  .capture-info { min-width:0; display:grid; gap:4px; flex:1; }
-  .capture-info strong { overflow:hidden; color:var(--text-primary); font-size:12px; text-overflow:ellipsis; white-space:nowrap; }
+  .capture-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(228px,1fr)); gap:12px; margin-top:12px; padding:2px 4px 10px; max-height:56vh; overflow-y:auto; }
+  .capture-card { display:flex; flex-direction:column; gap:9px; padding:9px; border-radius:12px; background:rgba(255,255,255,.03); box-shadow:0 1px 2px rgba(0,0,0,.25); transition:transform .15s ease, box-shadow .15s ease, background .15s ease; }
+  .capture-card:hover { transform:translateY(-2px); background:rgba(255,255,255,.05); box-shadow:0 6px 18px rgba(0,0,0,.32); }
+  .capture-thumb { position:relative; aspect-ratio:16/9; border-radius:8px; overflow:hidden; background:rgba(255,255,255,.04); }
+  .capture-thumb img { width:100%; height:100%; object-fit:cover; outline:1px solid rgba(255,255,255,.1); outline-offset:-1px; }
+  .capture-thumb-fallback { width:100%; height:100%; display:flex; align-items:center; justify-content:center; color:var(--text-muted); background:linear-gradient(160deg, rgba(106,92,255,.12), rgba(255,255,255,.02)); }
+  .capture-kind-pill { position:absolute; top:6px; left:6px; padding:2px 7px; border-radius:5px; color:#eef1ff; background:rgba(10,12,20,.72); font-size:10px; font-weight:700; letter-spacing:.4px; backdrop-filter:blur(4px); }
+  .capture-info { min-width:0; display:grid; gap:3px; }
+  .capture-info strong { overflow:hidden; color:var(--text-primary); font-size:12.5px; font-weight:600; text-overflow:ellipsis; white-space:nowrap; }
   .capture-info span { color:var(--text-muted); font-size:11px; }
-  .capture-download { padding:7px 9px; color:#dcd9ff; background:rgba(106, 92, 255, .16); border-radius:5px; font-size:11px; font-weight:650; }
-  .capture-download:hover:not(:disabled) { background:rgba(106, 92, 255, .29); }
+  .capture-download { display:inline-flex; align-items:center; justify-content:center; gap:6px; min-height:34px; padding:0 10px; color:#dcd9ff; background:rgba(106,92,255,.16); border:1px solid rgba(130,118,255,.22); border-radius:8px; font-size:12px; font-weight:650; cursor:pointer; transition:background .15s ease, transform .12s ease; }
+  .capture-download:hover:not(:disabled) { background:rgba(106,92,255,.29); }
+  .capture-download:active:not(:disabled) { transform:scale(.96); }
+  .capture-download:disabled { opacity:.45; cursor:not-allowed; }
+  .capture-grid::-webkit-scrollbar { width:8px; }
+  .capture-grid::-webkit-scrollbar-thumb { background:rgba(255,255,255,.14); border-radius:4px; }
+  .capture-grid::-webkit-scrollbar-thumb:hover { background:rgba(255,255,255,.24); }
 
   @media (max-width: 560px) {
     .mode-switch, .sniffer-section { margin-left:16px; margin-right:16px; }

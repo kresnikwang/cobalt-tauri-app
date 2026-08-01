@@ -61,6 +61,7 @@ type resource struct {
 	URL        string      `json:"-"`
 	Headers    http.Header `json:"-"`
 	DecodeKey  string      `json:"-"`
+	CoverURL   string      `json:"-"`
 }
 
 var allowedDomains = []string{
@@ -192,8 +193,17 @@ func (s *server) start(port int, upstream string) error {
 			return req, emptyResponse(req)
 		}
 		// Restrict WeChat asset encoding to gzip/identity so the proxy can safely inspect/rewrite JS hooks.
-		if strings.HasSuffix(req.URL.Hostname(), "res.wx.qq.com") || strings.HasSuffix(req.URL.Hostname(), "channels.weixin.qq.com") {
+		if strings.HasSuffix(req.URL.Hostname(), "res.wx.qq.com") {
 			req.Header.Set("Accept-Encoding", "gzip, identity")
+			if strings.Contains(req.URL.Path, "web-finder") {
+				// WeChat caches these bundles for a year. On revalidation the
+				// upstream answers 304 and the client keeps the previously
+				// cached body — which may predate Cobalt's hook patch. Strip
+				// the validators so every session gets a full 200 through the
+				// proxy and the patch is always applied.
+				req.Header.Del("If-None-Match")
+				req.Header.Del("If-Modified-Since")
+			}
 		}
 		return req, nil
 	})
@@ -293,6 +303,15 @@ var wechatBridgePatches = []wechatBridgePatch{
 	{regexp.MustCompile(`async finderUserPage\((\w+)\)\{(.*?)\}async`), `async finderUserPage($1){var __cobalt_result=await(async()=>{$2})();try{window.__cobalt_report(__cobalt_result&&__cobalt_result.data)}catch(_){}return __cobalt_result}async`},
 	{regexp.MustCompile(`async finderPCSearch\((\w+)\)\{(.*?)\}async`), `async finderPCSearch($1){var __cobalt_result=await(async()=>{$2})();try{window.__cobalt_report(__cobalt_result&&__cobalt_result.data)}catch(_){}return __cobalt_result}async`},
 	{regexp.MustCompile(`async finderSearch\((\w+)\)\{(.*?)\}async`), `async finderSearch($1){var __cobalt_result=await(async()=>{$2})();try{window.__cobalt_report(__cobalt_result&&__cobalt_result.data)}catch(_){}return __cobalt_result}async`},
+	// The signed playback URL and decode key are only materialized when the
+	// player reads feed.media, so the finder* API patches alone miss every
+	// video loaded after the first one. Report the getter result too.
+	// Must keep `this` (the feed instance) alive, so the wrapper is invoked
+	// with .call(this) — ES modules are strict and a bare call would lose it.
+	// The regex consumes both trailing braces (object literal + getter), so the
+	// replacement must restore both: first closes the return object, second the
+	// function body, before `.call(this)`.
+	{regexp.MustCompile(`get media\(\)\{(.*?)\}\}`), `get media(){var __cobalt_result=(function(){` + `$1` + `}}).call(this);try{window.__cobalt_report(__cobalt_result&&__cobalt_result.url?{media:[__cobalt_result],description:this.objectDesc&&this.objectDesc.description}:void 0)}catch(_){}return __cobalt_result}`},
 }
 
 func (s *server) injectWeChatHook(resp *http.Response, req *http.Request) *http.Response {
@@ -314,6 +333,7 @@ func (s *server) injectWeChatHook(resp *http.Response, req *http.Request) *http.
 		if bytes.Equal(body, injected) {
 			injected = append([]byte(wechatHookTag), body...)
 		}
+		resp.Header.Set("Cache-Control", "no-cache, no-store, must-revalidate")
 		s.mu.Lock()
 		s.wechatHooks++
 		hooks := s.wechatHooks
@@ -328,6 +348,10 @@ func (s *server) injectWeChatHook(resp *http.Response, req *http.Request) *http.
 	if bytes.Equal(body, injected) {
 		return resp
 	}
+	// WeChat's webview caches these bundles for a year. If a previously cached
+	// (unpatched) copy is served from disk, the hook never runs. Force
+	// revalidation so every session re-fetches through Cobalt and stays patched.
+	resp.Header.Set("Cache-Control", "no-cache, no-store, must-revalidate")
 	s.mu.Lock()
 	s.wechatHooks++
 	hooks := s.wechatHooks
@@ -372,6 +396,7 @@ func (s *server) captureWeChatCallback(req *http.Request) {
 			URL:        joinURLToken(item.URL, item.URLToken),
 			Headers:    http.Header{"Referer": []string{"https://channels.weixin.qq.com/"}, "Origin": []string{"https://channels.weixin.qq.com/"}},
 			DecodeKey:  item.DecodeKey,
+			CoverURL:   item.CoverURL,
 		}
 		s.mu.Lock()
 		already := false
@@ -399,6 +424,22 @@ type wechatCapturedItem struct {
 	Title     string
 	Size      int64
 	MediaType int
+	CoverURL  string
+}
+
+// Cover images are public and absolute; just normalize the scheme and host so
+// the frontend can hot-link them (http:// -> https://, wxapp.tc -> finder).
+func wechatCoverURL(v map[string]any) string {
+	for _, key := range []string{"fullCoverUrl", "coverUrl", "fullThumbUrl", "thumbUrl"} {
+		raw := scalarString(v[key])
+		if raw == "" {
+			continue
+		}
+		raw = strings.Replace(raw, "http://", "https://", 1)
+		raw = strings.Replace(raw, "wxapp.tc.qq.com", "finder.video.qq.com", 1)
+		return raw
+	}
+	return ""
 }
 
 func extractWeChatMediaItems(val any, parentTitle string) []wechatCapturedItem {
@@ -430,6 +471,7 @@ func extractWeChatMediaItems(val any, parentTitle string) []wechatCapturedItem {
 				Title:     currentTitle,
 				Size:      size,
 				MediaType: mType,
+				CoverURL:  wechatCoverURL(v),
 			})
 		}
 		for _, child := range v {
@@ -522,7 +564,11 @@ func writeResponseBody(resp *http.Response, body []byte, encoding string) *http.
 }
 
 func publicResource(r resource) map[string]any {
-	return map[string]any{"id": r.ID, "title": r.Title, "source": r.Source, "kind": r.Kind, "mimeType": r.MimeType, "size": r.Size, "extension": r.Extension, "capturedAt": r.CapturedAt}
+	out := map[string]any{"id": r.ID, "title": r.Title, "source": r.Source, "kind": r.Kind, "mimeType": r.MimeType, "size": r.Size, "extension": r.Extension, "capturedAt": r.CapturedAt}
+	if r.CoverURL != "" {
+		out["coverUrl"] = r.CoverURL
+	}
+	return out
 }
 func isAllowedHost(host string) bool {
 	host = strings.ToLower(host)

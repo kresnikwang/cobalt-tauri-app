@@ -89,7 +89,8 @@
     "sniffer.start": "启动嗅探",
     "sniffer.stop": "停止嗅探",
     "sniffer.proxy_title": "设置系统代理后再播放内容",
-    "sniffer.proxy_note": "先安装并验证本机证书，再启用系统代理。然后完全退出并重新打开微信，再播放视频号内容。Cobalt 会把当前网络的代理临时指向 127.0.0.1:{port}，停止后恢复原设置。",
+  "sniffer.proxy_note": "先安装并验证本机证书，再启用系统代理。然后完全退出并重新打开微信，再播放视频号内容。Cobalt 会把当前网络的代理临时指向 127.0.0.1:{port}，停止后恢复原设置。",
+  "sniffer.tun_warning": "检测到 {app} 正在以 TUN 模式运行，与本地抓包冲突，微信视频号可能无法打开。建议先关闭 TUN 模式，或改用浏览器打开视频号网页版。",
     "sniffer.install_certificate": "安装本机证书",
     "sniffer.certificate_installed": "证书已安装并验证",
     "sniffer.enable_proxy": "启用系统代理",
@@ -98,8 +99,10 @@
     "sniffer.captures": "已捕获资源",
     "sniffer.clear": "清空捕获记录",
     "sniffer.empty": "启动后播放受支持应用中的媒体，资源会显示在这里。",
-    "sniffer.download": "下载",
-    "sniffer.waiting_proxy": "等待启用系统代理",
+  "sniffer.download": "下载",
+  "sniffer.search_placeholder": "搜索标题或来源…",
+  "sniffer.no_match": "没有匹配的资源",
+  "sniffer.waiting_proxy": "等待启用系统代理",
     "sniffer.waiting_hook": "等待视频号页面",
     "sniffer.hook_ready": "已匹配视频号页面"
 }

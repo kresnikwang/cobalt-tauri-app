@@ -151,3 +151,17 @@ func TestMITMAllowlistRejectsUnrelatedHosts(t *testing.T) {
 		t.Fatal("unrelated hosts must not be intercepted")
 	}
 }
+
+func TestWeChatCoverURLNormalizesSchemeAndHost(t *testing.T) {
+	item := map[string]any{
+		"fullCoverUrl": "http://wxapp.tc.qq.com/251/cover.jpg?x=1",
+		"url":          "https://finder.video.qq.com/251/v.mp4",
+		"urlToken":     "tok",
+	}
+	if got := wechatCoverURL(item); got != "https://finder.video.qq.com/251/cover.jpg?x=1" {
+		t.Fatalf("unexpected cover URL: %s", got)
+	}
+	if got := wechatCoverURL(map[string]any{}); got != "" {
+		t.Fatalf("expected empty cover URL, got %s", got)
+	}
+}

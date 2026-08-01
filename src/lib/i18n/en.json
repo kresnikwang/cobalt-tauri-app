@@ -89,7 +89,8 @@
     "sniffer.start": "Start capture",
     "sniffer.stop": "Stop capture",
     "sniffer.proxy_title": "Set the system proxy before playing media",
-    "sniffer.proxy_note": "Install and verify Cobalt's local certificate, then enable the system proxy. Fully quit and reopen WeChat before playing a Channels video. Cobalt temporarily routes traffic through 127.0.0.1:{port} and restores the previous settings when capture stops.",
+  "sniffer.proxy_note": "Install and verify Cobalt's local certificate, then enable the system proxy. Fully quit and reopen WeChat before playing a Channels video. Cobalt temporarily routes traffic through 127.0.0.1:{port} and restores the previous settings when capture stops.",
+  "sniffer.tun_warning": "Detected {app} running in TUN mode. It conflicts with local capture and WeChat Channels may fail to open. Turn off TUN mode first, or open the Channels web version in a browser instead.",
     "sniffer.install_certificate": "Install local certificate",
     "sniffer.certificate_installed": "Certificate installed and verified",
     "sniffer.enable_proxy": "Enable system proxy",
@@ -98,8 +99,10 @@
     "sniffer.captures": "Captured resources",
     "sniffer.clear": "Clear captured resources",
     "sniffer.empty": "Start capture and play media in a supported app. Captured resources will appear here.",
-    "sniffer.download": "Download",
-    "sniffer.waiting_proxy": "Waiting for system proxy",
+  "sniffer.download": "Download",
+  "sniffer.search_placeholder": "Search title or source…",
+  "sniffer.no_match": "No matching resources",
+  "sniffer.waiting_proxy": "Waiting for system proxy",
     "sniffer.waiting_hook": "Waiting for Video Channels page",
     "sniffer.hook_ready": "Video Channels page matched"
 }
