@@ -29,6 +29,7 @@ Tauri 重构版采取了**解耦进程架构**：
 - **📋 智能剪贴板监听**：通过 `arboard` 库在 Rust 开启后台轻量线程监控系统剪贴板。当复制包含视频或音频的 URL 链接时，应用内部会平滑弹出精美 Toast 提示，支持一键加入下载队列。
 - **🎯 YouTube 本地优先下载**：内置 `yt-dlp` 与 Node JS runtime，优先在本机解析和下载 YouTube，支持浏览器 Cookie 登录态、实时进度、速度和 ETA。
 - **📺 Bilibili 本地 Cookie 下载**：Bilibili / b23.tv 默认走本地 `yt-dlp`，优先尝试 `chrome:Default` 及其他 Chrome profile，减少线上 Cookie 过期带来的失败。
+- **🎬 新片场链接下载**：粘贴公开的新片场作品链接即可下载视频；应用会在隐藏的本地浏览器上下文中解析短期签名地址，无需开启资源嗅探或系统代理。
 - **🎧 真正的音频提取**：音频模式使用 `yt-dlp --extract-audio` 与内置 FFmpeg，输出真正的 m4a/mp3/ogg/wav/opus 音频文件，而不是仅改扩展名。
 - **🧩 DASH 进度聚合**：针对 Bilibili 的视频流 + 音频流 + 合并流程做阶段进度映射，避免进度条回退或跳动。
 - **🌐 远程服务辅助解析**：对 Instagram、X、Pinterest 等平台保留服务端辅助下载路径，降低本地解析复杂度。
@@ -67,6 +68,7 @@ The Tauri rebuild decouples these components:
 - **📋 Smart Clipboard Monitoring**: A background thread detects copied video/audio URLs and triggers a reactive in-app toast to quickly queue downloads.
 - **🎯 Local YouTube first**: Bundled `yt-dlp` and Node runtime handle YouTube locally, with browser-cookie fallback, live progress, speed, and ETA.
 - **📺 Local Bilibili first**: Bilibili and b23.tv use local `yt-dlp`, explicitly trying `chrome:Default` and other Chrome profiles before falling back.
+- **🎬 Xinpianchang link downloads**: Paste a public Xinpianchang work URL to resolve its short-lived signed video URL in a hidden local browser context; resource-sniffer and system-proxy setup are not required.
 - **🎧 Real audio extraction**: Audio-only mode uses `yt-dlp --extract-audio` and bundled FFmpeg, producing real m4a/mp3/ogg/wav/opus files.
 - **🧩 DASH-aware progress**: Bilibili's separate video/audio streams and merge phase are mapped into stable progress so the UI does not jump backwards.
 - **🌐 Server-assisted fallback**: Remote media service integration remains available for Instagram, X, Pinterest, and similar sites.

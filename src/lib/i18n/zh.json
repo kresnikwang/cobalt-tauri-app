@@ -21,6 +21,7 @@
     "platform.capability.cookie_hd": "高清解析",
     "platform.capability.audio": "音频稳定",
     "platform.capability.server_assist": "服务端辅助",
+    "platform.capability.browser_resolve": "浏览器解析",
     "platform.capability.basic": "基础支持",
 
     "task.status.queued": "排队中",

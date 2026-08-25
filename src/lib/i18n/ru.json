@@ -21,6 +21,7 @@
     "platform.capability.cookie_hd": "HD-анализ",
     "platform.capability.audio": "Аудио",
     "platform.capability.server_assist": "Через сервер",
+    "platform.capability.browser_resolve": "Через браузер",
     "platform.capability.basic": "Базово",
 
     "task.status.queued": "В ОЧЕРЕДИ",

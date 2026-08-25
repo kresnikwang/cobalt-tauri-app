@@ -254,6 +254,7 @@
     const key = name.toLowerCase();
     if (key.includes('youtube')) return t('platform.capability.local_first');
     if (key.includes('bilibili')) return t('platform.capability.cookie_hd');
+    if (name === '新片场') return t('platform.capability.browser_resolve');
     if (key.includes('dailymotion')) return t('platform.capability.local_first');
     if (key.includes('soundcloud')) return t('platform.capability.audio');
     if (key.includes('instagram') || key.includes('twitter') || key.includes('x') || key.includes('pinterest')) {

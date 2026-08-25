@@ -11,6 +11,7 @@ use tauri::path::BaseDirectory;
 use base64::Engine;
 
 mod sniffer;
+mod xinpianchang;
 
 fn default_api_url() -> String {
     "http://43.156.122.169".to_string()
@@ -76,6 +77,29 @@ pub struct AppState {
     pub settings_path: PathBuf,
     pub tasks_path: PathBuf,
     pub captured_downloads: HashMap<String, sniffer::DownloadDescriptor>,
+}
+
+#[derive(Debug, Clone)]
+struct DirectMediaDescriptor {
+    url: String,
+    headers: HashMap<String, String>,
+    filename: String,
+    expected_bytes: u64,
+    decode_key: Option<String>,
+    use_proxy: bool,
+}
+
+impl From<sniffer::DownloadDescriptor> for DirectMediaDescriptor {
+    fn from(descriptor: sniffer::DownloadDescriptor) -> Self {
+        Self {
+            url: descriptor.url,
+            headers: descriptor.headers,
+            filename: descriptor.filename,
+            expected_bytes: 0,
+            decode_key: descriptor.decode_key,
+            use_proxy: true,
+        }
+    }
 }
 
 // -----------------------------------------------------------
@@ -989,7 +1013,56 @@ async fn run_download_task(id: String, state: Arc<Mutex<AppState>>, app_handle: 
 
     let captured_descriptor = { state.lock().unwrap().captured_downloads.remove(&id) };
     if let Some(descriptor) = captured_descriptor {
-        download_captured_stream(id, descriptor, settings, state, app_handle).await;
+        if descriptor.kind == "playlist" {
+            update_task_failed(id, "Playlist captures are not supported yet. Capture a direct video or audio request instead.".into(), &state, &app_handle);
+            return;
+        }
+        download_direct_stream(id, descriptor.into(), settings, state, app_handle).await;
+        return;
+    }
+
+    if xinpianchang::is_xinpianchang_url(&url_to_download) {
+        if settings.download_mode != "video" {
+            update_task_failed(id, "Xinpianchang link downloads currently support video mode only.".into(), &state, &app_handle);
+            return;
+        }
+        {
+            let mut lock = state.lock().unwrap();
+            if let Some(task) = lock.tasks.get_mut(&id) {
+                task.status = "analyzing".into();
+                task.speed = "Resolving in browser".into();
+                let _ = app_handle.emit("task-updated", task.clone());
+            }
+        }
+        let resolution = xinpianchang::resolve(&app_handle, &url_to_download).await;
+        let task_is_active = state.lock().unwrap().tasks.get(&id)
+            .map(|task| task.status == "analyzing")
+            .unwrap_or(false);
+        if !task_is_active {
+            return;
+        }
+        let resolved = match resolution {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                update_task_failed(id, format!("Xinpianchang resolution failed: {error}"), &state, &app_handle);
+                return;
+            }
+        };
+        let descriptor = DirectMediaDescriptor {
+            url: resolved.url,
+            headers: HashMap::from([
+                ("Referer".into(), url_to_download.clone()),
+                ("Origin".into(), "https://www.xinpianchang.com".into()),
+                ("Range".into(), "bytes=0-".into()),
+                ("Accept".into(), "video/webm,video/ogg,video/*;q=0.9,*/*;q=0.8".into()),
+                ("User-Agent".into(), "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.6 Safari/605.1.15".into()),
+            ]),
+            filename: resolved.filename,
+            expected_bytes: resolved.expected_bytes,
+            decode_key: None,
+            use_proxy: false,
+        };
+        download_direct_stream(id, descriptor, settings, state, app_handle).await;
         return;
     }
 
@@ -1253,30 +1326,26 @@ async fn run_download_task(id: String, state: Arc<Mutex<AppState>>, app_handle: 
     process_queue(state, app_handle);
 }
 
-async fn download_captured_stream(id: String, descriptor: sniffer::DownloadDescriptor, settings: Settings, state: Arc<Mutex<AppState>>, app_handle: tauri::AppHandle) {
-    if descriptor.kind == "playlist" {
-        update_task_failed(id, "Playlist captures are not supported yet. Capture a direct video or audio request instead.".into(), &state, &app_handle);
-        return;
-    }
+async fn download_direct_stream(id: String, descriptor: DirectMediaDescriptor, settings: Settings, state: Arc<Mutex<AppState>>, app_handle: tauri::AppHandle) {
     let mut builder = reqwest::Client::builder();
-    if settings.proxy_enabled && !settings.proxy_url.trim().is_empty() {
+    if descriptor.use_proxy && settings.proxy_enabled && !settings.proxy_url.trim().is_empty() {
         if let Ok(proxy) = reqwest::Proxy::all(settings.proxy_url.trim()) { builder = builder.proxy(proxy.no_proxy(reqwest::NoProxy::from_string("localhost,127.0.0.1"))); }
     }
     let client = match builder.build() { Ok(client) => client, Err(error) => { update_task_failed(id, format!("Failed to build HTTP client: {error}"), &state, &app_handle); return; } };
     let save_path = PathBuf::from(&settings.save_path); let _ = std::fs::create_dir_all(&save_path); let output_path = unique_output_path(&save_path, &descriptor.filename);
     let mut request = client.get(&descriptor.url);
     for (name, value) in &descriptor.headers { request = request.header(name, value); }
-    let response = match request.send().await { Ok(response) => response, Err(error) => { update_task_failed(id, format!("Captured media request failed: {error}"), &state, &app_handle); return; } };
-    if !response.status().is_success() { update_task_failed(id, format!("Captured media server returned {}", response.status()), &state, &app_handle); return; }
-    let total_bytes = response.content_length().unwrap_or(0);
-    let mut abort_rx = { let mut lock = state.lock().unwrap(); let task = lock.tasks.get_mut(&id).unwrap(); task.title = descriptor.filename.clone(); task.status = "downloading".into(); task.total_bytes = total_bytes; task.output_path = Some(output_path.to_string_lossy().into_owned()); let _ = app_handle.emit("task-updated", task.clone()); let (tx, rx) = tokio::sync::oneshot::channel(); lock.cancellations.insert(id.clone(), tx); rx };
+    let response = match request.send().await { Ok(response) => response, Err(error) => { update_task_failed(id, format!("Media request failed: {error}"), &state, &app_handle); return; } };
+    if !response.status().is_success() { update_task_failed(id, format!("Media server returned {}", response.status()), &state, &app_handle); return; }
+    let total_bytes = response.content_length().unwrap_or(descriptor.expected_bytes);
+    let mut abort_rx = { let mut lock = state.lock().unwrap(); let Some(task) = lock.tasks.get_mut(&id) else { return; }; if task.status == "cancelled" { return; } task.title = descriptor.filename.clone(); task.status = "downloading".into(); task.total_bytes = total_bytes; task.output_path = Some(output_path.to_string_lossy().into_owned()); let _ = app_handle.emit("task-updated", task.clone()); let (tx, rx) = tokio::sync::oneshot::channel(); lock.cancellations.insert(id.clone(), tx); rx };
     let mut file = match tokio::fs::File::create(&output_path).await { Ok(file) => file, Err(error) => { update_task_failed(id, format!("Disk write error: {error}"), &state, &app_handle); return; } };
     let mut stream = response.bytes_stream(); let mut downloaded = 0u64; let mut last_update = std::time::Instant::now();
     loop { tokio::select! {
         _ = &mut abort_rx => { drop(file); let _ = std::fs::remove_file(&output_path); return; }
-        chunk = stream.next() => match chunk { Some(Ok(chunk)) => { if let Err(error) = file.write_all(&chunk).await { update_task_failed(id, format!("Disk write error: {error}"), &state, &app_handle); return; } downloaded += chunk.len() as u64; if last_update.elapsed().as_millis() >= 120 { let mut lock = state.lock().unwrap(); if let Some(task) = lock.tasks.get_mut(&id) { task.downloaded_bytes = downloaded; if total_bytes > 0 { task.progress = (downloaded as f64 / total_bytes as f64).min(0.99); } let _ = app_handle.emit("task-updated", task.clone()); } last_update = std::time::Instant::now(); } }, Some(Err(error)) => { update_task_failed(id, format!("Captured download error: {error}"), &state, &app_handle); return; }, None => break }
+        chunk = stream.next() => match chunk { Some(Ok(chunk)) => { if let Err(error) = file.write_all(&chunk).await { update_task_failed(id, format!("Disk write error: {error}"), &state, &app_handle); return; } downloaded += chunk.len() as u64; if last_update.elapsed().as_millis() >= 120 { let mut lock = state.lock().unwrap(); if let Some(task) = lock.tasks.get_mut(&id) { task.downloaded_bytes = downloaded; if total_bytes > 0 { task.progress = (downloaded as f64 / total_bytes as f64).min(0.99); } let _ = app_handle.emit("task-updated", task.clone()); } last_update = std::time::Instant::now(); } }, Some(Err(error)) => { update_task_failed(id, format!("Media download error: {error}"), &state, &app_handle); return; }, None => break }
     }}
-    if downloaded == 0 { update_task_failed(id, "No data received from captured media URL".into(), &state, &app_handle); return; }
+    if downloaded == 0 { update_task_failed(id, "No data received from media URL".into(), &state, &app_handle); return; }
     if let Some(decode_key) = descriptor.decode_key.as_deref() {
         if let Err(error) = decode_wechat_file(&output_path, decode_key) { let _ = std::fs::remove_file(&output_path); update_task_failed(id, format!("WeChat media decryption failed: {error}"), &state, &app_handle); return; }
     }

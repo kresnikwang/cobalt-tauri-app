@@ -21,6 +21,7 @@
     "platform.capability.cookie_hd": "HD resolve",
     "platform.capability.audio": "Stable audio",
     "platform.capability.server_assist": "Server assist",
+    "platform.capability.browser_resolve": "Browser resolve",
     "platform.capability.basic": "Basic support",
 
     "task.status.queued": "QUEUED",

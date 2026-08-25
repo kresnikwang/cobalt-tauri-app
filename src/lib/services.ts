@@ -9,6 +9,7 @@ export interface ServicePlatform {
 export const platforms: ServicePlatform[] = [
   { name: 'YouTube', domain: 'youtube.com', color: '#ff0000', bg: 'rgba(255, 0, 0, 0.15)', keywords: ['youtube', 'youtu.be'] },
   { name: 'Bilibili', domain: 'bilibili.com', color: '#00aeec', bg: 'rgba(0, 174, 236, 0.15)', keywords: ['bilibili', 'bili'] },
+  { name: '新片场', domain: 'xinpianchang.com', color: '#f5b21b', bg: 'rgba(245, 178, 27, 0.15)', keywords: ['xinpianchang'] },
   { name: 'Instagram', domain: 'instagram.com', color: '#e1306c', bg: 'rgba(225, 48, 108, 0.15)', keywords: ['instagram'] },
   { name: 'Twitter / X', domain: 'x.com', color: '#ffffff', bg: 'rgba(255, 255, 255, 0.08)', keywords: ['twitter', 'x.com'] },
   { name: 'SoundCloud', domain: 'soundcloud.com', color: '#ff5500', bg: 'rgba(255, 85, 0, 0.15)', keywords: ['soundcloud'] },
