@@ -13,8 +13,11 @@ use base64::Engine;
 mod sniffer;
 mod xinpianchang;
 
+const LEGACY_API_URL: &str = "http://43.156.122.169";
+const DEFAULT_API_URL: &str = "http://47.241.10.142/cobalt-api";
+
 fn default_api_url() -> String {
-    "http://43.156.122.169".to_string()
+    DEFAULT_API_URL.to_string()
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -45,6 +48,15 @@ impl Settings {
             proxy_enabled: true,
             proxy_url: "http://127.0.0.1:7897".to_string(),
         }
+    }
+}
+
+fn migrate_legacy_api_url(settings: &mut Settings) -> bool {
+    if settings.api_url.trim().trim_end_matches('/') == LEGACY_API_URL {
+        settings.api_url = default_api_url();
+        true
+    } else {
+        false
     }
 }
 
@@ -190,6 +202,10 @@ fn normalized_api_url(settings: &Settings) -> String {
     }
 }
 
+fn api_request_url(settings: &Settings) -> String {
+    format!("{}/", normalized_api_url(settings))
+}
+
 fn absolute_api_url(settings: &Settings, path_or_url: &str) -> String {
     if path_or_url.starts_with("http://") || path_or_url.starts_with("https://") {
         path_or_url.to_string()
@@ -199,7 +215,7 @@ fn absolute_api_url(settings: &Settings, path_or_url: &str) -> String {
 }
 
 async fn request_media_service(payload: serde_json::Value, settings: &Settings, client: &reqwest::Client) -> Result<serde_json::Value, reqwest::Error> {
-    let res = client.post(normalized_api_url(settings))
+    let res = client.post(api_request_url(settings))
         .header("Accept", "application/json")
         .header("Content-Type", "application/json")
         .json(&payload)
@@ -1695,7 +1711,7 @@ pub fn run() {
             let settings_path = app_data_dir.join("settings.json");
             let tasks_path = app_data_dir.join("tasks.json");
             
-            let settings = if settings_path.exists() {
+            let mut settings = if settings_path.exists() {
                 let content = std::fs::read_to_string(&settings_path).unwrap_or_default();
                 serde_json::from_str::<Settings>(&content).unwrap_or_else(|_| {
                     let download_dir = app.path().download_dir().unwrap_or_else(|_| std::env::current_dir().unwrap());
@@ -1706,8 +1722,10 @@ pub fn run() {
                 Settings::default_with_download_dir(download_dir)
             };
             
-            // Save initial defaults if missing
-            if !settings_path.exists() {
+            let migrated_api_url = migrate_legacy_api_url(&mut settings);
+
+            // Save initial defaults and migrate the previous built-in API endpoint.
+            if !settings_path.exists() || migrated_api_url {
                 let _ = std::fs::write(&settings_path, serde_json::to_string_pretty(&settings).unwrap());
             }
 
@@ -1827,8 +1845,35 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-	use super::{decode_wechat_file, xor_wechat_isaac64_prefix, Isaac64};
+    use super::{api_request_url, decode_wechat_file, migrate_legacy_api_url, xor_wechat_isaac64_prefix, Isaac64, Settings};
+    use std::path::PathBuf;
     use std::io::Write;
+
+    #[test]
+    fn migrates_the_previous_default_api_url() {
+        let mut settings = Settings::default_with_download_dir(PathBuf::from("/tmp"));
+        settings.api_url = "http://43.156.122.169/".to_string();
+
+        assert!(migrate_legacy_api_url(&mut settings));
+        assert_eq!(settings.api_url, "http://47.241.10.142/cobalt-api");
+    }
+
+    #[test]
+    fn preserves_a_custom_api_url() {
+        let mut settings = Settings::default_with_download_dir(PathBuf::from("/tmp"));
+        settings.api_url = "https://media.example.com/api".to_string();
+
+        assert!(!migrate_legacy_api_url(&mut settings));
+        assert_eq!(settings.api_url, "https://media.example.com/api");
+    }
+
+    #[test]
+    fn posts_to_the_api_root_with_a_trailing_slash() {
+        let mut settings = Settings::default_with_download_dir(PathBuf::from("/tmp"));
+        settings.api_url = "http://47.241.10.142/cobalt-api/".to_string();
+
+        assert_eq!(api_request_url(&settings), "http://47.241.10.142/cobalt-api/");
+    }
 
     #[test]
     fn decrypts_only_the_wechat_key_prefix() {

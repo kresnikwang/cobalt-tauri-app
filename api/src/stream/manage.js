@@ -10,6 +10,7 @@ import { closeRequest } from "./shared.js";
 import { decryptStream, encryptStream } from "../misc/crypto.js";
 import { hashHmac } from "../security/secrets.js";
 import { zip } from "../misc/utils.js";
+import { createAPIURL } from "../misc/api-url.js";
 
 // optional dependency
 const freebind = env.freebindCIDR && await import('freebind').catch(() => {});
@@ -62,7 +63,7 @@ export function createStream(obj) {
         });
     }
 
-    let streamLink = new URL('/tunnel', env.apiURL);
+    let streamLink = createAPIURL(env.apiURL, '/tunnel');
 
     const params = {
         'id': streamID,

@@ -20,6 +20,7 @@ import { friendlyServiceName } from "../processing/service-alias.js";
 import { verifyStream } from "../stream/manage.js";
 import { createResponse, normalizeRequest, getIP } from "../processing/request.js";
 import { setupTunnelHandler } from "./itunnel.js";
+import { createAPIURL } from "../misc/api-url.js";
 
 import * as APIKeys from "../security/api-keys.js";
 import * as Cookies from "../processing/cookie/manager.js";
@@ -80,7 +81,7 @@ const youtubeFilename = (url) => {
 }
 
 const createYtdlpTunnelResponse = (url) => {
-    const tunnel = new URL("/yt-dlp", env.apiURL);
+    const tunnel = createAPIURL(env.apiURL, "/yt-dlp");
     tunnel.searchParams.set("url", url);
 
     return {
