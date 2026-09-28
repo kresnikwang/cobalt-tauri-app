@@ -938,7 +938,7 @@
         </div>
 
         <div class="settings-footer">
-          <p class="settings-app-version">{t('settings.version', { version: '1.0.8' })}</p>
+          <p class="settings-app-version">{t('settings.version', { version: '1.0.9' })}</p>
         </div>
       </div>
     </div>
