@@ -3,7 +3,7 @@
   import { fade, fly } from 'svelte/transition';
   import { invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
-  
+
   import {
     IconDownload,
     IconSettings,
@@ -22,21 +22,34 @@
     IconSearch
   } from "@tabler/icons-svelte";
 
-  import { t, getLocale, setLocale } from '$lib/i18n.svelte';
-  import { platforms, getServiceInfo } from '$lib/services';
+  import { t, getLocale, setLocale, initLocale, availableLocales } from '$lib/i18n.svelte';
+  import { platforms, getServiceInfo, type ServicePlatform } from '$lib/services';
+
+  const RUNNING_STATUSES = ['downloading', 'analyzing', 'queued', 'merging'];
+  const SETTLED_STATUSES = ['completed', 'failed', 'cancelled'];
+  const TABS = ['all', 'downloading', 'completed', 'failed'] as const;
+  type TabId = (typeof TABS)[number];
+
+  const TOAST_TTL_MS = 8000;
+  const TOAST_MAX = 3;
 
   // State declaration using Svelte 5 Runes
   let inputUrl = $state('');
   let isDragging = $state(false);
   let showSettings = $state(false);
   let inputMode = $state<'url' | 'sniffer'>('url');
-  let clipboardToast = $state<{ url: string; visible: boolean }>({ url: '', visible: false });
-  let clipboardTimeout: any = null;
-  
+  let submitting = $state(false);
+
+  // Clipboard toasts are a queue: a second link must not silently replace the first one
+  // the user may still be about to act on.
+  let clipboardToasts = $state<{ id: number; url: string }[]>([]);
+  let toastSeq = 0;
+  let toastTimers: ReturnType<typeof setTimeout>[] = [];
+
   // Settings State
   let settings = $state({
     savePath: '',
-    apiUrl: 'http://43.156.122.169',
+    apiUrl: '',
     downloadMode: 'video',
     videoQuality: '720',
     audioFormat: 'best',
@@ -45,90 +58,167 @@
     proxyEnabled: true,
     proxyUrl: 'http://127.0.0.1:7897'
   });
+  // Guards against writing the placeholder defaults above back to disk if the user
+  // touches a setting before the backend has answered.
+  let settingsReady = $state(false);
+  let bootError = $state('');
+  let actionError = $state('');
 
   // Tasks List
   let tasks = $state<any[]>([]);
-  let activeTab = $state<'all' | 'downloading' | 'completed' | 'failed'>('all');
+  let activeTab = $state<TabId>('all');
   let sniffer = $state<any>({ status: 'stopped', port: 8899, captures: [], message: null, supportedSources: [], certificateInstalled: false, proxyActive: false, wechatHooks: 0, tunProxyDetected: null });
   let snifferBusy = $state(false);
   let snifferError = $state('');
   let captureSearch = $state('');
   let thumbFailed = $state<Record<string, boolean>>({});
 
+  // Announcements for assistive tech; the visible list is silent on its own.
+  let announcement = $state('');
+  const lastStatus = new Map<string, string>();
+
+  // Elements needed for focus management.
+  let settingsPanel = $state<HTMLElement | null>(null);
+  let settingsButton = $state<HTMLButtonElement | null>(null);
+  let tabButtons = $state<Partial<Record<TabId, HTMLButtonElement | null>>>({});
+
+  // Hoisted out of the filter callback — it was recomputed once per captured item.
+  const captureQuery = $derived(captureSearch.trim().toLowerCase());
   let filteredCaptures = $derived(
-    captureSearch.trim()
-      ? sniffer.captures.filter((c: any) => {
-          const q = captureSearch.trim().toLowerCase();
-          return (c.title || '').toLowerCase().includes(q) || (c.source || '').toLowerCase().includes(q);
-        })
+    captureQuery
+      ? sniffer.captures.filter((c: any) =>
+          (c.title || '').toLowerCase().includes(captureQuery) || (c.source || '').toLowerCase().includes(captureQuery))
       : sniffer.captures
   );
 
   // Filter tasks based on active tab using Svelte 5 $derived rune
   let filteredTasks = $derived(
     activeTab === 'downloading'
-      ? tasks.filter(t => ['downloading', 'analyzing', 'queued', 'merging'].includes(t.status))
+      ? tasks.filter(task => RUNNING_STATUSES.includes(task.status))
       : activeTab === 'completed'
-      ? tasks.filter(t => t.status === 'completed')
+      ? tasks.filter(task => task.status === 'completed')
       : activeTab === 'failed'
-      ? tasks.filter(t => ['failed', 'cancelled'].includes(t.status))
+      ? tasks.filter(task => ['failed', 'cancelled'].includes(task.status))
       : tasks
   );
+
+  // Computed once per update instead of re-filtering the whole list inside the template.
+  let tabCounts = $derived({
+    all: tasks.length,
+    downloading: tasks.filter(task => RUNNING_STATUSES.includes(task.status)).length,
+    completed: tasks.filter(task => task.status === 'completed').length,
+    failed: tasks.filter(task => ['failed', 'cancelled'].includes(task.status)).length
+  });
+
+  let hasSettledTasks = $derived(tasks.some(task => SETTLED_STATUSES.includes(task.status)));
+  // "Nothing here yet" only makes sense when the list itself is empty; a filtered tab
+  // needs different copy.
+  let isFilteredEmpty = $derived(tasks.length > 0 && filteredTasks.length === 0);
+
+  $effect(() => {
+    if (showSettings) settingsPanel?.focus();
+  });
+
+  $effect(() => {
+    for (const task of tasks) {
+      const previous = lastStatus.get(task.id);
+      if (previous === task.status) continue;
+      lastStatus.set(task.id, task.status);
+      // Only announce real transitions, not whatever state the app loaded with.
+      if (previous !== undefined && SETTLED_STATUSES.includes(task.status)) {
+        announcement = t(`status.announce.${task.status}`, { title: task.title });
+      }
+    }
+    const live = new Set(tasks.map(task => task.id));
+    for (const id of lastStatus.keys()) if (!live.has(id)) lastStatus.delete(id);
+  });
 
   let unlistenTask: (() => void) | null = null;
   let unlistenClipboard: (() => void) | null = null;
   let unlistenSniffer: (() => void) | null = null;
 
   onMount(async () => {
-    // Get settings from Tauri backend
-    settings = await invoke('get_settings');
-    // Get current tasks
-    tasks = await invoke('get_tasks');
-    sniffer = await invoke('get_sniffer_state');
+    initLocale();
 
-    // Listen for task updates from Tauri Rust process
-    unlistenTask = await listen('task-updated', (event) => {
-      const updatedTask = event.payload as any;
-      const index = tasks.findIndex(t => t.id === updatedTask.id);
-      if (index !== -1) {
-        tasks[index] = updatedTask;
-        tasks = [...tasks]; // force Svelte 5 array proxy update
-      } else {
-        tasks = [updatedTask, ...tasks];
-      }
-    });
+    // Register listeners BEFORE fetching initial state. If any of the invokes below
+    // rejects, the app must not end up permanently deaf to task/clipboard/sniffer events.
+    try {
+      [unlistenTask, unlistenClipboard, unlistenSniffer] = await Promise.all([
+        listen('task-updated', (event) => {
+          const updatedTask = event.payload as any;
+          const index = tasks.findIndex(task => task.id === updatedTask.id);
+          if (index !== -1) {
+            tasks[index] = updatedTask;
+            tasks = [...tasks]; // force Svelte 5 array proxy update
+          } else {
+            tasks = [updatedTask, ...tasks];
+          }
+        }),
+        listen('clipboard-detected', (event) => {
+          pushClipboardToast(event.payload as string);
+        }),
+        listen('sniffer-updated', (event) => {
+          sniffer = event.payload as any;
+        }),
+      ]);
+    } catch (error) {
+      bootError = `Failed to connect to the backend: ${error}`;
+      return;
+    }
 
-    // Listen for clipboard events
-    unlistenClipboard = await listen('clipboard-detected', (event) => {
-      const url = event.payload as string;
-      clipboardToast = { url, visible: true };
-
-      // Auto hide toast after 8 seconds
-      if (clipboardTimeout) clearTimeout(clipboardTimeout);
-      clipboardTimeout = setTimeout(() => {
-        clipboardToast.visible = false;
-      }, 8000);
-    });
-    unlistenSniffer = await listen('sniffer-updated', (event) => {
-      sniffer = event.payload as any;
-    });
+    // Each fetch is independent so one failure cannot strand the other two.
+    try { settings = await invoke('get_settings'); settingsReady = true; }
+    catch (error) { bootError = `Failed to load settings: ${error}`; }
+    try { tasks = await invoke('get_tasks'); }
+    catch (error) { bootError = bootError || `Failed to load tasks: ${error}`; }
+    try { sniffer = await invoke('get_sniffer_state'); }
+    catch (error) { bootError = bootError || `Failed to load sniffer state: ${error}`; }
   });
 
   onDestroy(() => {
     if (unlistenTask) unlistenTask();
     if (unlistenClipboard) unlistenClipboard();
     if (unlistenSniffer) unlistenSniffer();
-    if (clipboardTimeout) clearTimeout(clipboardTimeout);
+    for (const timer of toastTimers) clearTimeout(timer);
   });
 
-  async function handleDownload(urlToDownload = inputUrl) {
-    if (!urlToDownload.trim()) return;
-    const cleanUrl = urlToDownload.trim();
+  // --- Clipboard toasts -------------------------------------------------
+  function dismissToast(id: number) {
+    clipboardToasts = clipboardToasts.filter(toast => toast.id !== id);
+  }
+
+  function pushClipboardToast(url: string) {
+    const clean = url?.trim();
+    if (!clean || clipboardToasts.some(toast => toast.url === clean)) return;
+    const id = ++toastSeq;
+    clipboardToasts = [...clipboardToasts, { id, url: clean }].slice(-TOAST_MAX);
+    toastTimers.push(setTimeout(() => dismissToast(id), TOAST_TTL_MS));
+  }
+
+  // --- Actions ----------------------------------------------------------
+  async function handleDownload(urlToDownload = inputUrl, toastId?: number) {
+    const cleanUrl = (urlToDownload ?? '').trim();
+    if (!cleanUrl || submitting) return;
+
+    if (tasks.some(task => task.url === cleanUrl && RUNNING_STATUSES.includes(task.status))) {
+      actionError = t('download.duplicate');
+      return;
+    }
+
+    const previous = inputUrl;
     inputUrl = '';
-    clipboardToast.visible = false;
-    if (clipboardTimeout) clearTimeout(clipboardTimeout);
-    
-    await invoke('download_url', { url: cleanUrl });
+    if (toastId !== undefined) dismissToast(toastId);
+    submitting = true;
+
+    try {
+      await invoke('download_url', { url: cleanUrl });
+      actionError = '';
+    } catch (error) {
+      inputUrl = previous; // never discard what the user actually typed
+      actionError = String(error);
+    } finally {
+      submitting = false;
+    }
   }
 
   async function startSniffer() {
@@ -176,66 +266,162 @@
   }
 
   async function selectDirectory() {
-    const path: string | null = await invoke('select_directory');
-    if (path) {
-      settings.savePath = path;
-      await saveSettings();
+    try {
+      const path: string | null = await invoke('select_directory');
+      if (path) {
+        settings.savePath = path;
+        await saveSettings();
+      }
+    } catch (error) {
+      actionError = String(error);
     }
   }
 
   async function saveSettings() {
-    settings = await invoke('save_settings', { newSettings: JSON.parse(JSON.stringify(settings)) });
+    if (!settingsReady) return;
+    const payload = JSON.parse(JSON.stringify(settings));
+    // Whitespace here silently breaks the Rust-side proxy parse, which used to downgrade
+    // to a direct connection without telling anyone.
+    payload.apiUrl = String(payload.apiUrl ?? '').trim();
+    payload.proxyUrl = String(payload.proxyUrl ?? '').trim();
+    try {
+      settings = await invoke('save_settings', { newSettings: payload });
+      actionError = '';
+    } catch (error) {
+      actionError = String(error);
+    }
   }
 
   async function cancelTask(id: string) {
-    await invoke('cancel_task', { id });
+    try {
+      await invoke('cancel_task', { id });
+      actionError = '';
+    } catch (error) {
+      actionError = String(error);
+    }
   }
 
   async function deleteTask(id: string) {
-    await invoke('delete_task', { id });
-    tasks = tasks.filter(t => t.id !== id);
+    try {
+      await invoke('delete_task', { id });
+      tasks = tasks.filter(task => task.id !== id);
+      actionError = '';
+    } catch (error) {
+      actionError = String(error);
+    }
   }
 
   async function clearCompleted() {
-    tasks = await invoke('clear_completed');
+    try {
+      tasks = await invoke('clear_completed');
+      actionError = '';
+    } catch (error) {
+      actionError = String(error);
+    }
   }
 
   async function revealInFinder(path: string) {
-    await invoke('reveal_in_finder', { path });
+    if (!path) return;
+    try { await invoke('reveal_in_finder', { path }); }
+    catch (error) { actionError = String(error); }
   }
 
   async function openFile(path: string) {
-    await invoke('open_file', { path });
+    if (!path) return;
+    try { await invoke('open_file', { path }); }
+    catch (error) { actionError = String(error); }
   }
 
-  // Drag & Drop
-  function handleDragOver(e: DragEvent) {
+  // --- Settings panel focus management ----------------------------------
+  function openSettings() {
+    actionError = '';
+    showSettings = true;
+  }
+
+  function closeSettings() {
+    showSettings = false;
+    settingsButton?.focus();
+  }
+
+  function handleSettingsKeydown(event: KeyboardEvent) {
+    if (event.key === 'Escape') {
+      event.stopPropagation();
+      closeSettings();
+      return;
+    }
+    if (event.key !== 'Tab' || !settingsPanel) return;
+
+    const focusable = settingsPanel.querySelectorAll<HTMLElement>(
+      'button, input, select, textarea, a[href], [tabindex]:not([tabindex="-1"])'
+    );
+    if (focusable.length === 0) return;
+
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    const active = document.activeElement;
+
+    // Keep Tab cycling inside the dialog instead of escaping to the page behind it.
+    if (event.shiftKey && (active === first || active === settingsPanel)) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && active === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  }
+
+  function moveTab(delta: number) {
+    const current = TABS.indexOf(activeTab);
+    activeTab = TABS[(current + delta + TABS.length) % TABS.length];
+    queueMicrotask(() => tabButtons[activeTab]?.focus());
+  }
+
+  // --- Drag & drop ------------------------------------------------------
+  // A plain dragleave fires whenever the pointer crosses a child element, which made the
+  // overlay flicker. Count enter/leave pairs instead.
+  let dragDepth = 0;
+
+  function handleDragEnter(e: DragEvent) {
     e.preventDefault();
+    dragDepth += 1;
     isDragging = true;
   }
 
-  // svelte-ignore a11y_no_static_element_interactions
-  function handleDragLeave() {
-    isDragging = false;
+  function handleDragOver(e: DragEvent) {
+    e.preventDefault();
+    if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+  }
+
+  function handleDragLeave(e: DragEvent) {
+    e.preventDefault();
+    dragDepth = Math.max(0, dragDepth - 1);
+    if (dragDepth === 0) isDragging = false;
   }
 
   function handleDrop(e: DragEvent) {
     e.preventDefault();
+    dragDepth = 0;
     isDragging = false;
-    const text = e.dataTransfer?.getData('text');
-    
+
+    const text = e.dataTransfer?.getData('text')?.trim();
     if (text) {
       handleDownload(text);
+      return;
+    }
+    // Dropping a file used to do nothing at all, which reads as a broken app.
+    if ((e.dataTransfer?.files?.length ?? 0) > 0) {
+      actionError = t('drop.file_unsupported');
     }
   }
 
+  // --- Formatting -------------------------------------------------------
   function formatBytes(bytes: number, decimals = 2) {
-    if (!bytes || bytes === 0) return '0 Bytes';
+    if (!bytes || bytes <= 0) return t('unit.zero');
     const k = 1024;
+    const units = ['unit.bytes', 'unit.kb', 'unit.mb', 'unit.gb', 'unit.tb'];
     const dm = decimals < 0 ? 0 : decimals;
-    const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
-    const i = Math.floor(Math.log(bytes) / Math.log(k));
-    return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
+    const i = Math.min(Math.floor(Math.log(bytes) / Math.log(k)), units.length - 1);
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + t(units[i]);
   }
 
   function savePathLabel(path: string) {
@@ -250,17 +436,28 @@
     return settings.videoQuality === 'max' ? t('settings.quality.max') : `${settings.videoQuality}p`;
   }
 
-  function platformCapability(name: string) {
-    const key = name.toLowerCase();
-    if (key.includes('youtube')) return t('platform.capability.local_first');
-    if (key.includes('bilibili')) return t('platform.capability.cookie_hd');
-    if (name === '新片场') return t('platform.capability.browser_resolve');
-    if (key.includes('dailymotion')) return t('platform.capability.local_first');
-    if (key.includes('soundcloud')) return t('platform.capability.audio');
-    if (key.includes('instagram') || key.includes('twitter') || key.includes('x') || key.includes('pinterest')) {
-      return t('platform.capability.server_assist');
+  // t() degrades to the raw key when a locale is missing an entry, so fall back to the
+  // platform's own name rather than showing "platform.xinpianchang" to the user.
+  function platformName(id: string) {
+    const key = `platform.${id}`;
+    const label = t(key);
+    return label === key ? (platforms.find(platform => platform.id === id)?.fallbackName ?? id) : label;
+  }
+
+  // Keyed on the stable platform id — the old version matched on substrings, so any
+  // platform name containing "x" was reported as server-assisted.
+  function platformCapability(id: string) {
+    switch (id) {
+      case 'youtube':
+      case 'dailymotion': return t('platform.capability.local_first');
+      case 'bilibili': return t('platform.capability.cookie_hd');
+      case 'xinpianchang': return t('platform.capability.browser_resolve');
+      case 'soundcloud': return t('platform.capability.audio');
+      case 'instagram':
+      case 'twitter':
+      case 'pinterest': return t('platform.capability.server_assist');
+      default: return t('platform.capability.basic');
     }
-    return t('platform.capability.basic');
   }
 
   function humanTaskError(error?: string) {
@@ -278,8 +475,9 @@
 
 <!-- Drag & Drop overlay -->
 <!-- svelte-ignore a11y_no_static_element_interactions -->
-<main 
+<main
   class="app-container"
+  ondragenter={handleDragEnter}
   ondragover={handleDragOver}
   ondragleave={handleDragLeave}
   ondrop={handleDrop}
@@ -300,16 +498,49 @@
       <span class="gradient-text">COBALT</span>
     </div>
     <div class="header-actions no-drag">
-      <button class="settings-btn" onclick={() => showSettings = !showSettings} title={t('settings.title')} aria-label={t('settings.title')}>
+      <button
+        class="settings-btn"
+        bind:this={settingsButton}
+        onclick={openSettings}
+        title={t('settings.title')}
+        aria-label={t('settings.title')}
+        aria-haspopup="dialog"
+        aria-expanded={showSettings}
+      >
         <IconSettings size={18} />
       </button>
     </div>
   </header>
 
-  <div class="mode-switch" aria-label={t('sniffer.mode_label')}>
-    <button class:active={inputMode === 'url'} onclick={() => inputMode = 'url'}><IconDownload size={15} />{t('sniffer.mode_url')}</button>
-    <button class:active={inputMode === 'sniffer'} onclick={() => inputMode = 'sniffer'}><IconRadar size={15} />{t('sniffer.mode_capture')}</button>
+  <div
+    class="mode-switch"
+    role="tablist"
+    tabindex="-1"
+    aria-label={t('sniffer.mode_label')}
+    onkeydown={(e) => {
+      if (e.key === 'ArrowRight') { e.preventDefault(); inputMode = inputMode === 'url' ? 'sniffer' : 'url'; }
+      if (e.key === 'ArrowLeft') { e.preventDefault(); inputMode = inputMode === 'sniffer' ? 'url' : 'sniffer'; }
+    }}
+  >
+    <button
+      role="tab"
+      class:active={inputMode === 'url'}
+      aria-selected={inputMode === 'url'}
+      tabindex={inputMode === 'url' ? 0 : -1}
+      onclick={() => inputMode = 'url'}
+    ><IconDownload size={15} />{t('sniffer.mode_url')}</button>
+    <button
+      role="tab"
+      class:active={inputMode === 'sniffer'}
+      aria-selected={inputMode === 'sniffer'}
+      tabindex={inputMode === 'sniffer' ? 0 : -1}
+      onclick={() => inputMode = 'sniffer'}
+    ><IconRadar size={15} />{t('sniffer.mode_capture')}</button>
   </div>
+
+  {#if bootError || actionError}
+    <p class="app-banner" role="alert">{bootError || actionError}</p>
+  {/if}
 
   <!-- URL Paste Section -->
   {#if inputMode === 'url'}
@@ -325,9 +556,9 @@
         spellcheck="false"
         class="url-input"
       />
-      <button class="download-trigger-btn" onclick={() => handleDownload()} disabled={!inputUrl.trim()}>
+      <button class="download-trigger-btn" onclick={() => handleDownload()} disabled={!inputUrl.trim() || submitting}>
         <IconDownload size={18} />
-        <span>{t('analyze')}</span>
+        <span>{submitting ? t('download.submitting') : t('analyze')}</span>
       </button>
     </div>
     <div class="download-context-strip">
@@ -417,22 +648,28 @@
   {/if}
 
   <!-- Tabs Navigation -->
-  <nav class="tabs-nav">
-    <div class="tabs-list">
-      <button class="tab-btn" class:active={activeTab === 'all'} onclick={() => activeTab = 'all'}>
-        {t('tabs.all')} <span class="tab-count">{tasks.length}</span>
-      </button>
-      <button class="tab-btn" class:active={activeTab === 'downloading'} onclick={() => activeTab = 'downloading'}>
-        {t('tabs.downloading')} <span class="tab-count">{tasks.filter(t => ['downloading', 'analyzing', 'merging'].includes(t.status)).length}</span>
-      </button>
-      <button class="tab-btn" class:active={activeTab === 'completed'} onclick={() => activeTab = 'completed'}>
-        {t('tabs.completed')} <span class="tab-count">{tasks.filter(t => t.status === 'completed').length}</span>
-      </button>
-      <button class="tab-btn" class:active={activeTab === 'failed'} onclick={() => activeTab = 'failed'}>
-        {t('tabs.failed')} <span class="tab-count">{tasks.filter(t => ['failed', 'cancelled'].includes(t.status)).length}</span>
-      </button>
+  <nav class="tabs-nav" aria-label={t('tabs.label')}>
+    <div class="tabs-list" role="tablist" tabindex="-1" onkeydown={(e) => {
+      if (e.key === 'ArrowRight') { e.preventDefault(); moveTab(1); }
+      else if (e.key === 'ArrowLeft') { e.preventDefault(); moveTab(-1); }
+      else if (e.key === 'Home') { e.preventDefault(); activeTab = TABS[0]; }
+      else if (e.key === 'End') { e.preventDefault(); activeTab = TABS[TABS.length - 1]; }
+    }}>
+      {#each TABS as tab}
+        <button
+          class="tab-btn"
+          class:active={activeTab === tab}
+          role="tab"
+          aria-selected={activeTab === tab}
+          tabindex={activeTab === tab ? 0 : -1}
+          bind:this={tabButtons[tab]}
+          onclick={() => activeTab = tab}
+        >
+          {t(`tabs.${tab}`)} <span class="tab-count">{tabCounts[tab]}</span>
+        </button>
+      {/each}
     </div>
-    {#if tasks.some(t => ['completed', 'failed', 'cancelled'].includes(t.status))}
+    {#if hasSettledTasks}
       <button class="clear-btn" onclick={clearCompleted}>
         {t('tabs.clear_finished')}
       </button>
@@ -444,26 +681,31 @@
     {#if filteredTasks.length === 0}
       <div class="empty-state">
         <div class="empty-icon-pulse">
-          <IconCloudDownload size={40} color="var(--text-muted)" />
+          <IconSearch size={40} color="var(--text-muted)" />
         </div>
-        <h3>{t('empty.title')}</h3>
-        <p>{t('empty.subtitle')}</p>
-        
-        <span class="platforms-title">{t('empty.sources')}</span>
-        <div class="platforms-grid">
-          {#each platforms as platform}
-            <div class="platform-card">
-              <span class="platform-card-name" style="color: {platform.color}">{platform.name}</span>
-              <span class="platform-card-domain">{platform.domain}</span>
-              <span class="platform-card-capability">{platformCapability(platform.name)}</span>
-            </div>
-          {/each}
-        </div>
+        {#if isFilteredEmpty}
+          <h3>{t('empty.filtered.title')}</h3>
+          <p>{t('empty.filtered.subtitle')}</p>
+        {:else}
+          <h3>{t('empty.title')}</h3>
+          <p>{t('empty.subtitle')}</p>
+
+          <span class="platforms-title">{t('empty.sources')}</span>
+          <div class="platforms-grid">
+            {#each platforms as platform (platform.id)}
+              <div class="platform-card">
+                <span class="platform-card-name" style="color: {platform.color}">{platformName(platform.id)}</span>
+                <span class="platform-card-domain">{platform.domain}</span>
+                <span class="platform-card-capability">{platformCapability(platform.id)}</span>
+              </div>
+            {/each}
+          </div>
+        {/if}
       </div>
     {:else}
       <div class="tasks-list">
         {#each filteredTasks as task (task.id)}
-          {@const service = getServiceInfo(task.url, t('service.unknown'))}
+          {@const service = getServiceInfo(task.url, t('service.unknown'), platformName)}
           <div class="task-card glass">
             <div class="service-icon" style="--service-bg: {service.bg}; --service-color: {service.color}">
               {#if settings.downloadMode === 'audio'}
@@ -485,9 +727,16 @@
 
               <!-- Progress bar -->
               <div class="progress-bar-wrapper">
-                <div class="progress-bar-bg">
-                  <div 
-                    class="progress-bar-fill {task.status}" 
+                <div
+                  class="progress-bar-bg"
+                  role="progressbar"
+                  aria-label={t('progress.label')}
+                  aria-valuenow={Math.round(task.progress * 100)}
+                  aria-valuemin="0"
+                  aria-valuemax="100"
+                >
+                  <div
+                    class="progress-bar-fill {task.status}"
                     class:indeterminate={task.status === 'downloading' && task.totalBytes === 0}
                     style="width: {task.progress * 100}%"
                   ></div>
@@ -496,7 +745,9 @@
 
               <!-- Status line -->
               <div class="task-status-footer">
-                {#if task.status === 'downloading'}
+                {#if task.status === 'queued'}
+                  <span class="stats-text">{t('task.waiting_slot')}</span>
+                {:else if task.status === 'downloading'}
                   <span class="stats-text">
                     {formatBytes(task.downloadedBytes)} / {task.totalBytes > 0 ? formatBytes(task.totalBytes) : t('task.unknown_size')}
                   </span>
@@ -518,27 +769,27 @@
 
             <!-- Actions Column -->
             <div class="task-actions-col">
-              {#if ['downloading', 'analyzing', 'queued'].includes(task.status)}
-                <button class="action-circle-btn danger" onclick={() => cancelTask(task.id)} title="Cancel">
+              {#if RUNNING_STATUSES.includes(task.status)}
+                <button class="action-circle-btn danger" onclick={() => cancelTask(task.id)} title={t('action.cancel')} aria-label={t('action.cancel')}>
                   <IconX size={14} />
                 </button>
               {:else if task.status === 'completed'}
-                <button class="action-circle-btn success" onclick={() => openFile(task.outputPath)} title="Play File">
+                <button class="action-circle-btn success" onclick={() => openFile(task.outputPath)} title={t('action.play')} aria-label={t('action.play')}>
                   <IconPlayerPlay size={14} />
                 </button>
-                <button class="action-circle-btn secondary" onclick={() => revealInFinder(task.outputPath)} title="Show in Finder">
+                <button class="action-circle-btn secondary" onclick={() => revealInFinder(task.outputPath)} title={t('action.reveal')} aria-label={t('action.reveal')}>
                   <IconFolder size={14} />
                 </button>
-                <button class="action-circle-btn secondary" onclick={() => deleteTask(task.id)} title="Remove from List">
+                <button class="action-circle-btn secondary" onclick={() => deleteTask(task.id)} title={t('action.remove')} aria-label={t('action.remove')}>
                   <IconTrash size={14} />
                 </button>
               {:else}
                 {#if !task.url.startsWith('capture://')}
-                  <button class="action-circle-btn" onclick={() => handleDownload(task.url)} title="Retry">
-                    <IconPlayerPlay size={14} />
+                  <button class="action-circle-btn" onclick={() => handleDownload(task.url)} title={t('action.retry')} aria-label={t('action.retry')}>
+                    <IconRefresh size={14} />
                   </button>
                 {/if}
-                <button class="action-circle-btn secondary" onclick={() => deleteTask(task.id)} title="Remove from List">
+                <button class="action-circle-btn secondary" onclick={() => deleteTask(task.id)} title={t('action.remove')} aria-label={t('action.remove')}>
                   <IconTrash size={14} />
                 </button>
               {/if}
@@ -549,32 +800,48 @@
     {/if}
   </section>
 
-  <!-- Clipboard Toast Slide-up -->
-  {#if clipboardToast.visible}
-    <div class="clipboard-toast glass" in:fly={{ y: 12, duration: 220 }} out:fly={{ y: -8, duration: 140 }}>
-      <div class="toast-content">
-        <IconClipboard size={20} color="var(--accent-primary)" />
-        <div class="toast-text">
-          <h4>{t('toast.detected')}</h4>
-          <p class="truncate">{clipboardToast.url}</p>
+  <!-- Screen-reader announcements for task state changes -->
+  <div class="sr-only" aria-live="polite" aria-atomic="true">{announcement}</div>
+
+  <!-- Clipboard Toast Stack -->
+  <div class="toast-stack">
+    {#each clipboardToasts as toast (toast.id)}
+      <div class="clipboard-toast glass" in:fly={{ y: 12, duration: 220 }} out:fly={{ y: -8, duration: 140 }}>
+        <div class="toast-content">
+          <IconClipboard size={20} color="var(--accent-primary)" />
+          <div class="toast-text">
+            <h4>{t('toast.detected')}</h4>
+            <p class="truncate">{toast.url}</p>
+          </div>
+        </div>
+        <div class="toast-actions">
+          <button class="toast-btn secondary" onclick={() => dismissToast(toast.id)}>{t('toast.ignore')}</button>
+          <button class="toast-btn primary" onclick={() => handleDownload(toast.url, toast.id)}>{t('toast.download')}</button>
         </div>
       </div>
-      <div class="toast-actions">
-        <button class="toast-btn secondary" onclick={() => clipboardToast.visible = false}>{t('toast.ignore')}</button>
-        <button class="toast-btn primary" onclick={() => handleDownload(clipboardToast.url)}>{t('toast.download')}</button>
-      </div>
-    </div>
-  {/if}
+    {/each}
+  </div>
 
   <!-- Settings Slide Panel -->
   {#if showSettings}
     <!-- svelte-ignore a11y_click_events_have_key_events -->
     <!-- svelte-ignore a11y_no_static_element_interactions -->
-    <div class="settings-backdrop" onclick={() => showSettings = false} transition:fade={{ duration: 160 }}>
-      <div class="settings-panel glass" role="dialog" aria-modal="true" aria-label={t('settings.title')} tabindex="-1" onclick={(e) => e.stopPropagation()} in:fly={{ x: 24, duration: 220 }} out:fly={{ x: 16, duration: 140 }}>
+    <div class="settings-backdrop" onclick={closeSettings} transition:fade={{ duration: 160 }}>
+      <div
+        class="settings-panel glass"
+        role="dialog"
+        aria-modal="true"
+        aria-label={t('settings.title')}
+        tabindex="-1"
+        bind:this={settingsPanel}
+        onclick={(e) => e.stopPropagation()}
+        onkeydown={handleSettingsKeydown}
+        in:fly={{ x: 24, duration: 220 }}
+        out:fly={{ x: 16, duration: 140 }}
+      >
         <div class="settings-header">
           <h3>{t('settings.title')}</h3>
-          <button class="close-settings" onclick={() => showSettings = false} title={t('settings.title')} aria-label={t('settings.title')}>
+          <button class="close-settings" onclick={closeSettings} title={t('settings.close')} aria-label={t('settings.close')}>
             <IconX size={18} />
           </button>
         </div>
@@ -584,9 +851,9 @@
           <div class="setting-item">
             <label for="lang-select">{t('settings.language')}</label>
             <select id="lang-select" value={getLocale()} onchange={(e) => setLocale(e.currentTarget.value)} class="settings-select">
-              <option value="en">English</option>
-              <option value="zh">中文</option>
-              <option value="ru">Русский</option>
+              {#each availableLocales as locale (locale.code)}
+                <option value={locale.code}>{locale.label}</option>
+              {/each}
             </select>
           </div>
 
@@ -789,7 +1056,7 @@
 
   /* URL Paste Section */
   .paste-section {
-    padding: 20px 20px 14px;
+    padding: var(--page-gutter) var(--page-gutter) 14px;
   }
 
   .input-glow-wrapper {
@@ -885,7 +1152,7 @@
     color: var(--text-secondary);
     background: rgba(255, 255, 255, 0.045);
     box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.055);
-    font-size: 10.5px;
+    font-size: 11px;
     font-weight: 600;
     white-space: nowrap;
     overflow: hidden;
@@ -898,12 +1165,24 @@
     box-shadow: 0 0 0 1px rgba(119, 133, 255, 0.2);
   }
 
+  .app-banner {
+    margin: 12px 20px 0;
+    padding: 9px 12px;
+    border: 1px solid rgba(255, 125, 133, 0.32);
+    border-radius: var(--radius-md);
+    background: rgba(239, 68, 68, 0.1);
+    color: #ff7d85;
+    font-size: 12px;
+    line-height: 1.5;
+    overflow-wrap: anywhere;
+  }
+
   /* Tabs Nav */
   .tabs-nav {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 0 20px;
+    padding: 0 var(--page-gutter);
     margin-bottom: 14px;
     gap: 12px;
   }
@@ -926,7 +1205,7 @@
     padding: 0 12px;
     font-size: 12px;
     font-weight: 500;
-    border-radius: 10px;
+    border-radius: var(--radius-md);
     cursor: pointer;
     transition-property: background-color, color, scale;
     transition-duration: 150ms;
@@ -948,7 +1227,7 @@
   .tab-btn span {
     background: rgba(255, 255, 255, 0.08);
     padding: 1px 6px;
-    border-radius: 10px;
+    border-radius: var(--radius-md);
     font-size: 10px;
     color: var(--text-secondary);
   }
@@ -989,7 +1268,7 @@
   .downloads-area {
     flex: 1;
     overflow-y: auto;
-    padding: 0 20px 20px 20px;
+    padding: 0 var(--page-gutter) var(--page-gutter);
   }
 
   .tasks-list {
@@ -1014,7 +1293,7 @@
     width: 44px;
     height: 44px;
     flex: 0 0 44px;
-    border-radius: 10px;
+    border-radius: var(--radius-md);
     color: var(--service-color);
     background: var(--service-bg);
     display: flex;
@@ -1057,7 +1336,7 @@
   }
 
   .task-service {
-    font-size: 10px;
+    font-size: 11px;
     font-weight: 700;
     text-transform: uppercase;
     letter-spacing: 0;
@@ -1066,10 +1345,10 @@
 
   .task-status-badge {
     flex: 0 0 auto;
-    font-size: 8px;
+    font-size: 11px;
     font-weight: 700;
     padding: 2px 6px;
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     letter-spacing: 0;
     font-variant-numeric: tabular-nums;
   }
@@ -1268,21 +1547,45 @@
     line-height: 1.5;
   }
 
-  /* Clipboard Toast */
-  .clipboard-toast {
+  /* Clipboard Toast Stack */
+  /* The stack is the positioned element so several toasts stack upward instead of
+     overlapping each other in the same corner slot. */
+  .toast-stack {
     position: absolute;
     bottom: 20px;
     left: 20px;
     right: 20px;
+    z-index: 500;
+    display: flex;
+    flex-direction: column-reverse;
+    gap: 10px;
+    pointer-events: none;
+  }
+
+  .toast-stack > * { pointer-events: auto; }
+
+  .clipboard-toast {
     border-radius: 16px;
     padding: 14px 16px;
     display: flex;
     justify-content: space-between;
     align-items: center;
     gap: 16px;
-    z-index: 500;
     background: rgba(22, 22, 33, 0.95);
     box-shadow: 0 0 0 1px rgba(119, 133, 255, 0.28), var(--shadow-lg);
+  }
+
+  /* Available to assistive tech, invisible on screen. */
+  .sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+    border: 0;
   }
 
   .toast-content {
@@ -1328,7 +1631,7 @@
     font-weight: 600;
     min-height: 40px;
     padding: 0 12px;
-    border-radius: 10px;
+    border-radius: var(--radius-md);
     cursor: pointer;
     transition-property: background-color, color, scale;
     transition-duration: 150ms;
@@ -1450,7 +1753,7 @@
     flex: 1;
     background: var(--bg-input);
     border: 1px solid var(--border-color);
-    border-radius: 10px;
+    border-radius: var(--radius-md);
     color: var(--text-primary);
     padding: 0 10px;
     font-size: 12px;
@@ -1465,7 +1768,7 @@
     color: var(--text-primary);
     width: 40px;
     height: 40px;
-    border-radius: 10px;
+    border-radius: var(--radius-md);
     cursor: pointer;
     display: flex;
     align-items: center;
@@ -1488,7 +1791,7 @@
   .settings-select {
     background: var(--bg-input);
     border: 1px solid var(--border-color);
-    border-radius: 10px;
+    border-radius: var(--radius-md);
     color: var(--text-primary);
     padding: 0 10px;
     font-size: 12px;
@@ -1534,7 +1837,7 @@
   }
 
   .setting-section-title {
-    font-size: 10px;
+    font-size: 11px;
     font-weight: 700;
     text-transform: uppercase;
     letter-spacing: 0;
@@ -1545,7 +1848,7 @@
   .settings-input {
     background: var(--bg-input);
     border: 1px solid var(--border-color);
-    border-radius: 10px;
+    border-radius: var(--radius-md);
     color: var(--text-primary);
     padding: 0 10px;
     font-size: 12px;
@@ -1566,7 +1869,7 @@
   }
 
   .setting-hint {
-    font-size: 10px;
+    font-size: 11px;
     color: var(--text-muted);
     line-height: 1.45;
     text-wrap: pretty;
@@ -1574,7 +1877,7 @@
 
   .settings-app-version {
     margin: 0;
-    font-size: 10px;
+    font-size: 11px;
     color: var(--text-muted);
     text-align: center;
   }
@@ -1583,11 +1886,11 @@
     display: inline-flex;
     align-items: center;
     gap: 3px;
-    margin: 16px 28px 0;
+    margin: var(--section-gap) var(--page-gutter) 0;
     padding: 3px;
     background: rgba(20, 23, 31, 0.9);
     border: 1px solid var(--border-color);
-    border-radius: 7px;
+    border-radius: var(--radius-md);
   }
 
   .mode-switch button, .sniffer-control, .capture-download, .capture-clear {
@@ -1599,9 +1902,21 @@
     font: inherit;
     cursor: pointer;
   }
-  .mode-switch button { color: var(--text-muted); background: transparent; padding: 7px 11px; border-radius: 5px; font-size: 12px; }
+  .mode-switch button { color: var(--text-muted); background: transparent; padding: 7px 11px; border-radius: var(--radius-sm); font-size: 12px; }
   .mode-switch button.active { color: #eef1ff; background: rgba(106, 92, 255, 0.24); }
-  .sniffer-section { margin: 16px 28px 0; padding: 20px; border: 1px solid var(--border-color); border-radius: 8px; background: rgba(15, 17, 24, 0.64); }
+  /* min-height:0 lets this section shrink below its content height and scroll, instead of
+     pushing the downloads list off the bottom of the window. flex-basis stays auto so the
+     downloads area below keeps its share. */
+  .sniffer-section {
+    flex: 0 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    margin: var(--section-gap) var(--page-gutter) 0;
+    padding: 20px;
+    border: 1px solid var(--border-color);
+    border-radius: 12px;
+    background: rgba(15, 17, 24, 0.64);
+  }
   .sniffer-heading { display:flex; align-items:flex-start; justify-content:space-between; gap:18px; }
   .eyebrow { display:block; margin-bottom:6px; color:var(--accent-primary); font-size:10px; font-weight:700; letter-spacing:1.4px; }
   .sniffer-heading h2 { margin:0; color:var(--text-primary); font-size:18px; }
@@ -1631,7 +1946,8 @@
   .capture-clear:hover:not(:disabled) { color:var(--text-primary); background:rgba(255,255,255,.06); }
   .capture-clear:active:not(:disabled) { transform:scale(.96); }
   .sniffer-empty { display:flex; flex-direction:column; align-items:center; gap:9px; padding:27px 10px 12px; color:var(--text-muted); text-align:center; font-size:12px; }
-  .capture-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(228px,1fr)); gap:12px; margin-top:12px; padding:2px 4px 10px; max-height:56vh; overflow-y:auto; }
+  /* The section itself scrolls now, so the grid must not open a second scroll area. */
+  .capture-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(228px,1fr)); gap:12px; margin-top:12px; padding:2px 4px 10px; }
   .capture-card { display:flex; flex-direction:column; gap:9px; padding:9px; border-radius:12px; background:rgba(255,255,255,.03); box-shadow:0 1px 2px rgba(0,0,0,.25); transition:transform .15s ease, box-shadow .15s ease, background .15s ease; }
   .capture-card:hover { transform:translateY(-2px); background:rgba(255,255,255,.05); box-shadow:0 6px 18px rgba(0,0,0,.32); }
   .capture-thumb { position:relative; aspect-ratio:16/9; border-radius:8px; overflow:hidden; background:rgba(255,255,255,.04); }
@@ -1657,7 +1973,7 @@
 
   /* Supported platforms grid */
   .platforms-title {
-    font-size: 10px;
+    font-size: 11px;
     font-weight: 700;
     text-transform: uppercase;
     letter-spacing: 0;
@@ -1694,7 +2010,7 @@
   }
 
   .platform-card-domain {
-    font-size: 8.5px;
+    font-size: 11px;
     color: var(--text-muted);
     letter-spacing: 0;
   }
@@ -1706,7 +2022,7 @@
     background: rgba(255, 255, 255, 0.045);
     border-radius: 999px;
     padding: 2px 7px;
-    font-size: 8.5px;
+    font-size: 11px;
     font-weight: 600;
     white-space: nowrap;
     overflow: hidden;

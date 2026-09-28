@@ -29,6 +29,40 @@
   --shadow-lg: 0 16px 36px -12px rgba(0, 0, 0, 0.7);
   --shadow-border: 0 0 0 1px rgba(255, 255, 255, 0.075);
   --shadow-border-hover: 0 0 0 1px rgba(255, 255, 255, 0.13);
+
+  /* Shape and spacing scale. Screens that were written with one-off 5px/6px/7px/8px
+     radii read as subtly inconsistent next to each other; these keep them on a ladder. */
+  --radius-sm: 6px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+  --radius-xl: 16px;
+
+  --page-gutter: 20px;
+  --section-gap: 16px;
+}
+
+/* One scrollbar treatment for every scrollable region in the app. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.14) transparent;
+}
+
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+*::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.14);
+  border-radius: 4px;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.24);
 }
 
 html, body {

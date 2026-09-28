@@ -142,23 +142,35 @@ fn resource_binary(app: &AppHandle) -> Result<PathBuf, String> {
 pub fn start(app: AppHandle, sniffer: Arc<Mutex<SnifferState>>, upstream_proxy: Option<String>) -> Result<SnifferViewState, String> {
     let binary = resource_binary(&app)?;
     if !binary.exists() { return Err("Resource sniffer is not bundled in this build. Rebuild with Go 1.22+ installed.".into()); }
-    let mut guard = sniffer.lock().map_err(|_| "Sniffer state is unavailable")?;
-    if guard.status == "running" { return Ok(guard.view()); }
+    let mut guard = sniffer.lock().unwrap_or_else(|error| error.into_inner());
+    // "starting" counts as live: a half-started sidecar still owns the port.
+    if guard.status == "running" || guard.status == "starting" { return Ok(guard.view()); }
     std::fs::create_dir_all(&guard.data_dir).map_err(|e| e.to_string())?;
     let mut child = Command::new(binary).arg("--data-dir").arg(&guard.data_dir).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().map_err(|e| format!("Unable to start resource sniffer: {e}"))?;
-    let stdout = child.stdout.take().ok_or("Resource sniffer did not expose stdout")?;
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill(); let _ = child.wait();
+        return Err("Resource sniffer did not expose stdout".into());
+    };
     guard.stdin = child.stdin.take(); guard.child = Some(child); guard.status = "starting".into(); guard.message = Some("Configure the system proxy, then play media in the target app.".into());
     let port = guard.port;
     guard.upstream = upstream_proxy.filter(|proxy| !proxy.trim().is_empty());
     let upstream = guard.upstream.clone().unwrap_or_default();
-    send(&mut guard, json!({"id":"start", "command":"start", "port":port, "upstreamProxy":upstream}))?;
+    if let Err(error) = send(&mut guard, json!({"id":"start", "command":"start", "port":port, "upstreamProxy":upstream})) {
+        // The sidecar died on startup (port taken, arch mismatch). Reap it and reset the
+        // status, otherwise it leaks and every later start call spawns a second one.
+        if let Some(mut child) = guard.child.take() { let _ = child.kill(); let _ = child.wait(); }
+        guard.stdin = None;
+        guard.status = "stopped".into();
+        guard.message = Some(error.clone());
+        return Err(error);
+    }
     emit_state(&app, &guard); drop(guard);
 
     let reader_state = sniffer.clone();
     std::thread::spawn(move || {
         for line in BufReader::new(stdout).lines().map_while(Result::ok) {
             let Ok(value) = serde_json::from_str::<Value>(&line) else { continue };
-            let mut state = match reader_state.lock() { Ok(state) => state, Err(_) => return };
+            let mut state = reader_state.lock().unwrap_or_else(|error| error.into_inner());
             match value.get("type").and_then(Value::as_str) {
                 Some("ready") | Some("status") => { if let Some(data) = value.get("data") { if data.get("running").and_then(Value::as_bool) == Some(true) { state.status = "running".into(); } state.certificate_path = data.get("certificatePath").and_then(Value::as_str).map(PathBuf::from).or(state.certificate_path.clone()); state.certificate_fingerprint = data.get("certificateFingerprint").and_then(Value::as_str).map(str::to_string).or(state.certificate_fingerprint.clone()); state.certificate_installed = state.certificate_fingerprint.as_deref().map(certificate_is_installed).unwrap_or(false); state.wechat_hooks = data.get("wechatHooks").and_then(Value::as_u64).map(|count| count as u32).unwrap_or(state.wechat_hooks); state.wechat_callbacks = data.get("wechatCallbacks").and_then(Value::as_u64).map(|count| count as u32).unwrap_or(state.wechat_callbacks); if let Some(message) = data.get("message").and_then(Value::as_str) { state.message = Some(message.to_string()); } } }
                 Some("resource") => if let Some(data) = value.get("data") {
@@ -179,12 +191,22 @@ pub fn start(app: AppHandle, sniffer: Arc<Mutex<SnifferState>>, upstream_proxy: 
             }
             emit_state(&app, &state);
         }
+        // stdout hit EOF, so the sidecar exited on its own. Reap it and reflect that in the UI
+        // instead of leaving the status stuck on "running" and the process unreaped.
+        let mut state = reader_state.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(mut child) = state.child.take() { let _ = child.kill(); let _ = child.wait(); }
+        state.stdin = None;
+        if state.status == "running" || state.status == "starting" {
+            state.status = "stopped".into();
+            state.message = Some("The resource sniffer exited unexpectedly.".into());
+            emit_state(&app, &state);
+        }
     });
-    Ok(sniffer.lock().map_err(|_| "Sniffer state is unavailable")?.view())
+    Ok(sniffer.lock().unwrap_or_else(|error| error.into_inner()).view())
 }
 
 pub fn stop(app: &AppHandle, sniffer: &Arc<Mutex<SnifferState>>) -> Result<SnifferViewState, String> {
-    let mut state = sniffer.lock().map_err(|_| "Sniffer state is unavailable")?;
+    let mut state = sniffer.lock().unwrap_or_else(|error| error.into_inner());
     let _ = restore_system_proxy(&mut state);
     let _ = send(&mut state, json!({"id":"stop", "command":"stop"}));
     if let Some(mut child) = state.child.take() { let _ = child.kill(); let _ = child.wait(); }
@@ -280,7 +302,7 @@ fn proxy_endpoint_reachable(proxy_url: &str) -> Result<(), String> {
 }
 
 pub fn enable_system_proxy(app: &AppHandle, sniffer: &Arc<Mutex<SnifferState>>) -> Result<SnifferViewState, String> {
-    let mut state = sniffer.lock().map_err(|_| "Sniffer state is unavailable")?;
+    let mut state = sniffer.lock().unwrap_or_else(|error| error.into_inner());
     if state.status != "running" { return Err("Start the resource sniffer before enabling its system proxy.".into()); }
     if !state.certificate_installed {
 		return Err("Install and verify Cobalt's local capture certificate before enabling the system proxy.".into());
@@ -353,7 +375,7 @@ pub fn restore_system_proxy(state: &mut SnifferState) -> Result<(), String> {
 }
 
 pub fn install_certificate(app: &AppHandle, sniffer: &Arc<Mutex<SnifferState>>) -> Result<SnifferViewState, String> {
-    let mut state = sniffer.lock().map_err(|_| "Sniffer state is unavailable")?;
+    let mut state = sniffer.lock().unwrap_or_else(|error| error.into_inner());
     let certificate = state.certificate_path.clone().unwrap_or_else(|| state.data_dir.join("cobalt-capture-ca.pem"));
     let keychain = dirs_home_keychain();
     let output = Command::new("security").args(["add-trusted-cert", "-r", "trustRoot", "-p", "ssl", "-k", &keychain, &certificate.to_string_lossy()]).output().map_err(|error| error.to_string())?;
@@ -373,13 +395,13 @@ fn certificate_is_installed(fingerprint: &str) -> bool { let output = Command::n
 fn keychain_contains_fingerprint(output: &str, fingerprint: &str) -> bool { output.lines().filter_map(|line| line.strip_prefix("SHA-256 hash:")).any(|value| value.trim().eq_ignore_ascii_case(fingerprint)) }
 
 pub fn request_descriptor(sniffer: &Arc<Mutex<SnifferState>>, resource_id: &str) -> Result<DownloadDescriptor, String> {
-    { let mut state = sniffer.lock().map_err(|_| "Sniffer state is unavailable")?; state.descriptors.remove(resource_id); send(&mut state, json!({"id":format!("resolve:{resource_id}"), "command":"resolve_download", "resourceId":resource_id}))?; }
-    for _ in 0..30 { std::thread::sleep(Duration::from_millis(100)); if let Some(descriptor) = sniffer.lock().ok().and_then(|mut state| state.descriptors.remove(resource_id)) { return Ok(descriptor); } }
+    { let mut state = sniffer.lock().unwrap_or_else(|error| error.into_inner()); state.descriptors.remove(resource_id); send(&mut state, json!({"id":format!("resolve:{resource_id}"), "command":"resolve_download", "resourceId":resource_id}))?; }
+    for _ in 0..30 { std::thread::sleep(Duration::from_millis(100)); if let Some(descriptor) = sniffer.lock().unwrap_or_else(|error| error.into_inner()).descriptors.remove(resource_id) { return Ok(descriptor); } }
     Err("The captured URL expired before it could be queued. Play the media again and retry.".into())
 }
 
 pub fn clear(app: &AppHandle, sniffer: &Arc<Mutex<SnifferState>>) -> Result<SnifferViewState, String> {
-    let mut state = sniffer.lock().map_err(|_| "Sniffer state is unavailable")?; state.captures.clear(); state.descriptors.clear(); if state.status == "running" { let _ = send(&mut state, json!({"id":"clear", "command":"clear"})); }; emit_state(app, &state); Ok(state.view())
+    let mut state = sniffer.lock().unwrap_or_else(|error| error.into_inner()); state.captures.clear(); state.descriptors.clear(); if state.status == "running" { let _ = send(&mut state, json!({"id":"clear", "command":"clear"})); }; emit_state(app, &state); Ok(state.view())
 }
 
 #[cfg(test)]

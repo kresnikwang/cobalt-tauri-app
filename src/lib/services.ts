@@ -1,36 +1,66 @@
 export interface ServicePlatform {
-  name: string;
+  /** Stable identifier — used for i18n lookup and capability rules, never for display. */
+  id: string;
+  /** Fallback display name, used only if no translation exists for the active locale. */
+  fallbackName: string;
   domain: string;
   color: string;
   bg: string;
+  /** Host names (and subdomains) this platform owns. */
+  hosts: string[];
+  /** Last-resort substring match for non-http URLs such as capture://… */
   keywords: string[];
 }
 
 export const platforms: ServicePlatform[] = [
-  { name: 'YouTube', domain: 'youtube.com', color: '#ff0000', bg: 'rgba(255, 0, 0, 0.15)', keywords: ['youtube', 'youtu.be'] },
-  { name: 'Bilibili', domain: 'bilibili.com', color: '#00aeec', bg: 'rgba(0, 174, 236, 0.15)', keywords: ['bilibili', 'bili'] },
-  { name: '新片场', domain: 'xinpianchang.com', color: '#f5b21b', bg: 'rgba(245, 178, 27, 0.15)', keywords: ['xinpianchang'] },
-  { name: 'Instagram', domain: 'instagram.com', color: '#e1306c', bg: 'rgba(225, 48, 108, 0.15)', keywords: ['instagram'] },
-  { name: 'Twitter / X', domain: 'x.com', color: '#ffffff', bg: 'rgba(255, 255, 255, 0.08)', keywords: ['twitter', 'x.com'] },
-  { name: 'SoundCloud', domain: 'soundcloud.com', color: '#ff5500', bg: 'rgba(255, 85, 0, 0.15)', keywords: ['soundcloud'] },
-  { name: 'Pinterest', domain: 'pinterest.com', color: '#bd081c', bg: 'rgba(189, 8, 28, 0.15)', keywords: ['pinterest'] },
-  { name: 'Dailymotion', domain: 'dailymotion.com', color: '#0066dc', bg: 'rgba(0, 102, 220, 0.15)', keywords: ['dailymotion'] }
+  { id: 'youtube', fallbackName: 'YouTube', domain: 'youtube.com', color: '#ff0000', bg: 'rgba(255, 0, 0, 0.15)', hosts: ['youtube.com', 'youtu.be'], keywords: ['youtube', 'youtu.be'] },
+  { id: 'bilibili', fallbackName: 'Bilibili', domain: 'bilibili.com', color: '#00aeec', bg: 'rgba(0, 174, 236, 0.15)', hosts: ['bilibili.com', 'b23.tv'], keywords: ['bilibili', 'bili'] },
+  { id: 'xinpianchang', fallbackName: '新片场', domain: 'xinpianchang.com', color: '#f5b21b', bg: 'rgba(245, 178, 27, 0.15)', hosts: ['xinpianchang.com'], keywords: ['xinpianchang'] },
+  { id: 'instagram', fallbackName: 'Instagram', domain: 'instagram.com', color: '#e1306c', bg: 'rgba(225, 48, 108, 0.15)', hosts: ['instagram.com', 'ddinstagram.com'], keywords: ['instagram'] },
+  { id: 'twitter', fallbackName: 'Twitter / X', domain: 'x.com', color: '#e7e9ee', bg: 'rgba(255, 255, 255, 0.08)', hosts: ['x.com', 'twitter.com', 'vxtwitter.com', 'fixvx.com'], keywords: ['twitter', 'x.com'] },
+  { id: 'soundcloud', fallbackName: 'SoundCloud', domain: 'soundcloud.com', color: '#ff5500', bg: 'rgba(255, 85, 0, 0.15)', hosts: ['soundcloud.com'], keywords: ['soundcloud'] },
+  { id: 'pinterest', fallbackName: 'Pinterest', domain: 'pinterest.com', color: '#bd081c', bg: 'rgba(189, 8, 28, 0.15)', hosts: ['pinterest.com'], keywords: ['pinterest'] },
+  { id: 'dailymotion', fallbackName: 'Dailymotion', domain: 'dailymotion.com', color: '#0066dc', bg: 'rgba(0, 102, 220, 0.15)', hosts: ['dailymotion.com', 'dai.ly'], keywords: ['dailymotion'] }
 ];
 
-export function getServiceInfo(url: string, unknownLabel: string = 'Web Media') {
+/** Strips a leading "www." and lowercases, so host comparisons are stable. */
+function normalizeHost(url: string): string {
+  try {
+    return new URL(url).hostname.toLowerCase().replace(/^www\./, '');
+  } catch {
+    return '';
+  }
+}
+
+function matchPlatform(id: string): ServicePlatform | undefined {
+  return platforms.find(platform => platform.id === id);
+}
+
+/**
+ * Resolves a platform by matching the URL's host, not by scanning the whole string.
+ * A substring scan would label "https://notyoutube.com.evil/watch" as YouTube.
+ */
+export function getServiceId(url: string): string | null {
+  const host = normalizeHost(url);
+  if (host) {
+    const hit = platforms.find(platform =>
+      platform.hosts.some(h => host === h || host.endsWith('.' + h))
+    );
+    if (hit) return hit.id;
+  }
+  // capture://… and other non-http schemes have no host; fall back to a keyword scan.
   const lower = url.toLowerCase();
   for (const platform of platforms) {
-    if (platform.keywords.some(kw => lower.includes(kw))) {
-      return {
-        name: platform.name,
-        color: platform.color,
-        bg: platform.bg
-      };
-    }
+    if (platform.keywords.some(keyword => lower.includes(keyword))) return platform.id;
   }
-  return {
-    name: unknownLabel,
-    color: '#6366f1',
-    bg: 'rgba(99, 102, 241, 0.15)'
-  };
+  return null;
+}
+
+export function getServiceInfo(url: string, unknownLabel: string, nameFor: (id: string) => string) {
+  const id = getServiceId(url);
+  const platform = id ? matchPlatform(id) : undefined;
+  if (!platform) {
+    return { name: unknownLabel, color: '#6366f1', bg: 'rgba(99, 102, 241, 0.15)' };
+  }
+  return { name: nameFor(platform.id), color: platform.color, bg: platform.bg };
 }

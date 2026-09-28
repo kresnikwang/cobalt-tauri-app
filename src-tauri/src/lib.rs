@@ -76,9 +76,27 @@ pub struct DownloadTask {
     pub output_path: Option<String>,
 }
 
+// Write via a temp file + rename. A plain overwrite can leave a truncated JSON behind if the
+// process dies mid-write, and the loader then silently discards every setting and task.
+fn write_atomic(path: &std::path::Path, content: &str) -> std::io::Result<()> {
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| std::path::Path::new("."));
+    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("cobalt-data.json");
+    let temp = parent.join(format!(".{file_name}.tmp"));
+    std::fs::write(&temp, content)?;
+    match std::fs::rename(&temp, path) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = std::fs::remove_file(&temp);
+            Err(error)
+        }
+    }
+}
+
 fn save_tasks(tasks: &HashMap<String, DownloadTask>, path: &std::path::Path) {
     if let Ok(content) = serde_json::to_string_pretty(tasks) {
-        let _ = std::fs::write(path, content);
+        if let Err(error) = write_atomic(path, &content) {
+            eprintln!("Failed to persist tasks to {}: {}", path.display(), error);
+        }
     }
 }
 
@@ -395,20 +413,19 @@ fn remove_ytdlp_outputs(save_dir: &std::path::Path, stem: &str) {
     }
 }
 
-fn resolve_ytdlp_path(app_handle: &tauri::AppHandle) -> PathBuf {
-    let candidates = [
+fn resolve_ytdlp_path(app_handle: &tauri::AppHandle) -> Option<PathBuf> {
+    // Absolute paths only. A bare "yt-dlp" would be resolved through $PATH by Command::new,
+    // letting a same-named binary earlier in PATH hijack the download — and with it the
+    // --cookies-from-browser argument, which can read and decrypt the user's browser cookies.
+    [
         app_handle.path().resolve("binaries/yt-dlp", BaseDirectory::Resource).ok(),
         Some(PathBuf::from("src-tauri/binaries/yt-dlp")),
         Some(PathBuf::from("/opt/homebrew/bin/yt-dlp")),
         Some(PathBuf::from("/usr/local/bin/yt-dlp")),
-        Some(PathBuf::from("yt-dlp")),
-    ];
-
-    candidates
-        .into_iter()
-        .flatten()
-        .find(|path| path.exists() || path.to_string_lossy() == "yt-dlp")
-        .unwrap_or_else(|| PathBuf::from("yt-dlp"))
+    ]
+    .into_iter()
+    .flatten()
+    .find(|path| path.exists())
 }
 
 fn resolve_node_path(app_handle: &tauri::AppHandle) -> Option<PathBuf> {
@@ -471,6 +488,18 @@ fn ytdlp_audio_format(settings: &Settings) -> String {
     }
 }
 
+fn ytdlp_video_height(settings: &Settings) -> u32 {
+    // Whitelisted on purpose: this value is interpolated into a yt-dlp format selector, where
+    // ']', '/' and '+' are syntax characters. A hand-edited settings.json could otherwise
+    // rewrite the selector entirely and force an arbitrary stream.
+    match settings.video_quality.as_str() {
+        "1080" => 1080,
+        "480" => 480,
+        "360" => 360,
+        _ => 720,
+    }
+}
+
 fn ytdlp_format(settings: &Settings) -> String {
     if settings.download_mode == "audio" {
         return "bestaudio/best".to_string();
@@ -479,15 +508,14 @@ fn ytdlp_format(settings: &Settings) -> String {
     // Prefer H.264 + AAC so macOS QuickTime / Finder can play natively (mp4).
     // Fall back to any adaptive best (VP9/AV1 + opus) when H.264 is unavailable.
     // bestvideo* allows formats yt-dlp would otherwise deprioritize.
-    match settings.video_quality.as_str() {
-        "max" => {
-            "bestvideo*[vcodec^=avc1]+bestaudio[acodec^=mp4a]/bestvideo*[vcodec^=avc1]+bestaudio/bestvideo*+bestaudio/best"
-                .to_string()
-        }
-        quality => format!(
-            "bestvideo*[vcodec^=avc1][height<={quality}]+bestaudio[acodec^=mp4a]/bestvideo*[vcodec^=avc1][height<={quality}]+bestaudio/bestvideo*[height<={quality}]+bestaudio/best[height<={quality}]/best"
-        ),
+    if settings.video_quality == "max" {
+        return "bestvideo*[vcodec^=avc1]+bestaudio[acodec^=mp4a]/bestvideo*[vcodec^=avc1]+bestaudio/bestvideo*+bestaudio/best".to_string();
     }
+
+    let quality = ytdlp_video_height(settings);
+    format!(
+        "bestvideo*[vcodec^=avc1][height<={quality}]+bestaudio[acodec^=mp4a]/bestvideo*[vcodec^=avc1][height<={quality}]+bestaudio/bestvideo*[height<={quality}]+bestaudio/best[height<={quality}]/best"
+    )
 }
 
 fn ytdlp_error_text(stderr: &str) -> String {
@@ -669,8 +697,11 @@ async fn try_local_ytdlp_download(
     let provisional_path = save_path.join(&provisional_filename);
 
     let mut abort_rx = {
-        let mut state_lock = state.lock().unwrap();
+        let mut state_lock = state.lock().unwrap_or_else(|error| error.into_inner());
         if let Some(task) = state_lock.tasks.get_mut(&id) {
+            // A cancel that lands while we were still resolving has no sender to reach yet, so
+            // bail before resurrecting the task as "downloading".
+            if task.status == "cancelled" { return Ok(true) }
             task.title = provisional_filename.clone();
             task.status = "downloading".to_string();
             task.output_path = Some(provisional_path.to_string_lossy().into_owned());
@@ -687,7 +718,11 @@ async fn try_local_ytdlp_download(
         abort_rx
     };
 
-    let ytdlp_path = resolve_ytdlp_path(app_handle);
+    let Some(ytdlp_path) = resolve_ytdlp_path(app_handle) else {
+        // No local yt-dlp: fall through to the remote service rather than half-working.
+        println!("No local yt-dlp binary found, falling back to the remote service");
+        return Ok(false);
+    };
     let node_path = resolve_node_path(app_handle);
     let ffmpeg_path = resolve_ffmpeg_path(app_handle);
     let format = ytdlp_format(settings);
@@ -809,7 +844,7 @@ async fn try_local_ytdlp_download(
                             continue;
                         }
 
-                        let mut state_lock = progress_state.lock().unwrap();
+                        let mut state_lock = progress_state.lock().unwrap_or_else(|error| error.into_inner());
                         if let Some(task) = state_lock.tasks.get_mut(&progress_id) {
                             task.status = "downloading".to_string();
                             task.progress = mapped_progress;
@@ -828,7 +863,7 @@ async fn try_local_ytdlp_download(
                         last_mapped_progress = mapped_progress;
                         last_emit = now;
                     } else if trimmed.contains("[Merger]") || trimmed.contains("[ExtractAudio]") || trimmed.contains("Merging formats") {
-                        let mut state_lock = progress_state.lock().unwrap();
+                        let mut state_lock = progress_state.lock().unwrap_or_else(|error| error.into_inner());
                         if let Some(task) = state_lock.tasks.get_mut(&progress_id) {
                             task.status = "merging".to_string();
                             task.progress = task.progress.max(0.99);
@@ -880,7 +915,7 @@ async fn try_local_ytdlp_download(
                             .and_then(|n| n.to_str())
                             .unwrap_or(&provisional_filename)
                             .to_string();
-                        let mut state_lock = state.lock().unwrap();
+                        let mut state_lock = state.lock().unwrap_or_else(|error| error.into_inner());
                         state_lock.cancellations.remove(&id);
                         if let Some(task) = state_lock.tasks.get_mut(&id) {
                             task.title = final_name;
@@ -911,7 +946,7 @@ async fn try_local_ytdlp_download(
 
     remove_ytdlp_outputs(&save_path, &output_stem);
     {
-        let mut state_lock = state.lock().unwrap();
+        let mut state_lock = state.lock().unwrap_or_else(|error| error.into_inner());
         state_lock.cancellations.remove(&id);
     }
     Err(last_error)
@@ -977,57 +1012,70 @@ async fn request_media_service_with_fallbacks(
 // Queue & Download Task Executer
 // -----------------------------------------------------------
 fn process_queue(state: Arc<Mutex<AppState>>, app_handle: tauri::AppHandle) {
-    let state_lock = state.lock().unwrap();
-    let limit = state_lock.settings.max_parallel_downloads as usize;
-    
-    let running_statuses = vec!["analyzing", "downloading", "merging"];
-    let running_count = state_lock.tasks.values()
-        .filter(|t| running_statuses.contains(&t.status.as_str()))
-        .count();
-        
-    if running_count >= limit {
-        return;
-    }
-    
-    let next_task_id = state_lock.tasks.iter()
-        .find(|(_, t)| t.status == "queued")
-        .map(|(id, _)| id.clone());
-        
-    if let Some(id) = next_task_id {
-        drop(state_lock);
-        
-        let mut state_mut = state.lock().unwrap();
-        if let Some(task) = state_mut.tasks.get_mut(&id) {
-            task.status = "analyzing".to_string();
-            let updated_task = task.clone();
-            let _ = app_handle.emit("task-updated", updated_task);
-            save_tasks(&state_mut.tasks, &state_mut.tasks_path);
+    // Claim the next queued task in a single critical section. Several commands can enter
+    // process_queue concurrently; checking the limit and flipping the task to "analyzing"
+    // must be atomic or two callers can start the same task twice (double download, and two
+    // writers truncating the same output_path).
+    let claimed = {
+        let mut state_lock = state.lock().unwrap_or_else(|error| error.into_inner());
+        // Clamp to at least 1: a zero limit would make every task queue forever with no UI feedback.
+        let limit = (state_lock.settings.max_parallel_downloads as usize).max(1);
+
+        const RUNNING_STATUSES: [&str; 3] = ["analyzing", "downloading", "merging"];
+        let running_count = state_lock.tasks.values()
+            .filter(|t| RUNNING_STATUSES.contains(&t.status.as_str()))
+            .count();
+
+        if running_count >= limit {
+            return;
         }
-        drop(state_mut);
-        
-        let state_clone = state.clone();
-        let app_handle_clone = app_handle.clone();
-        tauri::async_runtime::spawn(async move {
-            run_download_task(id, state_clone, app_handle_clone).await;
-        });
-        
-        process_queue(state, app_handle);
-    }
+
+        let Some(next_task_id) = state_lock.tasks.iter()
+            .find(|(_, t)| t.status == "queued")
+            .map(|(id, _)| id.clone()) else {
+            return;
+        };
+
+        let updated_task = {
+            let task = match state_lock.tasks.get_mut(&next_task_id) {
+                Some(task) => task,
+                None => return,
+            };
+            task.status = "analyzing".to_string();
+            task.clone()
+        };
+        save_tasks(&state_lock.tasks, &state_lock.tasks_path);
+        (next_task_id, updated_task)
+    };
+
+    let (id, updated_task) = claimed;
+    let _ = app_handle.emit("task-updated", updated_task);
+
+    let state_clone = state.clone();
+    let app_handle_clone = app_handle.clone();
+    tauri::async_runtime::spawn(async move {
+        run_download_task(id, state_clone, app_handle_clone).await;
+    });
+
+    process_queue(state, app_handle);
 }
 
 async fn run_download_task(id: String, state: Arc<Mutex<AppState>>, app_handle: tauri::AppHandle) {
     let (url_to_download, settings) = {
-        let state_lock = state.lock().unwrap();
+        let state_lock = state.lock().unwrap_or_else(|error| error.into_inner());
         let url = state_lock.tasks.get(&id).map(|task| task.url.clone()).unwrap_or_default();
         let settings = state_lock.settings.clone();
         (url, settings)
     };
     
     if url_to_download.is_empty() {
+        // The task was already flipped to "analyzing" by process_queue, so returning bare would
+        // hold a concurrency slot forever. Fail it properly and free the slot.
+        update_task_failed(id, "No URL was provided for this download.".to_string(), &state, &app_handle);
         return;
     }
 
-    let captured_descriptor = { state.lock().unwrap().captured_downloads.remove(&id) };
+    let captured_descriptor = { state.lock().unwrap_or_else(|error| error.into_inner()).captured_downloads.remove(&id) };
     if let Some(descriptor) = captured_descriptor {
         if descriptor.kind == "playlist" {
             update_task_failed(id, "Playlist captures are not supported yet. Capture a direct video or audio request instead.".into(), &state, &app_handle);
@@ -1043,7 +1091,7 @@ async fn run_download_task(id: String, state: Arc<Mutex<AppState>>, app_handle: 
             return;
         }
         {
-            let mut lock = state.lock().unwrap();
+            let mut lock = state.lock().unwrap_or_else(|error| error.into_inner());
             if let Some(task) = lock.tasks.get_mut(&id) {
                 task.status = "analyzing".into();
                 task.speed = "Resolving in browser".into();
@@ -1051,7 +1099,7 @@ async fn run_download_task(id: String, state: Arc<Mutex<AppState>>, app_handle: 
             }
         }
         let resolution = xinpianchang::resolve(&app_handle, &url_to_download).await;
-        let task_is_active = state.lock().unwrap().tasks.get(&id)
+        let task_is_active = state.lock().unwrap_or_else(|error| error.into_inner()).tasks.get(&id)
             .map(|task| task.status == "analyzing")
             .unwrap_or(false);
         if !task_is_active {
@@ -1113,11 +1161,23 @@ async fn run_download_task(id: String, state: Arc<Mutex<AppState>>, app_handle: 
         }
     }
     
-    let mut client_builder = reqwest::Client::builder();
+    // This client is shared by the resolve request and the media GET that follows, so it must
+    // not carry a total timeout — only a connect timeout. The resolve call is bounded separately.
+    let mut client_builder = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .read_timeout(std::time::Duration::from_secs(60));
     if settings.proxy_enabled && !settings.proxy_url.trim().is_empty() {
-        if let Ok(proxy) = reqwest::Proxy::all(settings.proxy_url.trim()) {
-            let proxy = proxy.no_proxy(reqwest::NoProxy::from_string("localhost,127.0.0.1"));
-            client_builder = client_builder.proxy(proxy);
+        // Never silently fall back to a direct connection: the user believes traffic is going
+        // through their proxy, and a silent downgrade is worse than an explicit failure.
+        match reqwest::Proxy::all(settings.proxy_url.trim()) {
+            Ok(proxy) => {
+                let proxy = proxy.no_proxy(reqwest::NoProxy::from_string("localhost,127.0.0.1"));
+                client_builder = client_builder.proxy(proxy);
+            }
+            Err(error) => {
+                update_task_failed(id, format!("Invalid proxy URL '{}': {}", settings.proxy_url.trim(), error), &state, &app_handle);
+                return;
+            }
         }
     }
     let client = match client_builder.build() {
@@ -1128,10 +1188,20 @@ async fn run_download_task(id: String, state: Arc<Mutex<AppState>>, app_handle: 
         }
     };
     
-    let result = match request_media_service_with_fallbacks(&url_to_download, &settings, &client).await {
-        Ok(res) => res,
-        Err(e) => {
+    // The shared client has no total timeout (the media GET reuses it), so bound the resolve
+    // call here. Without this a hung server leaves the task in "downloading" forever and its
+    // cancellation entry is never reclaimed.
+    let result = match tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        request_media_service_with_fallbacks(&url_to_download, &settings, &client),
+    ).await {
+        Ok(Ok(res)) => res,
+        Ok(Err(e)) => {
             update_task_failed(id, e, &state, &app_handle);
+            return;
+        }
+        Err(_) => {
+            update_task_failed(id, "Media service did not respond within 60 seconds".to_string(), &state, &app_handle);
             return;
         }
     };
@@ -1192,8 +1262,10 @@ async fn run_download_task(id: String, state: Arc<Mutex<AppState>>, app_handle: 
     let output_path = unique_output_path(&save_path, &filename);
     
     let mut abort_rx = {
-        let mut state_lock = state.lock().unwrap();
+        let mut state_lock = state.lock().unwrap_or_else(|error| error.into_inner());
         if let Some(task) = state_lock.tasks.get_mut(&id) {
+            // Same guard as the yt-dlp and direct-stream paths: don't revive a cancelled task.
+            if task.status == "cancelled" { return }
             task.title = filename.clone();
             task.status = "downloading".to_string();
             task.output_path = Some(output_path.to_string_lossy().into_owned());
@@ -1229,7 +1301,7 @@ async fn run_download_task(id: String, state: Arc<Mutex<AppState>>, app_handle: 
     
     let total_bytes = media_res.content_length().unwrap_or(0);
     {
-        let mut state_lock = state.lock().unwrap();
+        let mut state_lock = state.lock().unwrap_or_else(|error| error.into_inner());
         if let Some(task) = state_lock.tasks.get_mut(&id) {
             task.total_bytes = total_bytes;
             let _ = app_handle.emit("task-updated", task.clone());
@@ -1279,7 +1351,7 @@ async fn run_download_task(id: String, state: Arc<Mutex<AppState>>, app_handle: 
                                 speed_str = format!("{}/s", format_bytes(speed_bps));
                                 
                                 if total_bytes > 0 && speed_bps > 0.0 {
-                                    let eta_secs = ((total_bytes - downloaded_bytes) as f64 / speed_bps) as u32;
+                                    let eta_secs = (total_bytes.saturating_sub(downloaded_bytes) as f64 / speed_bps) as u32;
                                     eta_str = format!("{}:{:02}", eta_secs / 60, eta_secs % 60);
                                 }
                                 
@@ -1287,7 +1359,7 @@ async fn run_download_task(id: String, state: Arc<Mutex<AppState>>, app_handle: 
                                 last_speed_bytes = downloaded_bytes;
                             }
                             
-                            let mut state_lock = state.lock().unwrap();
+                            let mut state_lock = state.lock().unwrap_or_else(|error| error.into_inner());
                             if let Some(task) = state_lock.tasks.get_mut(&id) {
                                 task.downloaded_bytes = downloaded_bytes;
                                 if total_bytes > 0 {
@@ -1325,7 +1397,7 @@ async fn run_download_task(id: String, state: Arc<Mutex<AppState>>, app_handle: 
     }
     
     {
-        let mut state_lock = state.lock().unwrap();
+        let mut state_lock = state.lock().unwrap_or_else(|error| error.into_inner());
         state_lock.cancellations.remove(&id);
         if let Some(task) = state_lock.tasks.get_mut(&id) {
             task.status = "completed".to_string();
@@ -1343,9 +1415,14 @@ async fn run_download_task(id: String, state: Arc<Mutex<AppState>>, app_handle: 
 }
 
 async fn download_direct_stream(id: String, descriptor: DirectMediaDescriptor, settings: Settings, state: Arc<Mutex<AppState>>, app_handle: tauri::AppHandle) {
-    let mut builder = reqwest::Client::builder();
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .read_timeout(std::time::Duration::from_secs(60));
     if descriptor.use_proxy && settings.proxy_enabled && !settings.proxy_url.trim().is_empty() {
-        if let Ok(proxy) = reqwest::Proxy::all(settings.proxy_url.trim()) { builder = builder.proxy(proxy.no_proxy(reqwest::NoProxy::from_string("localhost,127.0.0.1"))); }
+        match reqwest::Proxy::all(settings.proxy_url.trim()) {
+            Ok(proxy) => { builder = builder.proxy(proxy.no_proxy(reqwest::NoProxy::from_string("localhost,127.0.0.1"))); }
+            Err(error) => { update_task_failed(id, format!("Invalid proxy URL '{}': {}", settings.proxy_url.trim(), error), &state, &app_handle); return; }
+        }
     }
     let client = match builder.build() { Ok(client) => client, Err(error) => { update_task_failed(id, format!("Failed to build HTTP client: {error}"), &state, &app_handle); return; } };
     let save_path = PathBuf::from(&settings.save_path); let _ = std::fs::create_dir_all(&save_path); let output_path = unique_output_path(&save_path, &descriptor.filename);
@@ -1354,18 +1431,18 @@ async fn download_direct_stream(id: String, descriptor: DirectMediaDescriptor, s
     let response = match request.send().await { Ok(response) => response, Err(error) => { update_task_failed(id, format!("Media request failed: {error}"), &state, &app_handle); return; } };
     if !response.status().is_success() { update_task_failed(id, format!("Media server returned {}", response.status()), &state, &app_handle); return; }
     let total_bytes = response.content_length().unwrap_or(descriptor.expected_bytes);
-    let mut abort_rx = { let mut lock = state.lock().unwrap(); let Some(task) = lock.tasks.get_mut(&id) else { return; }; if task.status == "cancelled" { return; } task.title = descriptor.filename.clone(); task.status = "downloading".into(); task.total_bytes = total_bytes; task.output_path = Some(output_path.to_string_lossy().into_owned()); let _ = app_handle.emit("task-updated", task.clone()); let (tx, rx) = tokio::sync::oneshot::channel(); lock.cancellations.insert(id.clone(), tx); rx };
+    let mut abort_rx = { let mut lock = state.lock().unwrap_or_else(|error| error.into_inner()); let Some(task) = lock.tasks.get_mut(&id) else { return; }; if task.status == "cancelled" { return; } task.title = descriptor.filename.clone(); task.status = "downloading".into(); task.total_bytes = total_bytes; task.output_path = Some(output_path.to_string_lossy().into_owned()); let _ = app_handle.emit("task-updated", task.clone()); let (tx, rx) = tokio::sync::oneshot::channel(); lock.cancellations.insert(id.clone(), tx); rx };
     let mut file = match tokio::fs::File::create(&output_path).await { Ok(file) => file, Err(error) => { update_task_failed(id, format!("Disk write error: {error}"), &state, &app_handle); return; } };
     let mut stream = response.bytes_stream(); let mut downloaded = 0u64; let mut last_update = std::time::Instant::now();
     loop { tokio::select! {
         _ = &mut abort_rx => { drop(file); let _ = std::fs::remove_file(&output_path); return; }
-        chunk = stream.next() => match chunk { Some(Ok(chunk)) => { if let Err(error) = file.write_all(&chunk).await { update_task_failed(id, format!("Disk write error: {error}"), &state, &app_handle); return; } downloaded += chunk.len() as u64; if last_update.elapsed().as_millis() >= 120 { let mut lock = state.lock().unwrap(); if let Some(task) = lock.tasks.get_mut(&id) { task.downloaded_bytes = downloaded; if total_bytes > 0 { task.progress = (downloaded as f64 / total_bytes as f64).min(0.99); } let _ = app_handle.emit("task-updated", task.clone()); } last_update = std::time::Instant::now(); } }, Some(Err(error)) => { update_task_failed(id, format!("Media download error: {error}"), &state, &app_handle); return; }, None => break }
+        chunk = stream.next() => match chunk { Some(Ok(chunk)) => { if let Err(error) = file.write_all(&chunk).await { update_task_failed(id, format!("Disk write error: {error}"), &state, &app_handle); return; } downloaded += chunk.len() as u64; if last_update.elapsed().as_millis() >= 120 { let mut lock = state.lock().unwrap_or_else(|error| error.into_inner()); if let Some(task) = lock.tasks.get_mut(&id) { task.downloaded_bytes = downloaded; if total_bytes > 0 { task.progress = (downloaded as f64 / total_bytes as f64).min(0.99); } let _ = app_handle.emit("task-updated", task.clone()); } last_update = std::time::Instant::now(); } }, Some(Err(error)) => { update_task_failed(id, format!("Media download error: {error}"), &state, &app_handle); return; }, None => break }
     }}
     if downloaded == 0 { update_task_failed(id, "No data received from media URL".into(), &state, &app_handle); return; }
     if let Some(decode_key) = descriptor.decode_key.as_deref() {
         if let Err(error) = decode_wechat_file(&output_path, decode_key) { let _ = std::fs::remove_file(&output_path); update_task_failed(id, format!("WeChat media decryption failed: {error}"), &state, &app_handle); return; }
     }
-    let mut lock = state.lock().unwrap(); lock.cancellations.remove(&id); if let Some(task) = lock.tasks.get_mut(&id) { task.status="completed".into(); task.progress=1.0; task.downloaded_bytes=downloaded; task.eta="Done".into(); let _ = app_handle.emit("task-updated", task.clone()); save_tasks(&lock.tasks, &lock.tasks_path); } drop(lock); process_queue(state, app_handle);
+    let mut lock = state.lock().unwrap_or_else(|error| error.into_inner()); lock.cancellations.remove(&id); if let Some(task) = lock.tasks.get_mut(&id) { task.status="completed".into(); task.progress=1.0; task.downloaded_bytes=downloaded; task.eta="Done".into(); let _ = app_handle.emit("task-updated", task.clone()); save_tasks(&lock.tasks, &lock.tasks_path); } drop(lock); process_queue(state, app_handle);
 }
 
 fn decode_wechat_file(path: &std::path::Path, encoded_key: &str) -> Result<(), String> {
@@ -1465,7 +1542,7 @@ fn decode_wechat_isaac64(path: &std::path::Path, seed: u64) -> Result<(), String
 }
 
 fn update_task_failed(id: String, error_msg: String, state: &Arc<Mutex<AppState>>, app_handle: &tauri::AppHandle) {
-    let mut state_lock = state.lock().unwrap();
+    let mut state_lock = state.lock().unwrap_or_else(|error| error.into_inner());
     state_lock.cancellations.remove(&id);
     if let Some(task) = state_lock.tasks.get_mut(&id) {
         task.status = "failed".to_string();
@@ -1484,16 +1561,16 @@ fn update_task_failed(id: String, error_msg: String, state: &Arc<Mutex<AppState>
 // -----------------------------------------------------------
 #[tauri::command]
 fn get_settings(state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Settings {
-    let state = state.lock().unwrap();
+    let state = state.lock().unwrap_or_else(|error| error.into_inner());
     state.settings.clone()
 }
 
 #[tauri::command]
 fn save_settings(new_settings: Settings, state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Result<Settings, String> {
-    let mut state = state.lock().unwrap();
+    let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
     state.settings = new_settings.clone();
     
-    if let Err(e) = std::fs::write(&state.settings_path, serde_json::to_string_pretty(&state.settings).unwrap()) {
+    if let Err(e) = write_atomic(&state.settings_path, &serde_json::to_string_pretty(&state.settings).unwrap()) {
         return Err(format!("Failed to save settings: {}", e));
     }
     Ok(new_settings)
@@ -1554,19 +1631,19 @@ fn open_file(path: String) -> Result<bool, String> {
 
 #[tauri::command]
 fn get_tasks(state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Vec<DownloadTask> {
-    let state = state.lock().unwrap();
+    let state = state.lock().unwrap_or_else(|error| error.into_inner());
     state.tasks.values().cloned().collect()
 }
 
 #[tauri::command]
 fn cancel_task(id: String, state: tauri::State<'_, Arc<Mutex<AppState>>>, app_handle: tauri::AppHandle) -> bool {
-    let mut state_lock = state.lock().unwrap();
+    let mut state_lock = state.lock().unwrap_or_else(|error| error.into_inner());
     if let Some(tx) = state_lock.cancellations.remove(&id) {
         let _ = tx.send(());
     }
     
     if let Some(task) = state_lock.tasks.get_mut(&id) {
-        if vec!["downloading", "analyzing", "queued"].contains(&task.status.as_str()) {
+        if vec!["downloading", "analyzing", "queued", "merging"].contains(&task.status.as_str()) {
             task.status = "cancelled".to_string();
             task.speed = "0 B/s".to_string();
             task.progress = 0.0;
@@ -1589,14 +1666,14 @@ fn cancel_task(id: String, state: tauri::State<'_, Arc<Mutex<AppState>>>, app_ha
 
 #[tauri::command]
 fn delete_task(id: String, state: tauri::State<'_, Arc<Mutex<AppState>>>, app_handle: tauri::AppHandle) -> bool {
-    let mut state_lock = state.lock().unwrap();
+    let mut state_lock = state.lock().unwrap_or_else(|error| error.into_inner());
     if let Some(tx) = state_lock.cancellations.remove(&id) {
         let _ = tx.send(());
     }
     
     let task = state_lock.tasks.remove(&id);
     if let Some(t) = task {
-        if vec!["downloading", "analyzing", "queued"].contains(&t.status.as_str()) {
+        if vec!["downloading", "analyzing", "queued", "merging"].contains(&t.status.as_str()) {
             if let Some(ref path) = t.output_path {
                 let _ = std::fs::remove_file(path);
             }
@@ -1611,7 +1688,7 @@ fn delete_task(id: String, state: tauri::State<'_, Arc<Mutex<AppState>>>, app_ha
 
 #[tauri::command]
 fn clear_completed(state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Vec<DownloadTask> {
-    let mut state = state.lock().unwrap();
+    let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
     state.tasks.retain(|_, task| !vec!["completed", "cancelled", "failed"].contains(&task.status.as_str()));
     save_tasks(&state.tasks, &state.tasks_path);
     state.tasks.values().cloned().collect()
@@ -1627,7 +1704,7 @@ fn download_url(url: String, state: tauri::State<'_, Arc<Mutex<AppState>>>, app_
         
     let task = DownloadTask {
         id: id.clone(),
-        url,
+        url: url.trim().to_string(),
         title: "Analyzing URL...".to_string(),
         status: "queued".to_string(),
         progress: 0.0,
@@ -1639,7 +1716,7 @@ fn download_url(url: String, state: tauri::State<'_, Arc<Mutex<AppState>>>, app_
         output_path: None,
     };
     
-    let mut state_lock = state.lock().unwrap();
+    let mut state_lock = state.lock().unwrap_or_else(|error| error.into_inner());
     state_lock.tasks.insert(id, task.clone());
     save_tasks(&state_lock.tasks, &state_lock.tasks_path);
     drop(state_lock);
@@ -1653,12 +1730,12 @@ fn download_url(url: String, state: tauri::State<'_, Arc<Mutex<AppState>>>, app_
 
 #[tauri::command]
 fn get_sniffer_state(sniffer_state: tauri::State<'_, Arc<Mutex<sniffer::SnifferState>>>) -> sniffer::SnifferViewState {
-    sniffer_state.lock().unwrap().view()
+    sniffer_state.lock().unwrap_or_else(|error| error.into_inner()).view()
 }
 
 #[tauri::command]
 fn start_sniffer(sniffer_state: tauri::State<'_, Arc<Mutex<sniffer::SnifferState>>>, state: tauri::State<'_, Arc<Mutex<AppState>>>, app_handle: tauri::AppHandle) -> Result<sniffer::SnifferViewState, String> {
-    let settings = state.lock().unwrap().settings.clone();
+    let settings = state.lock().unwrap_or_else(|error| error.into_inner()).settings.clone();
     let upstream = if settings.proxy_enabled { Some(settings.proxy_url) } else { None };
     sniffer::start(app_handle, sniffer_state.inner().clone(), upstream)
 }
@@ -1697,7 +1774,7 @@ fn download_captured_resource(resource_id: String, sniffer_state: tauri::State<'
     let descriptor = sniffer::request_descriptor(sniffer_state.inner(), &resource_id)?;
     let id = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos().to_string();
     let task = DownloadTask { id:id.clone(), url:format!("capture://{resource_id}"), title:descriptor.filename.clone(), status:"queued".into(), progress:0.0, speed:"0 B/s".into(), downloaded_bytes:0, total_bytes:0, eta:"--:--".into(), error:None, output_path:None };
-    let mut lock = state.lock().unwrap(); lock.captured_downloads.insert(id.clone(), descriptor); lock.tasks.insert(id, task.clone()); save_tasks(&lock.tasks, &lock.tasks_path); drop(lock);
+    let mut lock = state.lock().unwrap_or_else(|error| error.into_inner()); lock.captured_downloads.insert(id.clone(), descriptor); lock.tasks.insert(id, task.clone()); save_tasks(&lock.tasks, &lock.tasks_path); drop(lock);
     let _ = app_handle.emit("task-updated", task.clone()); process_queue(state.inner().clone(), app_handle); Ok(task)
 }
 
@@ -1713,10 +1790,26 @@ pub fn run() {
             
             let mut settings = if settings_path.exists() {
                 let content = std::fs::read_to_string(&settings_path).unwrap_or_default();
-                serde_json::from_str::<Settings>(&content).unwrap_or_else(|_| {
-                    let download_dir = app.path().download_dir().unwrap_or_else(|_| std::env::current_dir().unwrap());
-                    Settings::default_with_download_dir(download_dir)
-                })
+                match serde_json::from_str::<Settings>(&content) {
+                    Ok(mut loaded) => {
+                        // A hand-edited file can carry any videoQuality; normalise it so the
+                        // value we later interpolate into the yt-dlp selector stays whitelisted.
+                        if !matches!(loaded.video_quality.as_str(), "max" | "1080" | "720" | "480" | "360") {
+                            loaded.video_quality = "720".to_string();
+                        }
+                        loaded
+                    }
+                    Err(error) => {
+                        let backup = settings_path.with_extension("corrupt.json");
+                        eprintln!(
+                            "Failed to parse {} ({}); the previous contents were kept at {}",
+                            settings_path.display(), error, backup.display()
+                        );
+                        let _ = std::fs::write(&backup, &content);
+                        let download_dir = app.path().download_dir().unwrap_or_else(|_| std::env::current_dir().unwrap());
+                        Settings::default_with_download_dir(download_dir)
+                    }
+                }
             } else {
                 let download_dir = app.path().download_dir().unwrap_or_else(|_| std::env::current_dir().unwrap());
                 Settings::default_with_download_dir(download_dir)
@@ -1726,13 +1819,25 @@ pub fn run() {
 
             // Save initial defaults and migrate the previous built-in API endpoint.
             if !settings_path.exists() || migrated_api_url {
-                let _ = std::fs::write(&settings_path, serde_json::to_string_pretty(&settings).unwrap());
+                let _ = write_atomic(&settings_path, &serde_json::to_string_pretty(&settings).unwrap());
             }
 
             // Load persisted tasks
             let mut tasks = if tasks_path.exists() {
                 let content = std::fs::read_to_string(&tasks_path).unwrap_or_default();
-                serde_json::from_str::<HashMap<String, DownloadTask>>(&content).unwrap_or_default()
+                match serde_json::from_str::<HashMap<String, DownloadTask>>(&content) {
+                    Ok(tasks) => tasks,
+                    Err(error) => {
+                        // Don't silently throw the history away — keep a copy the user can recover.
+                        let backup = tasks_path.with_extension("corrupt.json");
+                        eprintln!(
+                            "Failed to parse {} ({}); the previous contents were kept at {}",
+                            tasks_path.display(), error, backup.display()
+                        );
+                        let _ = std::fs::write(&backup, &content);
+                        HashMap::new()
+                    }
+                }
             } else {
                 HashMap::new()
             };
@@ -1778,7 +1883,7 @@ pub fn run() {
                     tokio::time::sleep(tokio::time::Duration::from_millis(1200)).await;
                     
                     let monitoring = {
-                        let state = state_clone.lock().unwrap();
+                        let state = state_clone.lock().unwrap_or_else(|error| error.into_inner());
                         state.settings.clipboard_monitoring
                     };
                     
