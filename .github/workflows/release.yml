@@ -1,33 +1,165 @@
-name: Release Draft Creator
+name: Release
 
 on:
   push:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to build and release (e.g. 1.0.10). Leave empty to use package.json.'
+        required: false
+        default: ''
+      draft:
+        description: 'Create as draft release'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+
+permissions:
+  contents: write
 
 jobs:
-  create-draft:
-    permissions:
-      contents: write
-    runs-on: ubuntu-latest
+  build-release:
+    runs-on: macos-latest
+    timeout-minutes: 90
+    env:
+      CI: 'true'
+      YT_DLP_VERSION: '2025.11.12'
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Create GitHub Draft Release
+      - name: Resolve version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.version }}" ]; then
+            RAW="${{ inputs.version }}"
+          elif [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            RAW="${{ github.ref_name }}"
+          else
+            RAW="v$(node -p "require('./package.json').version")"
+          fi
+          RAW="${RAW#v}"
+          echo "version=$RAW" >> "$GITHUB_OUTPUT"
+          echo "tag=v$RAW" >> "$GITHUB_OUTPUT"
+          echo "RELEASE_VERSION=$RAW" >> "$GITHUB_ENV"
+          echo "Resolved version: $RAW (tag v$RAW)"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+          run_install: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Sync / check versions
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.version }}" ]; then
+            node scripts/sync-versions.mjs "${{ steps.version.outputs.version }}"
+          else
+            node scripts/sync-versions.mjs --check
+          fi
+
+      - name: Frontend type check
+        run: pnpm check
+
+      - name: Backend check
+        run: cargo check --manifest-path src-tauri/Cargo.toml --locked
+
+      - name: Go tests
+        working-directory: sidecars/res-sniffer
+        run: |
+          go vet ./cmd/res-sniffer
+          go test ./cmd/res-sniffer
+
+      - name: API unit tests
+        run: pnpm --dir api test:unit --run
+
+      - name: Prepare bundled runtimes
+        run: pnpm prepare:release-bundle
+
+      - name: Build Tauri app
+        run: pnpm tauri build --bundles app,dmg
+
+      - name: Sign bundle (ad-hoc on CI)
+        run: node scripts/post-build-bundle.mjs
+
+      - name: Package artifacts
+        id: package
+        run: |
+          set -eux
+          VERSION="${{ steps.version.outputs.version }}"
+          APP="src-tauri/target/release/bundle/macos/Cobalt.app"
+          DMG_DIR="src-tauri/target/release/bundle/dmg"
+          OUT="dist-ci"
+          mkdir -p "$OUT"
+          test -d "$APP"
+          # Canonical zip (keepParent so unzip yields Cobalt.app)
+          ditto -c -k --sequesterRsrc --keepParent "$APP" "$OUT/Cobalt-${VERSION}-aarch64.app.zip"
+          # DMG (Tauri names it Cobalt_<ver>_aarch64.dmg)
+          DMG_SRC="$(ls "$DMG_DIR"/*.dmg 2>/dev/null | head -n 1 || true)"
+          if [ -n "$DMG_SRC" ]; then
+            cp "$DMG_SRC" "$OUT/Cobalt-${VERSION}-aarch64.dmg"
+          else
+            echo "WARNING: no .dmg produced, shipping .app.zip only"
+          fi
+          # Install notes
+          cat > "$OUT/INSTALL.md" <<EOF
+          # Cobalt $VERSION (macOS Apple Silicon)
+
+          ## Install
+          1. Download \`Cobalt-${VERSION}-aarch64.dmg\` (or the \`.app.zip\`).
+          2. Drag **Cobalt.app** to **Applications**.
+          3. First launch: right-click Cobalt.app → Open → Open again (unsigned CI build, no Apple notarization).
+
+          Or from terminal:
+
+          \`\`\`
+          xattr -dr com.apple.quarantine /Applications/Cobalt.app
+          \`\`\`
+
+          Only Apple Silicon (arm64) is supported. Requires macOS 11+.
+          EOF
+          ls -lh "$OUT"
+
+      - name: Upload CI artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: cobalt-${{ steps.version.outputs.version }}-macos
+          path: dist-ci/*
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          draft: true
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: Cobalt Desktop ${{ steps.version.outputs.tag }}
+          draft: ${{ inputs.draft == 'true' }}
           prerelease: false
-          tag_name: ${{ github.ref_name }}
-          name: 'Cobalt Desktop ${{ github.ref_name }}'
-          body: |
-            Cobalt Desktop Release ${{ github.ref_name }}.
-            
-            ### Installation
-            - **macOS**: Download the `.dmg` or `.app.zip` below (compiled locally).
-            
-            *Note: To run the app on macOS, you may need to right-click the app and choose "Open" to bypass gatekeeper warnings.*
+          generate_release_notes: true
+          files: |
+            dist-ci/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
