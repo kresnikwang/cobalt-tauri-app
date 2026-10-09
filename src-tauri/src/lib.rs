@@ -12,6 +12,7 @@ use base64::Engine;
 
 mod sniffer;
 mod xinpianchang;
+mod gallerydl;
 
 const LEGACY_API_URL: &str = "http://43.156.122.169";
 const DEFAULT_API_URL: &str = "http://47.241.10.142/cobalt-api";
@@ -74,6 +75,22 @@ pub struct DownloadTask {
     pub eta: String,
     pub error: Option<String>,
     pub output_path: Option<String>,
+    /// "file" (one video/audio/image) or "gallery" (a multi-item image album).
+    #[serde(default = "default_task_kind")]
+    pub kind: String,
+    /// Engine that owns the task: "yt-dlp" | "gallery-dl" | "cobalt" | "direct".
+    #[serde(default)]
+    pub engine: String,
+    /// Number of items in a gallery job (0 when unknown / for single files).
+    #[serde(default)]
+    pub items_total: u32,
+    /// Number of gallery items already written.
+    #[serde(default)]
+    pub items_done: u32,
+}
+
+fn default_task_kind() -> String {
+    "file".to_string()
 }
 
 // Write via a temp file + rename. A plain overwrite can leave a truncated JSON behind if the
@@ -196,6 +213,13 @@ fn is_ytdlp_probe_blocked(url: &str) -> bool {
         return true;
     }
     if xinpianchang::is_xinpianchang_url(url) {
+        return true;
+    }
+    // Image hosts and gallery/profile/collection URLs are owned by the bundled
+    // gallery-dl sidecar; a blind yt-dlp probe there only duplicates work.
+    // (Single posts on IG/X/Pinterest/Reddit/Tumblr classify as None and keep
+    // their existing remote-first behaviour.)
+    if gallerydl::classify(url).owned() {
         return true;
     }
     const BLOCKED_EXACT: &[&str] = &[
@@ -604,6 +628,23 @@ fn resolve_ffmpeg_path(app_handle: &tauri::AppHandle) -> Option<PathBuf> {
         Some(PathBuf::from("src-tauri/binaries/ffmpeg")),
         Some(PathBuf::from("/opt/homebrew/bin/ffmpeg")),
         Some(PathBuf::from("/usr/local/bin/ffmpeg")),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|path| path.exists())
+}
+
+/// Resolve the bundled, relocatable CPython interpreter used to run gallery-dl.
+/// Absolute paths only, and there is deliberately **no** system-`python3`
+/// fallback: the engine is tested and signed against the bundled runtime, and a
+/// random system interpreter would not have gallery-dl installed.
+fn resolve_python_bin(app_handle: &tauri::AppHandle) -> Option<PathBuf> {
+    [
+        app_handle
+            .path()
+            .resolve("binaries/python/bin/python3.12", BaseDirectory::Resource)
+            .ok(),
+        Some(PathBuf::from("src-tauri/binaries/python/bin/python3.12")),
     ]
     .into_iter()
     .flatten()
@@ -1119,6 +1160,427 @@ async fn try_local_ytdlp_download(
     Err(last_error)
 }
 
+// -----------------------------------------------------------
+// gallery-dl (image / gallery engine)
+// -----------------------------------------------------------
+
+fn sanitize_path_component(raw: &str) -> String {
+    let cleaned: String = raw
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    let mut cleaned = cleaned;
+    while cleaned.contains("__") {
+        cleaned = cleaned.replace("__", "_");
+    }
+    cleaned.trim_matches('_').to_string()
+}
+
+/// Build a stable, safe per-gallery folder name from the URL, e.g.
+/// `gallery_danbooru_donmai_us_1234567`.
+fn gallery_folder_name(url: &str, fallback: &str) -> String {
+    let mut host_part = String::new();
+    let mut id_part = String::new();
+    if let Ok(parsed) = reqwest::Url::parse(url) {
+        if let Some(host) = parsed.host_str() {
+            let host = host.trim_start_matches("www.").to_ascii_lowercase();
+            let labels: Vec<&str> = host.split('.').filter(|label| !label.is_empty()).collect();
+            let take = labels.len().min(3);
+            if !labels.is_empty() {
+                host_part = labels[labels.len() - take..].join("_");
+            }
+        }
+        const STOP_SEGMENTS: &[&str] = &[
+            "photos", "photo", "artwork", "art", "post", "posts", "a", "gallery", "galleries",
+            "u", "user", "users", "r", "comments", "comment", "pin", "p", "reel", "reels", "tv",
+            "board", "boards", "album", "albums", "images", "image", "view", "blog", "tags",
+            "tag", "search", "profile", "sets", "people", "photostream", "en", "ja", "zh",
+        ];
+        if let Some(segment) = parsed
+            .path()
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .rev()
+            .find(|segment| {
+                let lowered = segment.to_ascii_lowercase();
+                !STOP_SEGMENTS.contains(&lowered.as_str())
+                    && lowered.chars().any(|c| c.is_ascii_alphanumeric())
+            })
+        {
+            id_part = segment.chars().take(48).collect();
+        }
+    }
+    let host_part = sanitize_path_component(&host_part);
+    let id_part = sanitize_path_component(&id_part);
+    let name = if id_part.is_empty() {
+        format!("gallery_{host_part}_{fallback}")
+    } else {
+        format!("gallery_{host_part}_{id_part}")
+    };
+    let name: String = name.trim_matches('_').chars().take(120).collect();
+    if name.is_empty() {
+        format!("gallery_{fallback}")
+    } else {
+        name
+    }
+}
+
+fn unique_gallery_dir(parent: &std::path::Path, name: &str) -> std::io::Result<PathBuf> {
+    let safe = sanitize_path_component(name);
+    let mut candidate = parent.join(&safe);
+    let mut dup_index = 1;
+    while candidate.exists() {
+        candidate = parent.join(format!("{safe} ({dup_index})"));
+        dup_index += 1;
+    }
+    std::fs::create_dir_all(&candidate)?;
+    Ok(candidate)
+}
+
+/// Recursively count non-empty files and sum their sizes under a gallery folder.
+fn dir_file_stats(path: &std::path::Path) -> (u32, u64) {
+    let mut count = 0u32;
+    let mut bytes = 0u64;
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            let child = entry.path();
+            if let Ok(metadata) = entry.metadata() {
+                if metadata.is_dir() {
+                    let (child_count, child_bytes) = dir_file_stats(&child);
+                    count += child_count;
+                    bytes += child_bytes;
+                } else if metadata.len() > 0 {
+                    count += 1;
+                    bytes += metadata.len();
+                }
+            }
+        }
+    }
+    (count, bytes)
+}
+
+/// Remove a gallery folder only when it contains no downloaded files, so a
+/// failed attempt (e.g. the remote-error fallback probing gallery-dl) does not
+/// litter empty directories while partial downloads are still preserved.
+fn remove_gallery_dir_if_empty(path: &std::path::Path) {
+    let (file_count, _) = dir_file_stats(path);
+    if file_count == 0 {
+        let _ = std::fs::remove_dir_all(path);
+    }
+}
+
+fn gallerydl_error_text(stderr: &str) -> String {
+    let lower = stderr.to_ascii_lowercase();
+    if lower.contains("login")
+        || lower.contains("unauthorized")
+        || lower.contains("403")
+        || lower.contains("authentication")
+        || lower.contains("cookie")
+    {
+        return "This gallery requires a browser login. Open the page in Chrome and retry, or enable the resource sniffer and play the media there.".to_string();
+    }
+    if lower.contains("proxy") || lower.contains("connection") || lower.contains("timed out") || lower.contains("timeout") {
+        return "gallery-dl could not reach the site through the configured proxy. Check the proxy settings and retry.".to_string();
+    }
+    stderr
+        .lines()
+        .map(str::trim)
+        .rev()
+        .find(|line| !line.is_empty() && (line.to_lowercase().contains("error") || line.contains("http")))
+        .unwrap_or("gallery-dl download failed")
+        .to_string()
+}
+
+/// Run the bundled gallery-dl sidecar for one URL.
+///
+/// Two phases: `-j` enumeration (counts items, tries browser cookies) followed
+/// by `-d <folder>` download (stdout prints each stored file's absolute path).
+/// Returns `Ok(true)` when handled (completed or cancelled), `Ok(false)` when
+/// the bundled runtime is missing (caller falls back), `Err` on failure.
+async fn try_local_gallery_download(
+    id: String,
+    url: &str,
+    settings: &Settings,
+    state: &Arc<Mutex<AppState>>,
+    app_handle: &tauri::AppHandle,
+) -> Result<bool, String> {
+    let Some(python_bin) = resolve_python_bin(app_handle) else {
+        println!("No bundled Python/gallery-dl runtime found, skipping gallery path");
+        return Ok(false);
+    };
+
+    let save_path = PathBuf::from(&settings.save_path);
+    let _ = std::fs::create_dir_all(&save_path);
+
+    // Flip the task to analyzing/gallery, create its folder, register cancellation.
+    let mut abort_rx = {
+        let mut lock = state.lock().unwrap_or_else(|error| error.into_inner());
+        let Some(task) = lock.tasks.get_mut(&id) else {
+            return Ok(false);
+        };
+        if task.status == "cancelled" {
+            return Ok(true);
+        }
+        let folder_name = gallery_folder_name(url, &id);
+        let folder = unique_gallery_dir(&save_path, &folder_name)
+            .map_err(|error| format!("Failed to create gallery folder: {error}"))?;
+        task.kind = "gallery".to_string();
+        task.engine = "gallery-dl".to_string();
+        task.status = "analyzing".to_string();
+        task.title = folder_name;
+        task.speed = "Analyzing gallery…".to_string();
+        task.eta = "--:--".to_string();
+        task.progress = 0.0;
+        task.items_total = 0;
+        task.items_done = 0;
+        task.total_bytes = 0;
+        task.downloaded_bytes = 0;
+        task.output_path = Some(folder.to_string_lossy().into_owned());
+        let _ = app_handle.emit("task-updated", task.clone());
+        save_tasks(&lock.tasks, &lock.tasks_path);
+        let (abort_tx, abort_rx) = tokio::sync::oneshot::channel::<()>();
+        lock.cancellations.insert(id.clone(), abort_tx);
+        abort_rx
+    };
+
+    let folder = {
+        let lock = state.lock().unwrap_or_else(|error| error.into_inner());
+        lock.tasks
+            .get(&id)
+            .and_then(|task| task.output_path.clone())
+            .map(PathBuf::from)
+    }
+    .ok_or_else(|| "Gallery task vanished".to_string())?;
+    let folder_str = folder.to_string_lossy().into_owned();
+
+    let proxy_arg = if settings.proxy_enabled && !settings.proxy_url.trim().is_empty() {
+        Some(settings.proxy_url.trim().to_string())
+    } else {
+        None
+    };
+
+    // Fixed invocation: <python> -I -m gallery_dl [--proxy P] [--cookies-from-browser B] <phase args> URL
+    let build_args = |cookie: Option<&str>, phase: &[&str]| -> Vec<String> {
+        let mut args = vec!["-I".to_string(), "-m".to_string(), "gallery_dl".to_string()];
+        if let Some(proxy) = proxy_arg.as_deref() {
+            args.push("--proxy".to_string());
+            args.push(proxy.to_string());
+        }
+        if let Some(browser) = cookie {
+            args.push("--cookies-from-browser".to_string());
+            args.push(browser.to_string());
+        }
+        for arg in phase {
+            args.push((*arg).to_string());
+        }
+        args.push(url.to_string());
+        args
+    };
+
+    let mut cookie_attempts: Vec<Option<String>> = vec![None];
+    cookie_attempts.extend(chrome_cookie_sources().into_iter().map(Some));
+    cookie_attempts.push(Some("safari".to_string()));
+    cookie_attempts.push(Some("firefox".to_string()));
+
+    // Phase 1: enumerate with `-j`; try cookie sources until items are found.
+    let mut items_total: usize = 0;
+    let mut chosen_cookie: Option<String> = None;
+    let mut enum_error = "gallery-dl found no items at this URL".to_string();
+
+    for cookie in &cookie_attempts {
+        let args = build_args(cookie.as_deref(), &["-j"]);
+        let mut cmd = TokioCommand::new(&python_bin);
+        cmd.env_remove("PYTHONHOME")
+            .env_remove("PYTHONPATH")
+            .env_remove("PYTHONSTARTUP")
+            .args(&args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = cmd
+            .spawn()
+            .map_err(|error| format!("Failed to start gallery-dl: {error}"))?;
+        let mut stdout_pipe = child.stdout.take();
+        let mut stderr_pipe = child.stderr.take();
+        let stdout_task = tauri::async_runtime::spawn(async move {
+            let mut text = String::new();
+            if let Some(reader) = stdout_pipe.as_mut() {
+                let _ = reader.read_to_string(&mut text).await;
+            }
+            text
+        });
+        let stderr_task = tauri::async_runtime::spawn(async move {
+            let mut text = String::new();
+            if let Some(reader) = stderr_pipe.as_mut() {
+                let _ = reader.read_to_string(&mut text).await;
+            }
+            text
+        });
+
+        let outcome = tokio::select! {
+            biased;
+            _ = &mut abort_rx => {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                return Ok(true);
+            }
+            result = child.wait() => Some(result),
+            _ = tokio::time::sleep(std::time::Duration::from_secs(180)) => {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                None
+            }
+        };
+
+        let stdout_text = stdout_task.await.unwrap_or_default();
+        let stderr_text = stderr_task.await.unwrap_or_default();
+
+        let success = matches!(outcome, Some(Ok(status)) if status.success());
+        let count = gallerydl::count_dump_items(&stdout_text);
+        if success && count > 0 {
+            items_total = count;
+            chosen_cookie = cookie.clone();
+            break;
+        }
+        if !stderr_text.trim().is_empty() {
+            enum_error = gallerydl_error_text(&stderr_text);
+        }
+    }
+
+    if items_total == 0 {
+        {
+            let mut lock = state.lock().unwrap_or_else(|error| error.into_inner());
+            lock.cancellations.remove(&id);
+        }
+        remove_gallery_dir_if_empty(&folder);
+        return Err(enum_error);
+    }
+
+    // Phase 2: download into the per-gallery folder.
+    {
+        let mut lock = state.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(task) = lock.tasks.get_mut(&id) {
+            task.status = "downloading".to_string();
+            task.items_total = u32::try_from(items_total).unwrap_or(u32::MAX);
+            task.items_done = 0;
+            task.speed = "gallery-dl".to_string();
+            let _ = app_handle.emit("task-updated", task.clone());
+            save_tasks(&lock.tasks, &lock.tasks_path);
+        }
+    }
+
+    let phase_args: Vec<&str> = vec!["-d", &folder_str];
+    let args = build_args(chosen_cookie.as_deref(), &phase_args);
+    let mut cmd = TokioCommand::new(&python_bin);
+    cmd.env_remove("PYTHONHOME")
+        .env_remove("PYTHONPATH")
+        .env_remove("PYTHONSTARTUP")
+        .args(&args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .map_err(|error| format!("Failed to start gallery-dl: {error}"))?;
+
+    let stdout_reader = child.stdout.take();
+    let mut stderr_pipe = child.stderr.take();
+    let progress_state = state.clone();
+    let progress_app = app_handle.clone();
+    let progress_id = id.clone();
+    let progress_folder = folder_str.clone();
+    let progress_total = items_total;
+    let stdout_task = tauri::async_runtime::spawn(async move {
+        let Some(reader) = stdout_reader else { return };
+        let mut lines = BufReader::new(reader).lines();
+        let mut done = 0u32;
+        let mut last_emit = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        while let Ok(Some(line)) = lines.next_line().await {
+            let trimmed = line.trim();
+            // gallery-dl prints the absolute path of each file it writes; skip
+            // comments (skipped/duplicate) and non-path status lines.
+            if !trimmed.starts_with('#') && trimmed.starts_with(&progress_folder) {
+                done = done.saturating_add(1);
+                let now = std::time::Instant::now();
+                if now.duration_since(last_emit).as_millis() < 200 && (done as usize) < progress_total {
+                    continue;
+                }
+                let mut lock = progress_state.lock().unwrap_or_else(|error| error.into_inner());
+                if let Some(task) = lock.tasks.get_mut(&progress_id) {
+                    task.items_done = done;
+                    if progress_total > 0 {
+                        task.progress = (done as f64 / progress_total as f64).min(0.99);
+                    }
+                    task.speed = format!("{done}/{progress_total}");
+                    let _ = progress_app.emit("task-updated", task.clone());
+                }
+                last_emit = now;
+            }
+        }
+    });
+    let stderr_task = tauri::async_runtime::spawn(async move {
+        let mut text = String::new();
+        if let Some(reader) = stderr_pipe.as_mut() {
+            let _ = reader.read_to_string(&mut text).await;
+        }
+        text
+    });
+
+    let wait_result = tokio::select! {
+        result = child.wait() => result,
+        _ = &mut abort_rx => {
+            let _ = child.start_kill();
+            let _ = stdout_task.await;
+            // Partial files are intentionally kept in the gallery folder.
+            return Ok(true);
+        }
+    };
+    let _ = stdout_task.await;
+    let stderr_text = stderr_task.await.unwrap_or_default();
+
+    match wait_result {
+        Ok(status) if status.success() => {
+            let (file_count, total_bytes) = dir_file_stats(&folder);
+            if file_count == 0 {
+                let mut lock = state.lock().unwrap_or_else(|error| error.into_inner());
+                lock.cancellations.remove(&id);
+                drop(lock);
+                remove_gallery_dir_if_empty(&folder);
+                return Err(gallerydl_error_text(&stderr_text));
+            }
+            let mut lock = state.lock().unwrap_or_else(|error| error.into_inner());
+            lock.cancellations.remove(&id);
+            if let Some(task) = lock.tasks.get_mut(&id) {
+                task.items_done = file_count;
+                task.items_total = task.items_total.max(file_count);
+                task.status = "completed".to_string();
+                task.progress = 1.0;
+                task.downloaded_bytes = total_bytes;
+                task.total_bytes = total_bytes;
+                task.speed = "0 B/s".to_string();
+                task.eta = "Done".to_string();
+                let _ = app_handle.emit("task-updated", task.clone());
+                save_tasks(&lock.tasks, &lock.tasks_path);
+            }
+            Ok(true)
+        }
+        Ok(_) => {
+            {
+                let mut lock = state.lock().unwrap_or_else(|error| error.into_inner());
+                lock.cancellations.remove(&id);
+            }
+            remove_gallery_dir_if_empty(&folder);
+            Err(gallerydl_error_text(&stderr_text))
+        }
+        Err(error) => {
+            {
+                let mut lock = state.lock().unwrap_or_else(|error| error.into_inner());
+                lock.cancellations.remove(&id);
+            }
+            remove_gallery_dir_if_empty(&folder);
+            Err(format!("gallery-dl failed: {error}"))
+        }
+    }
+}
+
 async fn request_media_service_with_fallbacks(
     url: &str,
     settings: &Settings,
@@ -1297,6 +1759,30 @@ async fn run_download_task(id: String, state: Arc<Mutex<AppState>>, app_handle: 
         return;
     }
 
+    // Image hosts and gallery/profile/collection URLs go straight to gallery-dl.
+    if gallerydl::classify(&url_to_download).owned() {
+        match try_local_gallery_download(
+            id.clone(),
+            &url_to_download,
+            &settings,
+            &state,
+            &app_handle,
+        )
+        .await
+        {
+            Ok(true) => {
+                process_queue(state, app_handle);
+                return;
+            }
+            // Bundled runtime missing: fall through to the remote service.
+            Ok(false) => {}
+            Err(error) => {
+                update_task_failed(id, error, &state, &app_handle);
+                return;
+            }
+        }
+    }
+
     if is_local_ytdlp_url(&url_to_download) {
         let local_source_name = if is_youtube_url(&url_to_download) {
             "YouTube"
@@ -1380,6 +1866,46 @@ async fn run_download_task(id: String, state: Arc<Mutex<AppState>>, app_handle: 
             .and_then(|t| t.as_str())
             .or_else(|| result.get("error").and_then(|e| e.get("code")).and_then(|c| c.as_str()))
             .unwrap_or("Unknown media service error");
+
+        // The remote picker rejected a post on an image-capable host (single
+        // IG/X/Pinterest/Reddit/Tumblr post, which classify() leaves to the
+        // remote first). Try gallery-dl before yt-dlp.
+        if gallerydl::is_gallery_capable_host(&url_to_download) {
+            {
+                let mut lock = state.lock().unwrap_or_else(|error| error.into_inner());
+                if let Some(task) = lock.tasks.get_mut(&id) {
+                    task.speed = "Trying gallery-dl…".into();
+                    let _ = app_handle.emit("task-updated", task.clone());
+                }
+            }
+            match try_local_gallery_download(
+                id.clone(),
+                &url_to_download,
+                &settings,
+                &state,
+                &app_handle,
+            )
+            .await
+            {
+                Ok(true) => {
+                    process_queue(state, app_handle);
+                    return;
+                }
+                Ok(false) => {}
+                Err(gallery_error) => {
+                    // If yt-dlp cannot probe this host either, surface the
+                    // gallery-dl (usually login/cookie) error instead of the
+                    // remote's generic message.
+                    if is_ytdlp_probe_blocked(&url_to_download) {
+                        update_task_failed(id, gallery_error, &state, &app_handle);
+                        return;
+                    }
+                    // Otherwise let yt-dlp have the last word below.
+                    println!("gallery-dl fallback failed ({gallery_error}), trying yt-dlp next");
+                }
+            }
+        }
+
         // P0 generic fallback: the remote service doesn't cover this site.
         // Ask local yt-dlp (1700+ extractors) before giving up.
         if !is_ytdlp_probe_blocked(&url_to_download) {
@@ -1932,6 +2458,10 @@ fn download_url(url: String, state: tauri::State<'_, Arc<Mutex<AppState>>>, app_
         eta: "--:--".to_string(),
         error: None,
         output_path: None,
+        kind: "file".to_string(),
+        engine: String::new(),
+        items_total: 0,
+        items_done: 0,
     };
     
     let mut state_lock = state.lock().unwrap_or_else(|error| error.into_inner());
@@ -1991,7 +2521,7 @@ fn restore_sniffer_system_proxy(sniffer_state: tauri::State<'_, Arc<Mutex<sniffe
 fn download_captured_resource(resource_id: String, sniffer_state: tauri::State<'_, Arc<Mutex<sniffer::SnifferState>>>, state: tauri::State<'_, Arc<Mutex<AppState>>>, app_handle: tauri::AppHandle) -> Result<DownloadTask, String> {
     let descriptor = sniffer::request_descriptor(sniffer_state.inner(), &resource_id)?;
     let id = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos().to_string();
-    let task = DownloadTask { id:id.clone(), url:format!("capture://{resource_id}"), title:descriptor.filename.clone(), status:"queued".into(), progress:0.0, speed:"0 B/s".into(), downloaded_bytes:0, total_bytes:0, eta:"--:--".into(), error:None, output_path:None };
+    let task = DownloadTask { id:id.clone(), url:format!("capture://{resource_id}"), title:descriptor.filename.clone(), status:"queued".into(), progress:0.0, speed:"0 B/s".into(), downloaded_bytes:0, total_bytes:0, eta:"--:--".into(), error:None, output_path:None, kind:"file".into(), engine:String::new(), items_total:0, items_done:0 };
     let mut lock = state.lock().unwrap_or_else(|error| error.into_inner()); lock.captured_downloads.insert(id.clone(), descriptor); lock.tasks.insert(id, task.clone()); save_tasks(&lock.tasks, &lock.tasks_path); drop(lock);
     let _ = app_handle.emit("task-updated", task.clone()); process_queue(state.inner().clone(), app_handle); Ok(task)
 }
@@ -2216,6 +2746,16 @@ mod tests {
         assert!(is_ytdlp_probe_blocked("https://www.pinterest.com/pin/123456789/"));
         // WeChat ecosystem: needs the MITM sniffer.
         assert!(is_ytdlp_probe_blocked("https://channels.weixin.qq.com/pages/feed"));
+        // gallery-dl image hosts: never probe with yt-dlp.
+        assert!(is_ytdlp_probe_blocked("https://www.pixiv.net/artworks/123456789"));
+        assert!(is_ytdlp_probe_blocked("https://danbooru.donmai.us/posts/1234567"));
+        assert!(is_ytdlp_probe_blocked("https://imgur.com/a/abcd123"));
+        assert!(is_ytdlp_probe_blocked("https://www.reddit.com/r/cats/top/"));
+        assert!(is_ytdlp_probe_blocked("https://someuser.tumblr.com/tagged/cat"));
+        // But single Reddit / Tumblr posts still fall through to yt-dlp after a
+        // remote failure (only bulk forms are owned by gallery-dl).
+        assert!(!is_ytdlp_probe_blocked("https://www.reddit.com/r/cats/comments/abc123/x/"));
+        assert!(!is_ytdlp_probe_blocked("https://someuser.tumblr.com/post/123/x"));
         // Generic long-tail video sites: probe them.
         assert!(!is_ytdlp_probe_blocked("https://vimeo.com/123456789"));
         assert!(!is_ytdlp_probe_blocked("https://www.rutube.ru/video/abc123/"));

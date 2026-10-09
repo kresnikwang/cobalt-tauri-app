@@ -1,4 +1,5 @@
 import { execFileSync, execSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import { cp, rm } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -7,6 +8,7 @@ const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const macosBundleDir = join(root, "src-tauri", "target", "release", "bundle", "macos");
 const defaultApp = join(macosBundleDir, "Cobalt.app");
 const ytDlpEntitlements = join(root, "src-tauri", "entitlements", "yt-dlp.plist");
+const pythonEntitlements = join(root, "src-tauri", "entitlements", "python.plist");
 
 // On CI there is no Developer ID certificate. Sign ad-hoc so the .app
 // still has a consistent seal and Gatekeeper behaviour stays testable.
@@ -61,6 +63,26 @@ sign(join(defaultApp, "Contents", "Resources", "binaries", "yt-dlp"), identity, 
   entitlements: ytDlpEntitlements,
   adHoc
 });
+// Bundled CPython (gallery-dl image engine): sign every extension module first,
+// then the static interpreter. The interpreter disables library validation so
+// its separately-signed .so modules still load under Hardened Runtime. This all
+// has to happen before the outer-bundle seal below.
+const pythonResourceDir = join(defaultApp, "Contents", "Resources", "binaries", "python");
+if (existsSync(pythonResourceDir)) {
+  const listFiles = (args) =>
+    execFileSync("find", [pythonResourceDir, "-type", "f", ...args], { encoding: "utf8" })
+      .split("\n").map((line) => line.trim()).filter(Boolean);
+  for (const extension of listFiles(["(", "-name", "*.so", "-o", "-name", "*.dylib", ")"])) {
+    sign(extension, identity, { adHoc });
+  }
+  const interpreters = listFiles(["-path", "*/bin/python3.*"]);
+  if (interpreters.length === 0) {
+    throw new Error(`Bundled Python interpreter missing under ${pythonResourceDir}/bin`);
+  }
+  for (const interpreter of interpreters) {
+    sign(interpreter, identity, { entitlements: pythonEntitlements, adHoc });
+  }
+}
 // Keep the official Node.js Foundation signature. Signing the outer bundle
 // after all other resources ensures its CodeResources seal is final.
 // (Ad-hoc mode still re-seals so `codesign --verify` passes.)

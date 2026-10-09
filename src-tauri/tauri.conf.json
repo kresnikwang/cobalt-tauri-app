@@ -33,6 +33,7 @@
       "binaries/node": "binaries/node",
       "binaries/ffmpeg": "binaries/ffmpeg",
       "binaries/res-sniffer": "binaries/res-sniffer",
+      "binaries/python": "binaries/python",
       "../THIRD_PARTY_NOTICES.md": "THIRD_PARTY_NOTICES.md",
       "../third_party/res-downloader/UPSTREAM.md": "licenses/res-downloader/UPSTREAM.md",
       "../third_party/wx_channels_download/LICENSE": "licenses/wx_channels_download/LICENSE",

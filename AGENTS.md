@@ -51,6 +51,8 @@ gh run list --limit 3    # 应看到 CI（main）和 Release（tag）两个 run 
 | `go test` 报 `missing LC_UUID` | Go <1.23 在新 macOS runner 上的 bug | workflow 的 Go 版本保持 `1.23`+，`go build` 不要加 `-ldflags "-s -w"` |
 | `could not read Username for 'https://github.com'` | HTTPS remote 无认证 | 本仓库 `origin` 已切到 SSH（`git@github.com:...`），**不要改回 HTTPS** |
 | `gh run watch` 工具超时 | watch 会阻塞超 30s | 改用 `gh run list --limit N` 轮询 |
+| 打包后 `binaries/python` 里 bin/lib 子目录消失、文件全平铺在一层 | `tauri.conf.json` 的 resources map 里**带 `*` 的 glob 会压平**（`"binaries/python/**/*": ...` 触发 `dest.join(file_name())`） | 目录资源映射写成目录本身：`"binaries/python": "binaries/python"`（Walk 才保留结构），不要改回 glob |
+| ad-hoc/Developer ID 重签后 bundled Python 起不来 | python 解释器/`.so` 未签或库校验拒绝 | `post-build-bundle.mjs` 先签 `binaries/python` 下所有 `*.so/*.dylib`，再用 `entitlements/python.plist`（disable-library-validation）签 `bin/python3.*`；改资源后勿跳过该步 |
 
 ## 5. 禁止事项
 
@@ -66,5 +68,8 @@ gh run list --limit 3    # 应看到 CI（main）和 Release（tag）两个 run 
 
 - 双 workflow：`CI`（push/PR 门禁，不打包）+ `Release`（tag/手动触发，真机打包发布）。
 - CI 产物是 **ad-hoc 签名、未公证**，用户首次启动需右键 → 打开。
-- `src-tauri/binaries/` 被 gitignore，CI 靠 `prepare-release-bundle.mjs` 自动下载 `yt-dlp`、复制 Node/FFmpeg、编译 `res-sniffer`。
+- `src-tauri/binaries/` 被 gitignore，CI 靠 `prepare-release-bundle.mjs` 自动下载 `yt-dlp`、复制 Node/FFmpeg、编译 `res-sniffer`，并下载可重定位 CPython + 在其前缀 site-packages 装 gallery-dl（图集引擎）。
+- gallery-dl 固定用绝对路径 `<res>/binaries/python/bin/python3.12 -I -m gallery_dl ...` 调起；**不要**设 PYTHONHOME/PYTHONPATH（`-I` 已隔离且运行时按可执行文件自定位），Rust 侧还应清除环境里的 PYTHON* 变量。Python/gallery-dl 版本钉在两个 workflow 的 env 与 `prepare-release-bundle.mjs` 默认值里。
+- 升级 Python/gallery-dl：同时改两个 workflow 的 `PYTHON_BUILD_TAG/PYTHON_VERSION/GALLERY_DL_VERSION` 与 `prepare-release-bundle.mjs` 默认值，删本地 `src-tauri/binaries/python` 后重跑 `pnpm prepare:release-bundle`（会校验 SHA256、装新版、跑 `--version`/import 冒烟）。**升 `PYTHON_BUILD_TAG` 时**还要按新 tag 刷新 `third_party/python-build-standalone/LICENSE` 与 `licenses/`（上游根 `LICENSE` + `LICENSE.*.txt` + `python-licenses.rst`）；升 gallery-dl 时刷新 `third_party/gallery-dl/LICENSE`。这些许可由 prepare 拷进 `binaries/python/licenses/`，精简运行时时**不要**删。
+- gallery-dl 的 `--version`/import 冒烟已内置在 `prepare-release-bundle.mjs`（prepare 成功即代表运行时可用），无需在 `release:check` 再加一条（本地未 prepare 时该目录不存在）。
 - `workflow_dispatch` 可手动发版（Actions → Release → Run workflow，填 `version`），但推荐走 tag。

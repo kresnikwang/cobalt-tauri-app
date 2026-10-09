@@ -29,6 +29,9 @@ jobs:
     env:
       CI: 'true'
       YT_DLP_VERSION: '2025.11.12'
+      PYTHON_BUILD_TAG: '20261003'
+      PYTHON_VERSION: '3.12.15'
+      GALLERY_DL_VERSION: '1.32.16'
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4

@@ -229,6 +229,13 @@
     finally { snifferBusy = false; }
   }
 
+  // Failed gallery job (often a login wall): jump to the resource sniffer, the
+  // app's user-guided extraction fallback, and start it.
+  async function openSnifferForGallery() {
+    inputMode = 'sniffer';
+    await startSniffer();
+  }
+
   async function stopSniffer() {
     snifferBusy = true;
     try { sniffer = await invoke('stop_sniffer'); }
@@ -721,6 +728,9 @@
                 <div class="task-title-group">
                   <span class="task-title" title={task.title}>{task.title}</span>
                   <span class="task-service" style="color: {service.color}">{service.name}</span>
+                  {#if task.engine === 'gallery-dl'}
+                    <span class="task-engine-badge">{t('task.engine_gallerydl')}</span>
+                  {/if}
                 </div>
                 <span class="task-status-badge {task.status}">{t(`task.status.${task.status}`)}</span>
               </div>
@@ -737,7 +747,7 @@
                 >
                   <div
                     class="progress-bar-fill {task.status}"
-                    class:indeterminate={task.status === 'downloading' && task.totalBytes === 0}
+                    class:indeterminate={task.status === 'downloading' && task.kind !== 'gallery' && task.totalBytes === 0}
                     style="width: {task.progress * 100}%"
                   ></div>
                 </div>
@@ -748,17 +758,29 @@
                 {#if task.status === 'queued'}
                   <span class="stats-text">{t('task.waiting_slot')}</span>
                 {:else if task.status === 'downloading'}
-                  <span class="stats-text">
-                    {formatBytes(task.downloadedBytes)} / {task.totalBytes > 0 ? formatBytes(task.totalBytes) : t('task.unknown_size')}
-                  </span>
-                  <span class="stats-text speed">{task.speed}</span>
-                  <span class="stats-text eta">{t('task.eta')}: {task.eta}</span>
+                  {#if task.kind === 'gallery'}
+                    <span class="stats-text">{t('task.gallery_items', { done: task.itemsDone, total: task.itemsTotal > 0 ? task.itemsTotal : '…' })}</span>
+                  {:else}
+                    <span class="stats-text">
+                      {formatBytes(task.downloadedBytes)} / {task.totalBytes > 0 ? formatBytes(task.totalBytes) : t('task.unknown_size')}
+                    </span>
+                    <span class="stats-text speed">{task.speed}</span>
+                    <span class="stats-text eta">{t('task.eta')}: {task.eta}</span>
+                  {/if}
                 {:else if task.status === 'analyzing'}
-                  <span class="stats-text animated-dots">{t('task.connecting')}</span>
+                  {#if task.kind === 'gallery'}
+                    <span class="stats-text animated-dots">{t('task.gallery_analyzing')}</span>
+                  {:else}
+                    <span class="stats-text animated-dots">{t('task.connecting')}</span>
+                  {/if}
                 {:else if task.status === 'merging'}
                   <span class="stats-text animated-dots font-semibold text-indigo-400">{t('task.merging')}</span>
                 {:else if task.status === 'completed'}
-                  <span class="stats-text success">{t('task.completed')}</span>
+                  {#if task.kind === 'gallery'}
+                    <span class="stats-text success">{t('task.gallery_done', { total: task.itemsTotal })}</span>
+                  {:else}
+                    <span class="stats-text success">{t('task.completed')}</span>
+                  {/if}
                 {:else if task.status === 'failed'}
                   <span class="stats-text error" title={task.error}>{humanTaskError(task.error)}</span>
                 {:else if task.status === 'cancelled'}
@@ -784,6 +806,11 @@
                   <IconTrash size={14} />
                 </button>
               {:else}
+                {#if task.kind === 'gallery'}
+                  <button class="action-circle-btn" onclick={openSnifferForGallery} title={t('task.use_sniffer')} aria-label={t('task.use_sniffer')}>
+                    <IconRadar size={14} />
+                  </button>
+                {/if}
                 {#if !task.url.startsWith('capture://')}
                   <button class="action-circle-btn" onclick={() => handleDownload(task.url)} title={t('action.retry')} aria-label={t('action.retry')}>
                     <IconRefresh size={14} />
@@ -1341,6 +1368,18 @@
     text-transform: uppercase;
     letter-spacing: 0;
     opacity: 0.85;
+  }
+
+  .task-engine-badge {
+    flex: 0 0 auto;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.2px;
+    padding: 1px 7px;
+    border-radius: 999px;
+    color: var(--accent-primary);
+    background: color-mix(in srgb, var(--accent-primary) 14%, transparent);
+    border: 1px solid color-mix(in srgb, var(--accent-primary) 30%, transparent);
   }
 
   .task-status-badge {
