@@ -10,6 +10,8 @@ jobs:
   check:
     runs-on: macos-latest
     timeout-minutes: 30
+    env:
+      YT_DLP_VERSION: '2025.11.12'
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -42,6 +44,9 @@ jobs:
 
       - name: Frontend type check
         run: pnpm check
+
+      - name: Prepare bundled runtimes (needed by Tauri build script)
+        run: pnpm prepare:release-bundle
 
       - name: Backend check
         run: cargo check --manifest-path src-tauri/Cargo.toml --locked

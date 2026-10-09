@@ -82,6 +82,9 @@ jobs:
             node scripts/sync-versions.mjs --check
           fi
 
+      - name: Prepare bundled runtimes
+        run: pnpm prepare:release-bundle
+
       - name: Frontend type check
         run: pnpm check
 
@@ -96,9 +99,6 @@ jobs:
 
       - name: API unit tests
         run: pnpm --dir api test:unit --run
-
-      - name: Prepare bundled runtimes
-        run: pnpm prepare:release-bundle
 
       - name: Build Tauri app
         run: pnpm tauri build --bundles app,dmg
