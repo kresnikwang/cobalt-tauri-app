@@ -126,7 +126,9 @@ try {
   // The repository carries a tiny executable placeholder so Cargo can resolve
   // resources in dev mode. Go 1.26 refuses to overwrite that non-object file.
   await rm(bundledSniffer, { force: true });
-  execFileSync("go", ["build", "-trimpath", "-ldflags", "-s -w", "-o", bundledSniffer, "./cmd/res-sniffer"], {
+  // NOTE: no `-ldflags "-s -w"` here. Stripping LC_UUID breaks
+  // `go test` binaries on newer macOS (dyld: missing LC_UUID).
+  execFileSync("go", ["build", "-trimpath", "-o", bundledSniffer, "./cmd/res-sniffer"], {
     cwd: snifferSource,
     stdio: "inherit"
   });
