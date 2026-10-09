@@ -181,6 +181,164 @@ fn is_local_ytdlp_url(url: &str) -> bool {
     is_youtube_url(url) || is_bilibili_url(url) || is_dailymotion_url(url)
 }
 
+/// Sites where a blind `yt-dlp --dump-json` probe is unsafe or pointless:
+/// login-walled apps, live-only pages, or hosts we already handle elsewhere
+/// (sniffer / dedicated extractors / remote service first).
+fn is_ytdlp_probe_blocked(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return true;
+    };
+    let Some(host) = parsed.host_str().map(|h| h.trim_start_matches("www.").to_ascii_lowercase()) else {
+        return true;
+    };
+    // Already covered by dedicated local paths.
+    if is_youtube_url(url) || is_bilibili_url(url) || is_dailymotion_url(url) {
+        return true;
+    }
+    if xinpianchang::is_xinpianchang_url(url) {
+        return true;
+    }
+    const BLOCKED_EXACT: &[&str] = &[
+        // WeChat ecosystem: needs the MITM sniffer, yt-dlp can't see it.
+        "channels.weixin.qq.com",
+        "mp.weixin.qq.com",
+    ];
+    const BLOCKED_SUFFIX: &[&str] = &[
+        // Login-walled / app-only feeds.
+        "douyin.com",
+        "iesdouyin.com",
+        "douyinvod.com",
+        "byteoversea.com",
+        "tiktok.com",
+        "kuaishou.com",
+        "kwai.com",
+        "xiaohongshu.com",
+        "xhslink.com",
+        "weibo.com",
+        "m.weibo.com",
+        // Instagram/X/Pinterest go through the remote service first (better
+        // picker UX for carousels / multi-media posts).
+        "instagram.com",
+        "ddinstagram.com",
+        "twitter.com",
+        "x.com",
+        "vxtwitter.com",
+        "fixvx.com",
+        "pinterest.com",
+        "facebook.com",
+        "fb.watch",
+    ];
+    BLOCKED_EXACT.iter().any(|b| host == *b)
+        || BLOCKED_SUFFIX.iter().any(|s| host == *s || host.ends_with(&format!(".{s}")))
+}
+
+/// Friendly display name for a probed extractor, e.g. "Vimeo" for "vimeo".
+fn extractor_display_name(extractor: &str) -> String {
+    let mut chars = extractor.chars();
+    match chars.next() {
+        None => "Video".to_string(),
+        Some(first) => {
+            let mut name: String = first.to_ascii_uppercase().to_string();
+            name.extend(chars);
+            name
+        }
+    }
+}
+
+/// Short stable id for filenames from a probed URL (no extractor-specific parser).
+fn generic_video_id(url: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    let segments: Vec<&str> = parsed
+        .path_segments()
+        .map(|parts| parts.filter(|s| !s.is_empty()).collect())
+        .unwrap_or_default();
+    let mut candidate = segments.last().map(|s| s.to_string()).unwrap_or_default();
+    if candidate.len() > 48 {
+        candidate.truncate(48);
+    }
+    // Keep it filesystem-safe.
+    let safe: String = candidate
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    let safe = safe.trim_matches('_').to_string();
+    if safe.is_empty() {
+        None
+    } else {
+        Some(safe)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct YtdlpProbe {
+    extractor: String,
+    title: String,
+    video_id: String,
+}
+
+/// Ask local yt-dlp whether it can handle this URL (`--dump-json`,
+/// no download). Returns the extractor + title on success, `None` when
+/// the site is unsupported. Never fails the task by itself.
+async fn probe_ytdlp_url(
+    ytdlp_path: &std::path::Path,
+    node_path: Option<&std::path::Path>,
+    url: &str,
+    proxy_url: Option<&str>,
+) -> Option<YtdlpProbe> {
+    let mut cmd = TokioCommand::new(ytdlp_path);
+    cmd.arg("--no-playlist")
+        .arg("--skip-download")
+        .arg("--dump-json")
+        .arg("--no-warnings")
+        .arg("--socket-timeout")
+        .arg("20")
+        .arg(url)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    if let Some(node) = node_path {
+        cmd.arg("--js-runtimes")
+            .arg(format!("node:{}", node.to_string_lossy()));
+    }
+    if let Some(proxy) = proxy_url.map(str::trim).filter(|p| !p.is_empty()) {
+        cmd.env("HTTP_PROXY", proxy);
+        cmd.env("HTTPS_PROXY", proxy);
+    }
+    let child = cmd.spawn().ok()?;
+    let output = tokio::time::timeout(std::time::Duration::from_secs(45), child.wait_with_output())
+        .await
+        .ok()?
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    // Playlists expose `entries`; single videos expose `id` + `title`.
+    if json.get("entries").is_some() {
+        return None;
+    }
+    let extractor = json
+        .get("extractor")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty() && *s != "generic")?;
+    let title = json
+        .get("title")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("video")
+        .to_string();
+    let video_id = json
+        .get("id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .or_else(|| generic_video_id(url))?;
+    Some(YtdlpProbe {
+        extractor: extractor.to_string(),
+        title,
+        video_id,
+    })
+}
+
 fn should_relay_download_through_server(url: &str) -> bool {
     let Ok(parsed) = reqwest::Url::parse(url) else {
         return true;
@@ -648,34 +806,43 @@ async fn try_local_ytdlp_download(
     settings: &Settings,
     state: &Arc<Mutex<AppState>>,
     app_handle: &tauri::AppHandle,
+    generic_probe: Option<YtdlpProbe>,
 ) -> Result<bool, String> {
-    if !is_local_ytdlp_url(url) {
+    if !is_local_ytdlp_url(url) && generic_probe.is_none() {
         return Ok(false);
     }
 
     let is_youtube = is_youtube_url(url);
     let is_bilibili = is_bilibili_url(url);
-    let source_name = if is_youtube {
-        "YouTube"
+    let (source_name, source_prefix): (String, String) = if is_youtube {
+        ("YouTube".to_string(), "youtube".to_string())
     } else if is_bilibili {
-        "Bilibili"
+        ("Bilibili".to_string(), "bilibili".to_string())
+    } else if is_dailymotion_url(url) {
+        ("Dailymotion".to_string(), "dailymotion".to_string())
+    } else if let Some(probe) = generic_probe.as_ref() {
+        // Generic yt-dlp fallback: use the extractor name + probed title.
+        (extractor_display_name(&probe.extractor), probe.extractor.clone())
     } else {
-        "Dailymotion"
-    };
-    let source_prefix = if is_youtube {
-        "youtube"
-    } else if is_bilibili {
-        "bilibili"
-    } else {
-        "dailymotion"
+        ("Dailymotion".to_string(), "dailymotion".to_string())
     };
     let video_id = if is_youtube {
         youtube_video_id(url)
     } else if is_bilibili {
         bilibili_video_id(url)
-    } else {
+    } else if is_dailymotion_url(url) {
         dailymotion_video_id(url)
+    } else {
+        generic_probe.as_ref().map(|probe| probe.video_id.clone())
     }.unwrap_or_else(|| id.clone());
+    if let Some(probe) = generic_probe.as_ref() {
+        // Show the real video title instead of a bare file stem.
+        let mut state_lock = state.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(task) = state_lock.tasks.get_mut(&id) {
+            task.title = probe.title.clone();
+            let _ = app_handle.emit("task-updated", task.clone());
+        }
+    }
     let audio_format = ytdlp_audio_format(settings);
     let save_path = PathBuf::from(&settings.save_path);
     if !save_path.exists() {
@@ -1144,6 +1311,7 @@ async fn run_download_task(id: String, state: Arc<Mutex<AppState>>, app_handle: 
             &settings,
             &state,
             &app_handle,
+            None,
         ).await {
             Ok(true) => {
                 process_queue(state, app_handle);
@@ -1212,6 +1380,56 @@ async fn run_download_task(id: String, state: Arc<Mutex<AppState>>, app_handle: 
             .and_then(|t| t.as_str())
             .or_else(|| result.get("error").and_then(|e| e.get("code")).and_then(|c| c.as_str()))
             .unwrap_or("Unknown media service error");
+        // P0 generic fallback: the remote service doesn't cover this site.
+        // Ask local yt-dlp (1700+ extractors) before giving up.
+        if !is_ytdlp_probe_blocked(&url_to_download) {
+            if let Some(ytdlp_path) = resolve_ytdlp_path(&app_handle) {
+                {
+                    let mut lock = state.lock().unwrap_or_else(|error| error.into_inner());
+                    if let Some(task) = lock.tasks.get_mut(&id) {
+                        task.speed = "Probing local yt-dlp…".into();
+                        let _ = app_handle.emit("task-updated", task.clone());
+                    }
+                }
+                let proxy = if settings.proxy_enabled {
+                    Some(settings.proxy_url.as_str())
+                } else {
+                    None
+                };
+                let node_path = resolve_node_path(&app_handle);
+                if let Some(probe) = probe_ytdlp_url(
+                    &ytdlp_path,
+                    node_path.as_deref(),
+                    &url_to_download,
+                    proxy,
+                ).await {
+                    println!(
+                        "Remote service failed ({}), local yt-dlp can handle it via extractor '{}'. Retrying locally.",
+                        err_msg, probe.extractor
+                    );
+                    match try_local_ytdlp_download(
+                        id.clone(),
+                        &url_to_download,
+                        &settings,
+                        &state,
+                        &app_handle,
+                        Some(probe),
+                    ).await {
+                        Ok(true) => {
+                            process_queue(state, app_handle);
+                            return;
+                        }
+                        Ok(false) => {}
+                        Err(e) => {
+                            update_task_failed(id, format!("Local yt-dlp download failed: {}", e), &state, &app_handle);
+                            return;
+                        }
+                    }
+                } else {
+                    println!("Remote service failed ({}), local yt-dlp probe found no extractor. Failing.", err_msg);
+                }
+            }
+        }
         update_task_failed(id, err_msg.to_string(), &state, &app_handle);
         return;
     }
@@ -1950,7 +2168,7 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{api_request_url, decode_wechat_file, migrate_legacy_api_url, xor_wechat_isaac64_prefix, Isaac64, Settings};
+    use super::{api_request_url, decode_wechat_file, extractor_display_name, generic_video_id, is_ytdlp_probe_blocked, migrate_legacy_api_url, xor_wechat_isaac64_prefix, Isaac64, Settings};
     use std::path::PathBuf;
     use std::io::Write;
 
@@ -1978,6 +2196,53 @@ mod tests {
         settings.api_url = "http://47.241.10.142/cobalt-api/".to_string();
 
         assert_eq!(api_request_url(&settings), "http://47.241.10.142/cobalt-api/");
+    }
+
+    #[test]
+    fn generic_probe_blocklist_keeps_dedicated_paths_first() {
+        // Dedicated local paths: never probe (handled before remote).
+        assert!(is_ytdlp_probe_blocked("https://www.youtube.com/watch?v=aqz-KE-bpKQ"));
+        assert!(is_ytdlp_probe_blocked("https://www.bilibili.com/video/BV1xx411c7mD"));
+        assert!(is_ytdlp_probe_blocked("https://www.dailymotion.com/video/x8abc12"));
+        assert!(is_ytdlp_probe_blocked("https://www.xinpianchang.com/a13775532"));
+        // Login-walled / app-only: probing wastes 45s and can't succeed.
+        assert!(is_ytdlp_probe_blocked("https://www.douyin.com/video/7481234567890123456"));
+        assert!(is_ytdlp_probe_blocked("https://www.tiktok.com/@user/video/7481234567890123456"));
+        assert!(is_ytdlp_probe_blocked("https://www.xiaohongshu.com/explore/abc123"));
+        assert!(is_ytdlp_probe_blocked("https://weibo.com/1234567890/AbC123XyZ"));
+        // Remote-service-first (better picker UX): don't preempt.
+        assert!(is_ytdlp_probe_blocked("https://www.instagram.com/reel/AbC123/"));
+        assert!(is_ytdlp_probe_blocked("https://x.com/user/status/123456789"));
+        assert!(is_ytdlp_probe_blocked("https://www.pinterest.com/pin/123456789/"));
+        // WeChat ecosystem: needs the MITM sniffer.
+        assert!(is_ytdlp_probe_blocked("https://channels.weixin.qq.com/pages/feed"));
+        // Generic long-tail video sites: probe them.
+        assert!(!is_ytdlp_probe_blocked("https://vimeo.com/123456789"));
+        assert!(!is_ytdlp_probe_blocked("https://www.rutube.ru/video/abc123/"));
+        assert!(!is_ytdlp_probe_blocked("https://www.acfun.cn/v/ac12345678"));
+        assert!(!is_ytdlp_probe_blocked("https://www.ixigua.com/7481234567890123456"));
+        // Subdomains of blocked hosts stay blocked; lookalikes don't.
+        assert!(is_ytdlp_probe_blocked("https://m.weibo.com/u/1234567890"));
+        assert!(!is_ytdlp_probe_blocked("https://notweibo.com/video/123"));
+        assert!(!is_ytdlp_probe_blocked("https://weibo.example.com/video/123"));
+        // Garbage input: block (probe would fail anyway).
+        assert!(is_ytdlp_probe_blocked("not a url"));
+    }
+
+    #[test]
+    fn generic_probe_helpers_produce_safe_names() {
+        assert_eq!(extractor_display_name("vimeo"), "Vimeo");
+        assert_eq!(extractor_display_name(""), "Video");
+        assert_eq!(
+            generic_video_id("https://vimeo.com/123456789"),
+            Some("123456789".to_string())
+        );
+        assert_eq!(
+            generic_video_id("https://example.com/videos/hello-world?a=1"),
+            Some("hello-world".to_string())
+        );
+        assert_eq!(generic_video_id("https://example.com/"), None);
+        assert_eq!(generic_video_id("not a url"), None);
     }
 
     #[test]
