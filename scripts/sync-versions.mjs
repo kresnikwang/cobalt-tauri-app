@@ -71,4 +71,16 @@ if (!/^version\s*=\s*"[^"]+"/m.test(cargo)) throw new Error("Could not find vers
 const updated = cargo.replace(/^version\s*=\s*"[^"]+"/m, `version = "${version}"`);
 writeFileSync(files.cargoToml, updated);
 
+// Keep Cargo.lock in sync so `cargo check --locked` passes in CI.
+// Best-effort: if cargo is unavailable, CI will surface the mismatch.
+try {
+  const { execFileSync } = await import("node:child_process");
+  execFileSync("cargo", ["check", "--manifest-path", join(root, "src-tauri", "Cargo.toml")], {
+    stdio: "ignore"
+  });
+  console.log("Cargo.lock updated.");
+} catch {
+  console.warn("WARNING: could not update Cargo.lock automatically (cargo unavailable). Run `cargo check --manifest-path src-tauri/Cargo.toml` locally and commit the lockfile.");
+}
+
 console.log(`Synced all versions to ${version}`);
