@@ -1,7 +1,8 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { constants as fsConstants } from "node:fs";
 import { access, chmod, cp, mkdir, rm } from "node:fs/promises";
-import { createWriteStream } from "node:fs";
+import { createWriteStream, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { pipeline } from "node:stream/promises";
@@ -133,7 +134,36 @@ try {
     | fsConstants.S_IRGRP | fsConstants.S_IXGRP
     | fsConstants.S_IROTH | fsConstants.S_IXOTH);
   await access(bundledSniffer, fsConstants.X_OK);
-  execFileSync(bundledSniffer, ["--help"], { stdio: "ignore" });
+  // Smoke-test the sidecar: it speaks JSON over stdio and requires
+  // --data-dir (it has no --help flag). Send a `status` command and
+  // expect a `ready` + `response` pair back.
+  await new Promise((resolve, reject) => {
+    const dataDir = mkdtempSync(join(tmpdir(), "cobalt-sniffer-smoke-"));
+    const child = spawn(bundledSniffer, ["--data-dir", dataDir], { stdio: ["pipe", "pipe", "pipe"] });
+    let output = "";
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      rmSync(dataDir, { recursive: true, force: true });
+      reject(new Error(`resource sniffer smoke test timed out. Output so far: ${output}`));
+    }, 15000);
+    child.stdout.on("data", (chunk) => {
+      output += chunk.toString();
+      if (output.includes('"ready"') && output.includes('"response"')) {
+        clearTimeout(timer);
+        child.kill("SIGKILL");
+        rmSync(dataDir, { recursive: true, force: true });
+        resolve();
+      }
+    });
+    child.on("error", (error) => {
+      clearTimeout(timer);
+      try { rmSync(dataDir, { recursive: true, force: true }); } catch {}
+      reject(error);
+    });
+    child.stdin.write(JSON.stringify({ id: "smoke", command: "status" }) + "\n");
+    // Keep stdin open: the sidecar exits when stdin closes, which would
+    // race with reading the response.
+  });
 } catch (error) {
   throw new Error(`Unable to build the resource sniffer. Install Go 1.22+ and retry: ${error.message}`);
 }
