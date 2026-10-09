@@ -1,20 +1,24 @@
 # Release Checklist
 
+> Agent 请先读 [AGENTS.md](./AGENTS.md)（发版 playbook，含失败排查手册）。
+> 人类快速发版看本节即可。
+
 ## Recommended: GitHub CI Release (green every time)
 
 Push a version tag and CI builds, signs (ad-hoc), and publishes
 `.dmg` + `.app.zip` automatically:
 
 ```bash
-# 1. Align the three version files
+# 1. Align versions (updates package.json, tauri.conf.json, Cargo.toml AND Cargo.lock)
 node scripts/sync-versions.mjs 1.0.10
 # or: pnpm release:bump 1.0.10
 
-# 2. Sanity check locally
+# 2. Sanity check locally (must exit 0)
 pnpm release:check
 
-# 3. Commit, tag, push — CI does the rest
-git add package.json src-tauri/tauri.conf.json src-tauri/Cargo.toml
+# 3. Commit, tag, push — CI does the rest.
+#    NOTE: all FOUR version files are required (Cargo.lock included)!
+git add package.json src-tauri/tauri.conf.json src-tauri/Cargo.toml src-tauri/Cargo.lock
 git commit -m "chore: release v1.0.10"
 git tag v1.0.10
 git push origin main v1.0.10
