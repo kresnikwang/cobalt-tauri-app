@@ -39,7 +39,7 @@ gh run list --limit 3    # 应看到 CI（main）和 Release（tag）两个 run 
 - 用 `gh run list --limit 2` 轮询（**不要用 `gh run watch`，它会占满 30s 工具超时**）。
 - 两个都 `completed success` 才算发版成功。
 - 验证产物：`gh release view vX.Y.Z` 应看到
-  `Cobalt-X.Y.Z-aarch64.app.zip`、`Cobalt-X.Y.Z-aarch64.dmg`、`INSTALL.md`。
+  `Cobalt-X.Y.Z-arm64.app.zip`、`Cobalt-X.Y.Z-arm64.dmg`、`INSTALL.md`。
 
 ## 4. 失败排查手册（按历史故障排序）
 

@@ -120,11 +120,11 @@ jobs:
           mkdir -p "$OUT"
           test -d "$APP"
           # Canonical zip (keepParent so unzip yields Cobalt.app)
-          ditto -c -k --sequesterRsrc --keepParent "$APP" "$OUT/Cobalt-${VERSION}-aarch64.app.zip"
-          # DMG (Tauri names it Cobalt_<ver>_aarch64.dmg)
+          ditto -c -k --sequesterRsrc --keepParent "$APP" "$OUT/Cobalt-${VERSION}-arm64.app.zip"
+          # DMG (Tauri outputs Cobalt_<ver>_aarch64.dmg; ship it under the friendlier arm64 name)
           DMG_SRC="$(ls "$DMG_DIR"/*.dmg 2>/dev/null | head -n 1 || true)"
           if [ -n "$DMG_SRC" ]; then
-            cp "$DMG_SRC" "$OUT/Cobalt-${VERSION}-aarch64.dmg"
+            cp "$DMG_SRC" "$OUT/Cobalt-${VERSION}-arm64.dmg"
           else
             echo "WARNING: no .dmg produced, shipping .app.zip only"
           fi
@@ -133,7 +133,7 @@ jobs:
           # Cobalt $VERSION (macOS Apple Silicon)
 
           ## Install
-          1. Download \`Cobalt-${VERSION}-aarch64.dmg\` (or the \`.app.zip\`).
+          1. Download \`Cobalt-${VERSION}-arm64.dmg\` (or the \`.app.zip\`).
           2. Drag **Cobalt.app** to **Applications**.
           3. First launch: right-click Cobalt.app → Open → Open again (unsigned CI build, no Apple notarization).
 
