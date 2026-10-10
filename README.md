@@ -32,6 +32,12 @@ Tauri 重构版采取了**解耦进程架构**：
 - **🎬 新片场链接下载**：粘贴公开的新片场作品链接即可下载视频；应用会在隐藏的本地浏览器上下文中解析短期签名地址，无需开启资源嗅探或系统代理。
 - **🎧 真正的音频提取**：音频模式使用 `yt-dlp --extract-audio` 与内置 FFmpeg，输出真正的 m4a/mp3/ogg/wav/opus 音频文件，而不是仅改扩展名。
 - **🧩 DASH 进度聚合**：针对 Bilibili 的视频流 + 音频流 + 合并流程做阶段进度映射，避免进度条回退或跳动。
+- **⏯ 断点续传 + Turbo 多分片并行 + 自动重试**：本地 `yt-dlp` 默认保留 `.part` 并 `--continue`，网络中断后继续而不是从零开始；DASH/HLS 分片默认 4 线程并行（可调），HTTP/分片重试使用指数退避。取消时保留未完成片段供下次续传，删除任务时才真正清理。
+- **🛠 yt-dlp 引擎热更新**：应用每天会自动检查 yt-dlp 官方 release，把新版本下载到 AppData、校验 SHA256 与 `--version` 冒烟测试后才替换；内置版本作为离线兜底。设置面板可手动「检查更新」，避免站点改版后必须等整包发版。
+- **📚 播放列表 / 合集 / 多P 选集**：命中播放列表、UP 主合集、番剧或多 P 视频时弹出选集面板（可全选 / 勾选 / 一键全部），每集生成独立任务，单独进度、重试与取消。
+- **💬 字幕与元数据**：可下载字幕/CC（含自动生成字幕，默认 `zh.*,en.*,en`），支持写入 .srt 外挂或嵌入 mp4；可嵌入标题、章节、简介和封面。
+- **🔔 完成通知**：任务完成或失败时发系统通知（可在设置关闭）。
+- **🖥 菜单栏 + URL Scheme**：菜单栏图标可呼出窗口、下载剪贴板链接；浏览器/快捷指令支持 `cobalt://download?url=<链接>` 直接投递给应用。
 - **🌐 远程服务辅助解析**：对 Instagram、X、Pinterest 等平台保留服务端辅助下载路径，降低本地解析复杂度。
 - **➕ yt-dlp 通用兜底**：远程服务报"不支持"的站点，自动用本地 `yt-dlp --dump-json` 探测（1700+ 站点 extractor），能解析就本地下载——Vimeo、Rutube、AcFun、西瓜视频等长尾站点开箱即用；抖音 / TikTok / 小红书等登录墙站点自动跳过探测避免空等。
 - **🖧 完整 HTTP 代理支持**：支持注入 Clash / Clash Verge 等本地代理服务，所有请求及下载分片均经过代理转发，确保顺畅拉取外网资源。
@@ -72,6 +78,12 @@ The Tauri rebuild decouples these components:
 - **🎬 Xinpianchang link downloads**: Paste a public Xinpianchang work URL to resolve its short-lived signed video URL in a hidden local browser context; resource-sniffer and system-proxy setup are not required.
 - **🎧 Real audio extraction**: Audio-only mode uses `yt-dlp --extract-audio` and bundled FFmpeg, producing real m4a/mp3/ogg/wav/opus files.
 - **🧩 DASH-aware progress**: Bilibili's separate video/audio streams and merge phase are mapped into stable progress so the UI does not jump backwards.
+- **⏯ Resumable downloads + parallel fragments + auto-retry**: local `yt-dlp` keeps `.part` files and resumes with `--continue`, DASH/HLS segments are fetched with 4 concurrent fragments (configurable), and HTTP/fragment retries use exponential backoff. Cancelling keeps the partial data for the next attempt; deleting a task cleans it up.
+- **🛠 Self-updating yt-dlp engine**: the app checks the official yt-dlp release once a day, downloads it into the app data folder, verifies the SHA256 checksum and a `--version` smoke test before replacing the bundled copy (which stays as the offline fallback). A manual "check for updates" button lives in Preferences.
+- **📚 Playlist / collection / multi-part picking**: playlist, channel-collection, series and multi-part links open an episode picker (select all / pick individually / download everything), and every episode becomes its own task with independent progress, retry and cancel.
+- **💬 Subtitles & metadata**: optional subtitles/CC download (including auto-generated captions, defaulting to `zh.*,en.*,en`) as embedded tracks or `.srt` sidecars, plus embedded title, chapters, description and cover art.
+- **🔔 Completion notifications**: a system notification fires when a task finishes or fails (can be turned off).
+- **🖥 Menu-bar icon + URL scheme**: the tray icon shows the window or downloads the clipboard link, and browsers / Shortcuts can hand a link to Cobalt with `cobalt://download?url=<url>`.
 - **🌐 Server-assisted fallback**: Remote media service integration remains available for Instagram, X, Pinterest, and similar sites.
 - **➕ yt-dlp generic fallback**: When the remote service reports "unsupported", the app probes the URL with local `yt-dlp --dump-json` (1700+ site extractors) and downloads locally if it can resolve it — Vimeo, Rutube, AcFun, Xigua and other long-tail sites work out of the box. Login-walled hosts (Douyin / TikTok / Xiaohongshu) are auto-skipped to avoid pointless waits.
 - **🖧 Full HTTP Proxy Support**: Seamlessly routes all scrapers and stream downloads through local Clash / Verge proxies.

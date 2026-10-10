@@ -58,7 +58,17 @@
     clipboardMonitoring: true,
     maxParallelDownloads: 3,
     proxyEnabled: true,
-    proxyUrl: 'http://127.0.0.1:7897'
+    proxyUrl: 'http://127.0.0.1:7897',
+    resumePartialDownloads: true,
+    concurrentFragments: 4,
+    downloadSubtitles: false,
+    subtitleLangs: 'zh.*,en.*,en,zh-Hans,zh-Hant',
+    embedSubtitles: true,
+    embedMetadata: true,
+    embedThumbnail: false,
+    playlistPrompt: true,
+    notifyOnFinish: true,
+    ytdlpAutoUpdate: true
   });
   // Guards against writing the placeholder defaults above back to disk if the user
   // touches a setting before the backend has answered.
@@ -74,6 +84,18 @@
   let snifferError = $state('');
   let captureSearch = $state('');
   let thumbFailed = $state<Record<string, boolean>>({});
+
+  // Playlist picker: one pending request (task id + episode list) at a time.
+  let playlistRequest = $state<any>(null);
+  let playlistSelection = $state<number[]>([]);
+  let playlistBusy = $state(false);
+  let playlistError = $state('');
+
+  // Download engine (yt-dlp) status.
+  let engine = $state<any>({ version: '', source: '', bundledVersion: '', autoUpdate: true, latest: '' });
+  let engineBusy = $state(false);
+  let engineError = $state('');
+  let engineMessage = $state('');
 
   // Announcements for assistive tech; the visible list is silent on its own.
   let announcement = $state('');
@@ -138,6 +160,9 @@
   let unlistenTask: (() => void) | null = null;
   let unlistenClipboard: (() => void) | null = null;
   let unlistenSniffer: (() => void) | null = null;
+  let unlistenPlaylist: (() => void) | null = null;
+  let unlistenEngine: (() => void) | null = null;
+  let unlistenDeepLink: (() => void) | null = null;
 
   onMount(async () => {
     initLocale();
@@ -149,7 +174,7 @@
     // Register listeners BEFORE fetching initial state. If any of the invokes below
     // rejects, the app must not end up permanently deaf to task/clipboard/sniffer events.
     try {
-      [unlistenTask, unlistenClipboard, unlistenSniffer] = await Promise.all([
+      [unlistenTask, unlistenClipboard, unlistenSniffer, unlistenPlaylist, unlistenEngine, unlistenDeepLink] = await Promise.all([
         listen('task-updated', (event) => {
           const updatedTask = event.payload as any;
           const index = tasks.findIndex(task => task.id === updatedTask.id);
@@ -166,6 +191,20 @@
         listen('sniffer-updated', (event) => {
           sniffer = event.payload as any;
         }),
+        listen('playlist-choice', (event) => {
+          openPlaylistRequest(event.payload as any);
+        }),
+        listen('engine-updated', () => {
+          // A background engine update landed: show the new version.
+          refreshEngine();
+        }),
+        listen('deep-link://new-url', (event) => {
+          const urls = (event.payload as unknown as string[]) ?? [];
+          for (const raw of urls) {
+            const target = deepLinkTarget(raw);
+            if (target) { handleDownload(target); }
+          }
+        }),
       ]);
     } catch (error) {
       bootError = `Failed to connect to the backend: ${error}`;
@@ -179,12 +218,16 @@
     catch (error) { bootError = bootError || `Failed to load tasks: ${error}`; }
     try { sniffer = await invoke('get_sniffer_state'); }
     catch (error) { bootError = bootError || `Failed to load sniffer state: ${error}`; }
+    try { await refreshEngine(); } catch { /* shown in the engine panel */ }
   });
 
   onDestroy(() => {
     if (unlistenTask) unlistenTask();
     if (unlistenClipboard) unlistenClipboard();
     if (unlistenSniffer) unlistenSniffer();
+    if (unlistenPlaylist) unlistenPlaylist();
+    if (unlistenEngine) unlistenEngine();
+    if (unlistenDeepLink) unlistenDeepLink();
     for (const timer of toastTimers) clearTimeout(timer);
   });
 
@@ -202,6 +245,97 @@
   }
 
   // --- Actions ----------------------------------------------------------
+  /** Accept `cobalt://download?url=<encoded>` (browsers, Shortcuts, Alfred). */
+  function deepLinkTarget(raw: string): string | null {
+    const value = (raw ?? '').trim();
+    if (!value) return null;
+    if (/^https?:\/\//i.test(value)) return value;
+    try {
+      const parsed = new URL(value);
+      const target = parsed.searchParams.get('url');
+      return target && /^https?:\/\//i.test(target) ? target : null;
+    } catch {
+      return null;
+    }
+  }
+
+  // --- Playlist episode picker -----------------------------------------
+  function openPlaylistRequest(payload: any) {
+    if (!payload?.taskId) return;
+    playlistRequest = payload;
+    playlistError = '';
+    playlistSelection = (payload.entries ?? []).map((entry: any) => entry.index).filter((index: any) => typeof index === 'number');
+  }
+
+  function togglePlaylistEntry(index: number, checked: boolean) {
+    playlistSelection = checked
+      ? [...playlistSelection, index].sort((a, b) => a - b)
+      : playlistSelection.filter((item: number) => item !== index);
+  }
+
+  function toggleAllPlaylistEntries(checked: boolean) {
+    playlistSelection = checked
+      ? (playlistRequest.entries ?? []).map((entry: any) => entry.index).filter((index: any) => typeof index === 'number')
+      : [];
+  }
+
+  async function confirmPlaylistSelection(downloadAll = false) {
+    if (!playlistRequest || playlistBusy) return;
+    playlistBusy = true;
+    playlistError = '';
+    try {
+      await invoke('resolve_playlist_choice', {
+        taskId: playlistRequest.taskId,
+        // An empty list means "every episode" (the picker only lists the first few).
+        indices: downloadAll ? [] : playlistSelection
+      });
+      playlistRequest = null;
+      playlistSelection = [];
+    } catch (error) {
+      playlistError = String(error);
+    } finally {
+      playlistBusy = false;
+    }
+  }
+
+  function dismissPlaylist() {
+    const pending = playlistRequest;
+    playlistRequest = null;
+    playlistSelection = [];
+    if (!pending) return;
+    // Cancelling the placeholder task frees its concurrency slot and stops the
+    // backend from waiting for an answer that will never come.
+    invoke('cancel_task', { id: pending.taskId }).catch(() => {});
+  }
+
+  // --- Download engine (yt-dlp) ----------------------------------------
+  async function refreshEngine() {
+    try {
+      engineError = '';
+      engine = await invoke('get_engine_info');
+    } catch (error) {
+      engineError = String(error);
+    }
+  }
+
+  async function updateEngine() {
+    if (engineBusy) return;
+    engineBusy = true;
+    engineError = '';
+    engineMessage = '';
+    try {
+      const info: any = await invoke('update_ytdlp_engine');
+      engine = info;
+      engineMessage = info?.justUpdated
+        ? t('engine.updated', { version: info.version ?? '–' })
+        : t('engine.up_to_date');
+    } catch (error) {
+      engineError = String(error);
+    } finally {
+      engineBusy = false;
+    }
+  }
+
   async function handleDownload(urlToDownload = inputUrl, toastId?: number) {
     const cleanUrl = (urlToDownload ?? '').trim();
     if (!cleanUrl || submitting) return;
@@ -235,11 +369,13 @@
     finally { snifferBusy = false; }
   }
 
-  // Failed gallery job (often a login wall): jump to the resource sniffer, the
-  // app's user-guided extraction fallback, and start it.
+  // Failed tasks (often a login wall or an unknown site): jump to the resource
+  // sniffer, the app's user-guided extraction fallback, and start it.
   async function openSnifferForGallery() {
     inputMode = 'sniffer';
-    await startSniffer();
+    if (sniffer.status !== 'running' && sniffer.status !== 'starting' && !snifferBusy) {
+      await startSniffer();
+    }
   }
 
   async function stopSniffer() {
@@ -297,6 +433,9 @@
     // to a direct connection without telling anyone.
     payload.apiUrl = String(payload.apiUrl ?? '').trim();
     payload.proxyUrl = String(payload.proxyUrl ?? '').trim();
+    // A <select> hands back strings; the Rust side types this as u32.
+    const fragments = Number(payload.concurrentFragments);
+    payload.concurrentFragments = Number.isFinite(fragments) ? Math.min(16, Math.max(1, Math.round(fragments))) : 4;
     try {
       settings = await invoke('save_settings', { newSettings: payload });
       actionError = '';
@@ -763,7 +902,7 @@
                   <IconTrash size={14} />
                 </button>
               {:else}
-                {#if task.kind === 'gallery'}
+                {#if task.kind === 'gallery' || task.status === 'failed'}
                   <button class="action-circle-btn" onclick={openSnifferForGallery} title={t('task.use_sniffer')} aria-label={t('task.use_sniffer')}>
                     <IconRadar size={14} />
                   </button>
@@ -893,6 +1032,92 @@
             <label for="clip-monitor">{t('settings.clipboard')}</label>
           </div>
 
+          <!-- Download engine -->
+          <div class="setting-divider"></div>
+          <div class="setting-section-title">{t('settings.engine')}</div>
+
+          <div class="setting-item engine-item">
+            <div class="engine-status">
+              <span class="engine-version">{t('engine.version', { version: engine.version || '–' })}</span>
+              <span class="engine-source {engine.source}">{t(`engine.source.${engine.source || 'missing'}`)}</span>
+            </div>
+            <div class="engine-actions">
+              <button class="btn-select-dir" onclick={updateEngine} disabled={engineBusy} title={t('engine.check_update')} aria-label={t('engine.check_update')}>
+                <IconRefresh size={16} />
+              </button>
+            </div>
+          </div>
+          <div class="setting-item">
+            <span class="setting-hint">
+              {engineMessage || engineError || t('engine.note', { bundled: engine.bundledVersion || '–' })}
+            </span>
+          </div>
+          <div class="setting-item checkbox-item">
+            <input type="checkbox" id="engine-auto" bind:checked={settings.ytdlpAutoUpdate} onchange={saveSettings} />
+            <label for="engine-auto">{t('engine.auto_update')}</label>
+          </div>
+
+          <!-- Download behaviour -->
+          <div class="setting-divider"></div>
+          <div class="setting-section-title">{t('settings.behavior')}</div>
+
+          <div class="setting-item checkbox-item">
+            <input type="checkbox" id="resume-partial" bind:checked={settings.resumePartialDownloads} onchange={saveSettings} />
+            <label for="resume-partial">{t('settings.resume')}</label>
+          </div>
+
+          <div class="setting-item">
+            <label for="fragments">{t('settings.fragments')}</label>
+            <select id="fragments" bind:value={settings.concurrentFragments} onchange={saveSettings} class="settings-select">
+              <option value={1}>{t('settings.fragments.1')}</option>
+              <option value={2}>2</option>
+              <option value={4}>4</option>
+              <option value={8}>8</option>
+            </select>
+            <span class="setting-hint">{t('settings.fragments.hint')}</span>
+          </div>
+
+          <div class="setting-item checkbox-item">
+            <input type="checkbox" id="playlist-prompt" bind:checked={settings.playlistPrompt} onchange={saveSettings} />
+            <label for="playlist-prompt">{t('settings.playlist_prompt')}</label>
+          </div>
+
+          <div class="setting-item checkbox-item">
+            <input type="checkbox" id="notify-finish" bind:checked={settings.notifyOnFinish} onchange={saveSettings} />
+            <label for="notify-finish">{t('settings.notify')}</label>
+          </div>
+
+          <!-- Subtitles & metadata -->
+          <div class="setting-divider"></div>
+          <div class="setting-section-title">{t('settings.subtitles')}</div>
+
+          <div class="setting-item checkbox-item">
+            <input type="checkbox" id="download-subs" bind:checked={settings.downloadSubtitles} onchange={saveSettings} />
+            <label for="download-subs">{t('settings.download_subtitles')}</label>
+          </div>
+
+          {#if settings.downloadSubtitles}
+            <div class="setting-item">
+              <label for="sub-langs">{t('settings.subtitle_langs')}</label>
+              <input type="text" id="sub-langs" bind:value={settings.subtitleLangs} onchange={saveSettings} class="settings-input" placeholder={t('settings.subtitle_langs.hint')} />
+              <span class="setting-hint">{t('settings.subtitle_langs.note')}</span>
+            </div>
+            <div class="setting-item checkbox-item">
+              <input type="checkbox" id="embed-subs" bind:checked={settings.embedSubtitles} onchange={saveSettings} />
+              <label for="embed-subs">{t('settings.embed_subtitles')}</label>
+            </div>
+          {/if}
+
+          <div class="setting-item checkbox-item">
+            <input type="checkbox" id="embed-metadata" bind:checked={settings.embedMetadata} onchange={saveSettings} />
+            <label for="embed-metadata">{t('settings.embed_metadata')}</label>
+          </div>
+
+          <div class="setting-item checkbox-item">
+            <input type="checkbox" id="embed-thumbnail" bind:checked={settings.embedThumbnail} onchange={saveSettings} />
+            <label for="embed-thumbnail">{t('settings.embed_thumbnail')}</label>
+          </div>
+
           <!-- Remote API -->
           <div class="setting-divider"></div>
           <div class="setting-section-title">{t('settings.api')}</div>
@@ -923,6 +1148,82 @@
 
         <div class="settings-footer">
           <p class="settings-app-version">{t('settings.version', { version: appVersion || '–' })}</p>
+        </div>
+      </div>
+    </div>
+  {/if}
+
+  <!-- Playlist episode picker -->
+  {#if playlistRequest}
+    {@const visibleEntries = playlistRequest.entries ?? []}
+    {@const allIndices = visibleEntries.map((entry: any) => entry.index).filter((index: any) => typeof index === 'number')}
+    {@const selectedCount = playlistSelection.length}
+    {@const isAllSelected = allIndices.length > 0 && selectedCount === allIndices.length}
+    <!-- svelte-ignore a11y_click_events_have_key_events -->
+    <!-- svelte-ignore a11y_no_static_element_interactions -->
+    <div class="settings-backdrop" transition:fade={{ duration: 160 }} onclick={dismissPlaylist}>
+      <div
+        class="settings-panel glass playlist-panel"
+        role="dialog"
+        aria-modal="true"
+        aria-label={t('playlist.title')}
+        tabindex="-1"
+        onclick={(e) => e.stopPropagation()}
+      >
+        <div class="settings-header">
+          <h3>{t('playlist.title')}</h3>
+          <button class="close-settings" onclick={dismissPlaylist} title={t('playlist.cancel')} aria-label={t('playlist.cancel')}>
+            <IconX size={18} />
+          </button>
+        </div>
+
+        <div class="playlist-meta">
+          <span class="playlist-title">{playlistRequest.title}</span>
+          <span class="playlist-count">
+            {t('playlist.subtitle', { count: playlistRequest.count ?? visibleEntries.length })}
+            {#if playlistRequest.truncated}
+              · {t('playlist.more', { shown: visibleEntries.length, count: playlistRequest.count })}
+            {/if}
+          </span>
+        </div>
+
+        <div class="playlist-toolbar">
+          <label class="playlist-check">
+            <input type="checkbox" checked={isAllSelected} onchange={(e) => toggleAllPlaylistEntries(e.currentTarget.checked)} />
+            <span>{t('playlist.all', { count: visibleEntries.length })}</span>
+          </label>
+          <span class="playlist-selected">{t('playlist.selected', { selected: selectedCount, total: allIndices.length })}</span>
+        </div>
+
+        <div class="playlist-list">
+          {#each visibleEntries as entry (entry.index)}
+            <label class="playlist-entry" class:selected={playlistSelection.includes(entry.index)}>
+              <input
+                type="checkbox"
+                checked={playlistSelection.includes(entry.index)}
+                onchange={(e) => togglePlaylistEntry(entry.index, e.currentTarget.checked)}
+              />
+              <span class="playlist-entry-index">{entry.index}</span>
+              <span class="playlist-entry-title" title={entry.title}>{entry.title || t('playlist.episode', { index: entry.index })}</span>
+              {#if entry.duration}
+                <span class="playlist-entry-duration">{entry.duration}</span>
+              {/if}
+            </label>
+          {/each}
+        </div>
+
+        {#if playlistError}
+          <p class="sniffer-error">{playlistError}</p>
+        {/if}
+
+        <div class="playlist-actions">
+          <button class="toast-btn secondary" onclick={dismissPlaylist} disabled={playlistBusy}>{t('playlist.cancel')}</button>
+          <button class="toast-btn secondary" onclick={() => confirmPlaylistSelection(true)} disabled={playlistBusy}>
+            {t('playlist.download_all', { count: playlistRequest.count ?? visibleEntries.length })}
+          </button>
+          <button class="toast-btn primary" onclick={() => confirmPlaylistSelection()} disabled={playlistBusy || selectedCount === 0}>
+            {playlistBusy ? t('download.submitting') : t('playlist.confirm', { selected: selectedCount })}
+          </button>
         </div>
       </div>
     </div>
@@ -1852,6 +2153,175 @@
     font-size: 11px;
     color: var(--text-muted);
     text-align: center;
+  }
+
+  /* Download engine row */
+  .engine-item {
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+  }
+
+  .engine-status {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    min-width: 0;
+  }
+
+  .engine-version {
+    font-family: 'SF Mono', 'Menlo', 'Monaco', monospace;
+    font-size: 12px;
+    color: var(--text-primary);
+  }
+
+  .engine-source {
+    padding: 2px 7px;
+    border-radius: var(--radius-sm);
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+
+  .engine-source.bundled {
+    color: var(--text-secondary);
+    background: var(--bg-subtle);
+  }
+
+  .engine-source.updated {
+    color: var(--success-text);
+    background: #eaf0e6;
+  }
+
+  .engine-source.missing {
+    color: var(--danger-text);
+    background: #f7e6e6;
+  }
+
+  .engine-actions {
+    display: flex;
+    gap: 6px;
+    flex: 0 0 auto;
+  }
+
+  /* Playlist episode picker */
+  .playlist-panel {
+    width: min(560px, 92vw);
+    max-height: min(680px, 88vh);
+    display: flex;
+    flex-direction: column;
+  }
+
+  .playlist-meta {
+    display: grid;
+    gap: 4px;
+    padding: 0 20px;
+  }
+
+  .playlist-title {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+
+  .playlist-count {
+    font-size: 11px;
+    color: var(--text-muted);
+  }
+
+  .playlist-toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    margin: 0 20px;
+    padding: 9px 11px;
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-md);
+    background: var(--bg-subtle);
+  }
+
+  .playlist-check,
+  .playlist-entry {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    cursor: pointer;
+  }
+
+  .playlist-check {
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--text-primary);
+  }
+
+  .playlist-selected {
+    font-size: 11px;
+    color: var(--text-muted);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .playlist-list {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: 0 20px;
+  }
+
+  .playlist-entry {
+    padding: 8px 10px;
+    border-radius: var(--radius-md);
+    border: 1px solid transparent;
+    color: var(--text-secondary);
+    font-size: 12px;
+    transition: background-color .15s ease, border-color .15s ease;
+  }
+
+  .playlist-entry:hover {
+    background: var(--bg-subtle);
+  }
+
+  .playlist-entry.selected {
+    border-color: #dedbd3;
+    background: var(--bg-card);
+    color: var(--text-primary);
+  }
+
+  .playlist-entry-index {
+    flex: 0 0 auto;
+    min-width: 22px;
+    font-family: 'SF Mono', 'Menlo', 'Monaco', monospace;
+    font-size: 11px;
+    color: var(--text-muted);
+    text-align: right;
+  }
+
+  .playlist-entry-title {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .playlist-entry-duration {
+    flex: 0 0 auto;
+    font-family: 'SF Mono', 'Menlo', 'Monaco', monospace;
+    font-size: 11px;
+    color: var(--text-muted);
+  }
+
+  .playlist-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    padding: 16px 20px 20px;
+    border-top: 1px solid var(--border-color);
   }
 
   .mode-switch {

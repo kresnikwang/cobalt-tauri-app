@@ -1,18 +1,20 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use serde::{Serialize, Deserialize};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command as TokioCommand;
 use futures_util::StreamExt;
-use tauri::{Manager, Emitter};
+use tauri::{Emitter, Manager};
 use tauri::path::BaseDirectory;
 use base64::Engine;
 
 mod sniffer;
 mod xinpianchang;
 mod gallerydl;
+mod engine_update;
+mod playlist;
 
 const LEGACY_API_URL: &str = "http://43.156.122.169";
 const DEFAULT_API_URL: &str = "http://47.241.10.142/cobalt-api";
@@ -34,6 +36,60 @@ pub struct Settings {
     pub max_parallel_downloads: u32,
     pub proxy_enabled: bool,
     pub proxy_url: String,
+    /// Keep downloading a partially written file after a network hiccup
+    /// (yt-dlp `--continue` + `.part` files) instead of restarting from zero.
+    #[serde(default = "default_true")]
+    pub resume_partial_downloads: bool,
+    /// Fragments of a DASH/HLS stream to fetch in parallel (yt-dlp `-N`).
+    #[serde(default = "default_concurrent_fragments")]
+    pub concurrent_fragments: u32,
+    /// Download subtitles / closed captions next to (or inside) the media file.
+    #[serde(default)]
+    pub download_subtitles: bool,
+    /// yt-dlp `--sub-langs` value, e.g. `zh.*,en`.
+    #[serde(default = "default_subtitle_langs")]
+    pub subtitle_langs: String,
+    /// Embed subtitles into the container instead of leaving sidecar files.
+    #[serde(default = "default_true")]
+    pub embed_subtitles: bool,
+    /// Embed title/author/chapters metadata into the container.
+    #[serde(default = "default_true")]
+    pub embed_metadata: bool,
+    /// Embed the cover art (needs ffmpeg; disabled by default because it can
+    /// force a container change for some sites).
+    #[serde(default)]
+    pub embed_thumbnail: bool,
+    /// Ask which episodes to keep when a link expands to a playlist/collection.
+    #[serde(default = "default_true")]
+    pub playlist_prompt: bool,
+    /// Post a system notification when a task finishes or fails.
+    #[serde(default = "default_true")]
+    pub notify_on_finish: bool,
+    /// Let the app refresh the bundled yt-dlp engine in the background so site
+    /// changes are fixed without waiting for a new app release.
+    #[serde(default = "default_true")]
+    pub ytdlp_auto_update: bool,
+    /// Version of the last engine update the app installed itself.
+    #[serde(default)]
+    pub ytdlp_updated_version: Option<String>,
+    /// UNIX timestamp of the last engine update.
+    #[serde(default)]
+    pub ytdlp_updated_at: Option<u64>,
+    /// UNIX timestamp of the last auto-update check (rate limited to daily).
+    #[serde(default)]
+    pub ytdlp_checked_at: Option<u64>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_concurrent_fragments() -> u32 {
+    4
+}
+
+fn default_subtitle_langs() -> String {
+    "zh.*,en.*,en,zh-Hans,zh-Hant".to_string()
 }
 
 impl Settings {
@@ -48,6 +104,28 @@ impl Settings {
             max_parallel_downloads: 3,
             proxy_enabled: true,
             proxy_url: "http://127.0.0.1:7897".to_string(),
+            resume_partial_downloads: true,
+            concurrent_fragments: 4,
+            download_subtitles: false,
+            subtitle_langs: default_subtitle_langs(),
+            embed_subtitles: true,
+            embed_metadata: true,
+            embed_thumbnail: false,
+            playlist_prompt: true,
+            notify_on_finish: true,
+            ytdlp_auto_update: true,
+            ytdlp_updated_version: None,
+            ytdlp_updated_at: None,
+            ytdlp_checked_at: None,
+        }
+    }
+
+    /// Proxy address for the download engines, or `None` when disabled.
+    fn proxy_url(&self) -> Option<&str> {
+        if self.proxy_enabled && !self.proxy_url.trim().is_empty() {
+            Some(self.proxy_url.trim())
+        } else {
+            None
         }
     }
 }
@@ -87,6 +165,16 @@ pub struct DownloadTask {
     /// Number of gallery items already written.
     #[serde(default)]
     pub items_done: u32,
+    /// Position inside a playlist/collection (1-based, what
+    /// `--playlist-items` expects) when this task is one episode of a set.
+    #[serde(default)]
+    pub playlist_index: Option<u32>,
+    /// Total number of episodes in the set this task belongs to.
+    #[serde(default)]
+    pub playlist_count: Option<u32>,
+    /// Task that expanded into this episode (used to group the UI).
+    #[serde(default)]
+    pub playlist_parent_id: Option<String>,
 }
 
 fn default_task_kind() -> String {
@@ -124,6 +212,14 @@ pub struct AppState {
     pub settings_path: PathBuf,
     pub tasks_path: PathBuf,
     pub captured_downloads: HashMap<String, sniffer::DownloadDescriptor>,
+    /// Tasks waiting for the user to pick playlist episodes: task id -> selection.
+    /// An empty selection means "the user dismissed the picker".
+    pub playlist_decisions: HashMap<String, tokio::sync::oneshot::Sender<Vec<u32>>>,
+    /// yt-dlp output stems currently being written. Two tasks that resolve to
+    /// the same stem would truncate each other's file (and, with resume
+    /// enabled, corrupt a shared `.part`), so a claimed stem is excluded from
+    /// `unique_ytdlp_stem` until its owner finishes.
+    pub active_stems: HashSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -300,6 +396,21 @@ struct YtdlpProbe {
     video_id: String,
 }
 
+/// Payload of the `playlist-choice` event: everything the picker needs to let
+/// the user choose which episodes to keep.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PlaylistChoiceEvent {
+    task_id: String,
+    url: String,
+    title: String,
+    uploader: String,
+    count: u32,
+    /// True when the collection is longer than the entries listed here.
+    truncated: bool,
+    entries: Vec<playlist::PlaylistEntry>,
+}
+
 /// Ask local yt-dlp whether it can handle this URL (`--dump-json`,
 /// no download). Returns the extractor + title on success, `None` when
 /// the site is unsupported. Never fails the task by itself.
@@ -361,6 +472,220 @@ async fn probe_ytdlp_url(
         title,
         video_id,
     })
+}
+
+/// Ask yt-dlp whether a URL expands to a playlist / collection / multi-part
+/// video. `--flat-playlist` keeps this to a single request (no per-video
+/// resolution), which is what makes it cheap enough to run before every
+/// supported download. Returns `None` for ordinary single videos.
+async fn probe_ytdlp_playlist(
+    ytdlp_path: &std::path::Path,
+    node_path: Option<&std::path::Path>,
+    url: &str,
+    proxy_url: Option<&str>,
+) -> Option<playlist::PlaylistProbe> {
+    let mut cmd = TokioCommand::new(ytdlp_path);
+    cmd.arg("--flat-playlist")
+        .arg("--dump-single-json")
+        .arg("--no-warnings")
+        .arg("--socket-timeout")
+        .arg("20")
+        .arg(url)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    if let Some(node) = node_path {
+        cmd.arg("--js-runtimes")
+            .arg(format!("node:{}", node.to_string_lossy()));
+    }
+    if let Some(proxy) = proxy_url.map(str::trim).filter(|p| !p.is_empty()) {
+        cmd.env("HTTP_PROXY", proxy);
+        cmd.env("HTTPS_PROXY", proxy);
+    }
+    let child = cmd.spawn().ok()?;
+    let output = tokio::time::timeout(std::time::Duration::from_secs(45), child.wait_with_output())
+        .await
+        .ok()?
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    let probe = playlist::parse_probe(&json);
+    probe.is_playlist.then_some(probe)
+}
+
+/// Expand a playlist task into one task per selected episode.
+///
+/// The parent task is removed (its slot stays with the queue) and the children
+/// each carry `--playlist-items <n>`, so every episode gets its own progress,
+/// retry and cancel handling.
+fn expand_playlist_selection(
+    parent_id: &str,
+    selections: &[u32],
+    probe: &playlist::PlaylistProbe,
+    state: &Arc<Mutex<AppState>>,
+    app_handle: &tauri::AppHandle,
+) -> Vec<DownloadTask> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let (url, playlist_title) = {
+        let state_lock = state.lock().unwrap_or_else(|error| error.into_inner());
+        let task = match state_lock.tasks.get(parent_id) {
+            Some(task) => task,
+            None => return Vec::new(),
+        };
+        (task.url.clone(), task.title.clone())
+    };
+
+    let mut created: Vec<DownloadTask> = Vec::new();
+    let mut state_lock = state.lock().unwrap_or_else(|error| error.into_inner());
+    for (offset, index) in selections.iter().enumerate() {
+        let entry_title = probe
+            .entries
+            .iter()
+            .find(|entry| entry.index == *index)
+            .map(|entry| entry.title.clone())
+            .filter(|title| !title.is_empty());
+        let fallback = if playlist_title.trim().is_empty() || playlist_title.starts_with("Analyzing") {
+            format!("Episode {}", index)
+        } else {
+            format!("{} · {}", playlist_title.trim(), index)
+        };
+        let title = entry_title.unwrap_or(fallback);
+        let child_id = format!("{}-p{}-{}", now, offset, index);
+        let child = DownloadTask {
+            id: child_id.clone(),
+            url: url.clone(),
+            title,
+            status: "queued".to_string(),
+            progress: 0.0,
+            speed: "0 B/s".to_string(),
+            downloaded_bytes: 0,
+            total_bytes: 0,
+            eta: "--:--".to_string(),
+            error: None,
+            output_path: None,
+            kind: "file".to_string(),
+            engine: String::new(),
+            items_total: 0,
+            items_done: 0,
+            playlist_index: Some(*index),
+            playlist_count: Some(probe.count.max(*index)),
+            playlist_parent_id: Some(parent_id.to_string()),
+        };
+        state_lock.tasks.insert(child_id, child.clone());
+        created.push(child);
+    }
+    state_lock.tasks.remove(parent_id);
+    save_tasks(&state_lock.tasks, &state_lock.tasks_path);
+    drop(state_lock);
+    for child in &created {
+        let _ = app_handle.emit("task-updated", child.clone());
+    }
+    created
+}
+
+/// Wait for the user's playlist selection, then expand the task.
+///
+/// Holds a concurrency slot while waiting (the task is in "analyzing"); the
+/// cancel button still works because a cancellation sender is registered.
+async fn resolve_playlist_selection(
+    id: String,
+    probe: playlist::PlaylistProbe,
+    state: &Arc<Mutex<AppState>>,
+    app_handle: &tauri::AppHandle,
+) {
+    let url = {
+        let state_lock = state.lock().unwrap_or_else(|error| error.into_inner());
+        state_lock.tasks.get(&id).map(|task| task.url.clone())
+    };
+    let Some(url) = url.filter(|url| !url.is_empty()) else {
+        return;
+    };
+
+    let mut cancelled_rx;
+    let mut decision_rx;
+    {
+        let mut state_lock = state.lock().unwrap_or_else(|error| error.into_inner());
+        let Some(task) = state_lock.tasks.get_mut(&id) else {
+            return;
+        };
+        if task.status == "cancelled" {
+            return;
+        }
+        if task.title.starts_with("Analyzing") {
+            task.title = if probe.uploader.is_empty() {
+                probe.title.clone()
+            } else {
+                format!("{} · {}", probe.title, probe.uploader)
+            };
+        }
+        if task.title.trim().is_empty() {
+            task.title = format!("{} episodes", probe.count);
+        }
+        task.status = "analyzing".to_string();
+        task.speed = "Waiting for your episode selection".to_string();
+        task.eta = "--:--".to_string();
+        let updated = task.clone();
+        save_tasks(&state_lock.tasks, &state_lock.tasks_path);
+
+        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+        let (decision_tx, decision_channel) = tokio::sync::oneshot::channel::<Vec<u32>>();
+        state_lock.cancellations.insert(id.clone(), cancel_tx);
+        state_lock.playlist_decisions.insert(id.clone(), decision_tx);
+        drop(state_lock);
+        let _ = app_handle.emit("task-updated", updated);
+        cancelled_rx = cancel_rx;
+        decision_rx = decision_channel;
+    }
+
+    let event = PlaylistChoiceEvent {
+        task_id: id.clone(),
+        url,
+        title: probe.title.clone(),
+        uploader: probe.uploader.clone(),
+        count: probe.count,
+        truncated: probe.count as usize > probe.entries.len(),
+        entries: probe.entries.clone(),
+    };
+    let _ = app_handle.emit("playlist-choice", event);
+
+    let selections: Vec<u32> = tokio::select! {
+        // `cancel_task` answers through the cancellation channel.
+        _ = &mut cancelled_rx => return,
+        decision = &mut decision_rx => match decision {
+            Ok(selection) => selection,
+            Err(_) => return,
+        },
+    };
+
+    // An empty selection means "every episode". The picker only lists the first
+    // MAX_ENTRIES, so a larger collection is capped there too (the UI says so).
+    let selections: Vec<u32> = if selections.is_empty() {
+        (1..=probe.count)
+            .take(playlist::MAX_ENTRIES)
+            .collect()
+    } else {
+        selections
+    };
+
+    let wanted = expand_playlist_selection(&id, &selections, &probe, state, app_handle);
+    {
+        let mut state_lock = state.lock().unwrap_or_else(|error| error.into_inner());
+        state_lock.cancellations.remove(&id);
+    }
+    if wanted.is_empty() {
+        update_task_failed(
+            id,
+            "No episodes were selected for download.".to_string(),
+            state,
+            app_handle,
+        );
+        return;
+    }
+    process_queue(state.clone(), app_handle.clone());
 }
 
 fn should_relay_download_through_server(url: &str) -> bool {
@@ -547,12 +872,70 @@ const YTDLP_MEDIA_EXTS: &[&str] = &[
     "mkv", "mp4", "webm", "m4a", "mp3", "opus", "ogg", "wav", "flac", "aac",
 ];
 
+/// Extensions yt-dlp writes next to the media file when subtitles or metadata
+/// are requested. They must never be mistaken for the download's own output.
+const YTDLP_SIDE_EXTS: &[&str] = &[
+    "srt", "vtt", "ass", "ssa", "lrc", "ttml", "sbv", "srv1", "srv2", "srv3",
+    "json3", "description", "jpg", "jpeg", "png", "webp",
+];
+
 fn ytdlp_stem_has_output(save_dir: &std::path::Path, stem: &str) -> bool {
     YTDLP_MEDIA_EXTS.iter().any(|ext| save_dir.join(format!("{}.{}", stem, ext)).exists())
 }
 
-/// Pick a collision-free basename for yt-dlp's `%(ext)s` template.
-fn unique_ytdlp_stem(save_dir: &std::path::Path, base: &str) -> String {
+/// Extra files yt-dlp leaves behind for a stem (subtitles, thumbnails, ...).
+fn ytdlp_side_outputs(save_dir: &std::path::Path, stem: &str) -> Vec<PathBuf> {
+    let prefix = format!("{}.", stem);
+    let mut found = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(save_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if !name.starts_with(&prefix) {
+                continue;
+            }
+            let is_side = name[prefix.len()..]
+                .rsplit('.')
+                .next()
+                .map(|ext| YTDLP_SIDE_EXTS.contains(&ext))
+                .unwrap_or(false);
+            if is_side {
+                found.push(path);
+            }
+        }
+    }
+    found
+}
+
+/// All files yt-dlp owns for a stem: final output, sidecars and every
+/// intermediate (`stem.f137.mp4`, `stem.mp4.part`, ...).
+fn ytdlp_stem_outputs(save_dir: &std::path::Path, stem: &str) -> Vec<PathBuf> {
+    let prefix = format!("{}.", stem);
+    let mut found = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(save_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if name == stem || name.starts_with(&prefix) {
+                found.push(path);
+            }
+        }
+    }
+    found
+}
+
+fn stem_key(save_dir: &std::path::Path, stem: &str) -> String {
+    format!("{}::{}", save_dir.display(), stem)
+}
+
+/// Pick a collision-free basename for yt-dlp's `%(ext)s` template and mark it
+/// as in-flight so a task queued for the same media cannot write to the same
+/// `.part`/output while this one is still running.
+fn claim_ytdlp_stem(state: &Arc<Mutex<AppState>>, save_dir: &std::path::Path, base: &str) -> String {
     let safe_base = std::path::Path::new(base)
         .file_name()
         .and_then(|s| s.to_str())
@@ -560,11 +943,45 @@ fn unique_ytdlp_stem(save_dir: &std::path::Path, base: &str) -> String {
         .to_string();
     let mut stem = safe_base.clone();
     let mut dup_index = 1;
-    while ytdlp_stem_has_output(save_dir, &stem) {
+    let mut state_lock = state.lock().unwrap_or_else(|error| error.into_inner());
+    loop {
+        let claimed = state_lock.active_stems.contains(&stem_key(save_dir, &stem));
+        // A finished file takes the name; a leftover `.part` does not, so that a
+        // restart/crash of the same media resumes instead of duplicating.
+        let taken = claimed || ytdlp_stem_has_output(save_dir, &stem);
+        if !taken {
+            state_lock.active_stems.insert(stem_key(save_dir, &stem));
+            return stem;
+        }
         stem = format!("{} ({})", safe_base, dup_index);
         dup_index += 1;
     }
-    stem
+}
+
+fn release_ytdlp_stem(state: &Arc<Mutex<AppState>>, save_dir: &std::path::Path, stem: &str) {
+    let mut state_lock = state.lock().unwrap_or_else(|error| error.into_inner());
+    state_lock.active_stems.remove(&stem_key(save_dir, &stem));
+}
+
+/// Delete everything yt-dlp owns for a stem, including resumable `.part` files.
+fn remove_ytdlp_outputs(save_dir: &std::path::Path, stem: &str) {
+    for path in ytdlp_stem_outputs(save_dir, stem) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Delete intermediates but keep `.part` files so the next attempt resumes.
+fn remove_ytdlp_intermediates(save_dir: &std::path::Path, stem: &str) {
+    for path in ytdlp_stem_outputs(save_dir, stem) {
+        let is_part = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| name.ends_with(".part"))
+            .unwrap_or(false);
+        if !is_part {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 fn resolve_ytdlp_output(save_dir: &std::path::Path, stem: &str) -> Option<PathBuf> {
@@ -579,27 +996,21 @@ fn resolve_ytdlp_output(save_dir: &std::path::Path, stem: &str) -> Option<PathBu
         })
 }
 
-fn remove_ytdlp_outputs(save_dir: &std::path::Path, stem: &str) {
-    let prefix = format!("{}.", stem);
-    if let Ok(entries) = std::fs::read_dir(save_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            // Final file (stem.ext) or yt-dlp intermediates (stem.f137.mp4, etc.).
-            if name == stem || name.starts_with(&prefix) {
-                let _ = std::fs::remove_file(&path);
-            }
-        }
-    }
-}
-
 fn resolve_ytdlp_path(app_handle: &tauri::AppHandle) -> Option<PathBuf> {
     // Absolute paths only. A bare "yt-dlp" would be resolved through $PATH by Command::new,
     // letting a same-named binary earlier in PATH hijack the download — and with it the
     // --cookies-from-browser argument, which can read and decrypt the user's browser cookies.
+    //
+    // A runtime-updated engine in the app data directory wins over the bundled one: it is
+    // newer (site fixes land there first) and the bundle keeps working as the offline fallback.
+    let updated = app_handle
+        .path()
+        .app_data_dir()
+        .ok()
+        .map(|dir| engine_update::updated_binary_path(&dir))
+        .filter(|path| path.exists());
     [
+        updated,
         app_handle.path().resolve("binaries/yt-dlp", BaseDirectory::Resource).ok(),
         Some(PathBuf::from("src-tauri/binaries/yt-dlp")),
         Some(PathBuf::from("/opt/homebrew/bin/yt-dlp")),
@@ -608,6 +1019,129 @@ fn resolve_ytdlp_path(app_handle: &tauri::AppHandle) -> Option<PathBuf> {
     .into_iter()
     .flatten()
     .find(|path| path.exists())
+}
+
+/// Everything about a request that decides which bytes land on disk. Two tasks
+/// with the same stem but a different fingerprint must not share `.part` data:
+/// yt-dlp would resume the new format against the old stream's bytes and
+/// silently produce a corrupt file.
+fn ytdlp_request_fingerprint(format: &str, settings: &Settings, is_youtube: bool) -> String {
+    let merge = if settings.download_mode != "video" {
+        "-"
+    } else if is_youtube {
+        "mp4/mkv/webm"
+    } else {
+        "mp4"
+    };
+    format!(
+        "v1|{}|{}|{}|{}",
+        format,
+        settings.download_mode,
+        merge,
+        settings.video_quality,
+    )
+}
+
+fn resume_marker_path(save_dir: &std::path::Path, stem: &str) -> PathBuf {
+    save_dir.join(format!("{}.cobalt-resume", stem))
+}
+
+fn resume_marker_matches(save_dir: &std::path::Path, stem: &str, fingerprint: &str) -> bool {
+    std::fs::read_to_string(resume_marker_path(save_dir, stem))
+        .map(|stored| stored.trim() == fingerprint)
+        .unwrap_or(false)
+}
+
+fn write_resume_marker(save_dir: &std::path::Path, stem: &str, fingerprint: &str) {
+    let _ = std::fs::write(resume_marker_path(save_dir, stem), fingerprint);
+}
+
+fn remove_resume_marker(save_dir: &std::path::Path, stem: &str) {
+    let _ = std::fs::remove_file(resume_marker_path(save_dir, stem));
+}
+
+/// Drop only the resumable fragments (`*.part`) of a stem.
+fn remove_ytdlp_partial_files(save_dir: &std::path::Path, stem: &str) {
+    for path in ytdlp_stem_outputs(save_dir, stem) {
+        let is_part = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| name.ends_with(".part"))
+            .unwrap_or(false);
+        if is_part {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// Delete everything a cancelled/failed task leaves behind (final file, `.part`
+/// fragments, sidecars). Completed tasks keep their output.
+fn remove_task_partial_files(task: &DownloadTask) {
+    if task.status == "completed" || task.kind == "gallery" {
+        return;
+    }
+    let Some(output_path) = task.output_path.as_ref() else {
+        return;
+    };
+    let path = Path::new(output_path);
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return;
+    };
+    // `<title>.mp4.part` for a progressive download…
+    let _ = std::fs::remove_file(parent.join(format!("{}.part", file_name)));
+    // …and every `<stem>.*` fragment/sidecar of a merged DASH download.
+    if let Some((stem, _)) = file_name.rsplit_once('.') {
+        remove_ytdlp_outputs(parent, stem);
+    }
+}
+
+/// Post a system notification for a finished task (opt-out in settings).
+fn notify_task_finished(
+    app_handle: &tauri::AppHandle,
+    settings: &Settings,
+    task: &DownloadTask,
+) {
+    if !settings.notify_on_finish {
+        return;
+    }
+    use tauri_plugin_notification::NotificationExt;
+    let (title, body) = match task.status.as_str() {
+        "completed" => (
+            "Cobalt".to_string(),
+            if task.kind == "gallery" {
+                format!(
+                    "{} · {} {}",
+                    task.title,
+                    task.items_total,
+                    if task.items_total == 1 { "image" } else { "images" }
+                )
+            } else {
+                task.title.clone()
+            },
+        ),
+        "failed" => (
+            "Cobalt".to_string(),
+            format!(
+                "{} — {}",
+                task.title,
+                task.error.clone().unwrap_or_else(|| "Download failed".to_string())
+            ),
+        ),
+        _ => return,
+    };
+    if let Err(error) = app_handle
+        .notification()
+        .builder()
+        .title(title)
+        .body(body)
+        .show()
+    {
+        // A missing/denied notification permission must never fail a download.
+        eprintln!("Could not post the completion notification: {error}");
+    }
 }
 
 fn resolve_node_path(app_handle: &tauri::AppHandle) -> Option<PathBuf> {
@@ -885,16 +1419,26 @@ async fn try_local_ytdlp_download(
         }
     }
     let audio_format = ytdlp_audio_format(settings);
+    let playlist_index = {
+        let state_lock = state.lock().unwrap_or_else(|error| error.into_inner());
+        state_lock
+            .tasks
+            .get(&id)
+            .and_then(|task| task.playlist_index)
+    };
     let save_path = PathBuf::from(&settings.save_path);
     if !save_path.exists() {
         std::fs::create_dir_all(&save_path).ok();
     }
 
     // Use yt-dlp's %(ext)s so best-quality AV1/VP9 merges can land as mkv/webm, not forced .mp4.
-    let output_stem = unique_ytdlp_stem(
-        &save_path,
-        &format!("{}_{}", source_prefix, video_id),
-    );
+    // An episode of a playlist keeps its position in the name so sibling episodes never
+    // collide, and so re-queuing the same episode resumes its `.part` file.
+    let stem_base = match playlist_index {
+        Some(index) => format!("{}_{}_{}", source_prefix, index, video_id),
+        None => format!("{}_{}", source_prefix, video_id),
+    };
+    let output_stem = claim_ytdlp_stem(state, &save_path, &stem_base);
     let output_template = save_path.join(format!("{}.%(ext)s", output_stem));
     let provisional_filename = if settings.download_mode == "audio" {
         format!("{}.{}", output_stem, audio_format)
@@ -909,7 +1453,11 @@ async fn try_local_ytdlp_download(
         if let Some(task) = state_lock.tasks.get_mut(&id) {
             // A cancel that lands while we were still resolving has no sender to reach yet, so
             // bail before resurrecting the task as "downloading".
-            if task.status == "cancelled" { return Ok(true) }
+            if task.status == "cancelled" {
+                drop(state_lock);
+                release_ytdlp_stem(state, &save_path, &output_stem);
+                return Ok(true);
+            }
             task.title = provisional_filename.clone();
             task.status = "downloading".to_string();
             task.output_path = Some(provisional_path.to_string_lossy().into_owned());
@@ -929,11 +1477,20 @@ async fn try_local_ytdlp_download(
     let Some(ytdlp_path) = resolve_ytdlp_path(app_handle) else {
         // No local yt-dlp: fall through to the remote service rather than half-working.
         println!("No local yt-dlp binary found, falling back to the remote service");
+        release_ytdlp_stem(state, &save_path, &output_stem);
         return Ok(false);
     };
     let node_path = resolve_node_path(app_handle);
     let ffmpeg_path = resolve_ffmpeg_path(app_handle);
     let format = ytdlp_format(settings);
+    // A `.part` written for another format selector would be resumed against the
+    // wrong stream and silently corrupt the file, so only keep it when it
+    // belongs to the very same request.
+    let fingerprint = ytdlp_request_fingerprint(&format, settings, is_youtube);
+    if !resume_marker_matches(&save_path, &output_stem, &fingerprint) {
+        remove_ytdlp_partial_files(&save_path, &output_stem);
+    }
+    write_resume_marker(&save_path, &output_stem, &fingerprint);
     let cookie_attempts: Vec<Option<String>> = if is_youtube {
         let mut sources = vec![None];
         sources.extend(chrome_cookie_sources().into_iter().map(Some));
@@ -952,12 +1509,12 @@ async fn try_local_ytdlp_download(
     let mut last_error = String::from("Local yt-dlp download failed");
 
     for browser in cookie_attempts {
-        remove_ytdlp_outputs(&save_path, &output_stem);
+        // Intermediates from an earlier attempt are stale, but a `.part` file is
+        // exactly what resume is for — keep it.
+        remove_ytdlp_intermediates(&save_path, &output_stem);
 
         let mut cmd = TokioCommand::new(&ytdlp_path);
-        cmd.arg("--no-playlist")
-            .arg("--newline")
-            .arg("--no-part")
+        cmd.arg("--newline")
             .arg("-f")
             .arg(&format)
             .arg("-o")
@@ -965,6 +1522,41 @@ async fn try_local_ytdlp_download(
             .arg(url)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+
+        // One entry of a playlist/collection: never expand to the whole set
+        // here, the picker already split it into per-episode tasks.
+        match playlist_index {
+            Some(index) => {
+                cmd.arg("--playlist-items").arg(index.to_string());
+            }
+            None => {
+                cmd.arg("--no-playlist");
+            }
+        }
+
+        // --- "fast, stable, resumable" bundle ----------------------------
+        // `.part` + `--continue` (yt-dlp defaults, stated explicitly so a
+        // future default change cannot silently reintroduce restart-from-zero).
+        if settings.resume_partial_downloads {
+            cmd.arg("-c").arg("--part");
+        } else {
+            cmd.arg("--no-continue").arg("--no-part");
+        }
+        // Retry counts are yt-dlp defaults; the exponential backoff is not.
+        cmd.arg("--retries")
+            .arg("10")
+            .arg("--fragment-retries")
+            .arg("10")
+            .arg("--retry-sleep")
+            .arg("http:exp=1:20")
+            .arg("--retry-sleep")
+            .arg("fragment:exp=1:20");
+        // Fetch DASH/HLS fragments in parallel ("turbo"). Fragmented downloads
+        // are the only place yt-dlp can use more than one connection.
+        let fragments = settings.concurrent_fragments.clamp(1, 16);
+        if fragments > 1 {
+            cmd.arg("-N").arg(fragments.to_string());
+        }
 
         if is_youtube {
             // Use yt-dlp defaults (android_vr etc.) so adaptive 720p–4K streams are available.
@@ -991,9 +1583,44 @@ async fn try_local_ytdlp_download(
                 .arg("0");
         }
 
+        // Subtitles / metadata embedding.
+        let embed_subtitles = settings.download_subtitles
+            && settings.embed_subtitles
+            && settings.download_mode == "video"
+            && ffmpeg_path.is_some();
+        if settings.download_subtitles {
+            let langs = settings.subtitle_langs.trim();
+            if !langs.is_empty() {
+                cmd.arg("--write-subs")
+                    .arg("--write-auto-subs")
+                    .arg("--sub-langs")
+                    .arg(langs);
+                // Converting VTT/TTML to srt (and embedding into the container)
+                // needs ffmpeg. Missing subtitles are only a warning for
+                // yt-dlp, so a language with no transcript never fails a
+                // download.
+                if ffmpeg_path.is_some() {
+                    cmd.arg("--convert-subs").arg("srt");
+                    if embed_subtitles {
+                        cmd.arg("--embed-subs");
+                    }
+                }
+            }
+        }
+        if settings.download_mode == "video" {
+            if settings.embed_metadata {
+                cmd.arg("--embed-metadata").arg("--embed-chapters");
+            }
+            if settings.embed_thumbnail {
+                cmd.arg("--embed-thumbnail");
+            }
+        }
+
         if let Some(ffmpeg_path) = &ffmpeg_path {
-            cmd.arg("--ffmpeg-location")
-                .arg(ffmpeg_path);
+            if ffmpeg_path.exists() {
+                cmd.arg("--ffmpeg-location")
+                    .arg(ffmpeg_path);
+            }
         }
 
         if let Some(node_path) = &node_path {
@@ -1005,9 +1632,9 @@ async fn try_local_ytdlp_download(
             cmd.arg("--cookies-from-browser").arg(browser);
         }
 
-        if settings.proxy_enabled && !settings.proxy_url.trim().is_empty() {
-            cmd.env("HTTP_PROXY", settings.proxy_url.trim());
-            cmd.env("HTTPS_PROXY", settings.proxy_url.trim());
+        if let Some(proxy) = settings.proxy_url() {
+            cmd.env("HTTP_PROXY", proxy);
+            cmd.env("HTTPS_PROXY", proxy);
         }
 
         let mut child = cmd.spawn()
@@ -1102,7 +1729,9 @@ async fn try_local_ytdlp_download(
                 if let Some(handle) = progress_task {
                     handle.abort();
                 }
-                remove_ytdlp_outputs(&save_path, &output_stem);
+                // Keep every `.part` file: a cancelled download resumes instead of
+                // starting over. Delete/Clear removes them explicitly.
+                release_ytdlp_stem(state, &save_path, &output_stem);
                 return Ok(true);
             }
         };
@@ -1123,8 +1752,21 @@ async fn try_local_ytdlp_download(
                             .and_then(|n| n.to_str())
                             .unwrap_or(&provisional_filename)
                             .to_string();
+                        // Subtitles that were embedded into the container must
+                        // not be left next to the file; a sidecar the user asked
+                        // for (audio mode, or embedding unavailable) stays.
+                        if embed_subtitles {
+                            for path in ytdlp_side_outputs(&save_path, &output_stem) {
+                                let _ = std::fs::remove_file(path);
+                            }
+                        }
+                        remove_resume_marker(&save_path, &output_stem);
+                        {
+                            let mut state_lock = state.lock().unwrap_or_else(|error| error.into_inner());
+                            state_lock.cancellations.remove(&id);
+                        }
+                        release_ytdlp_stem(state, &save_path, &output_stem);
                         let mut state_lock = state.lock().unwrap_or_else(|error| error.into_inner());
-                        state_lock.cancellations.remove(&id);
                         if let Some(task) = state_lock.tasks.get_mut(&id) {
                             task.title = final_name;
                             task.output_path = Some(final_path.to_string_lossy().into_owned());
@@ -1134,8 +1776,12 @@ async fn try_local_ytdlp_download(
                             task.total_bytes = downloaded_bytes;
                             task.speed = "0 B/s".to_string();
                             task.eta = "Done".to_string();
-                            let _ = app_handle.emit("task-updated", task.clone());
+                            let updated_task = task.clone();
+                            let settings = state_lock.settings.clone();
+                            let _ = app_handle.emit("task-updated", updated_task.clone());
                             save_tasks(&state_lock.tasks, &state_lock.tasks_path);
+                            drop(state_lock);
+                            notify_task_finished(app_handle, &settings, &updated_task);
                         }
                         return Ok(true);
                     }
@@ -1152,7 +1798,9 @@ async fn try_local_ytdlp_download(
         }
     }
 
-    remove_ytdlp_outputs(&save_path, &output_stem);
+    // Keep resumable `.part` files; drop everything else this attempt produced.
+    remove_ytdlp_intermediates(&save_path, &output_stem);
+    release_ytdlp_stem(state, &save_path, &output_stem);
     {
         let mut state_lock = state.lock().unwrap_or_else(|error| error.into_inner());
         state_lock.cancellations.remove(&id);
@@ -1548,7 +2196,7 @@ async fn try_local_gallery_download(
             }
             let mut lock = state.lock().unwrap_or_else(|error| error.into_inner());
             lock.cancellations.remove(&id);
-            if let Some(task) = lock.tasks.get_mut(&id) {
+            let (updated_task, settings) = if let Some(task) = lock.tasks.get_mut(&id) {
                 task.items_done = file_count;
                 task.items_total = task.items_total.max(file_count);
                 task.status = "completed".to_string();
@@ -1557,8 +2205,17 @@ async fn try_local_gallery_download(
                 task.total_bytes = total_bytes;
                 task.speed = "0 B/s".to_string();
                 task.eta = "Done".to_string();
+                (Some(task.clone()), Some(lock.settings.clone()))
+            } else {
+                (None, None)
+            };
+            if let Some(task) = updated_task {
                 let _ = app_handle.emit("task-updated", task.clone());
                 save_tasks(&lock.tasks, &lock.tasks_path);
+                drop(lock);
+                if let Some(settings) = settings {
+                    notify_task_finished(&app_handle, &settings, &task);
+                }
             }
             Ok(true)
         }
@@ -1791,6 +2448,30 @@ async fn run_download_task(id: String, state: Arc<Mutex<AppState>>, app_handle: 
         } else {
             "Dailymotion"
         };
+
+        // Playlists / collections / multi-part videos: ask which episodes to
+        // keep instead of silently downloading only the first one.
+        if settings.playlist_prompt {
+            if let Some(ytdlp_path) = resolve_ytdlp_path(&app_handle) {
+                let node_path = resolve_node_path(&app_handle);
+                if let Some(probe) = probe_ytdlp_playlist(
+                    &ytdlp_path,
+                    node_path.as_deref(),
+                    &url_to_download,
+                    settings.proxy_url(),
+                )
+                .await
+                {
+                    println!(
+                        "{}: '{}' expands to {} episodes; asking which to keep",
+                        local_source_name, probe.title, probe.count
+                    );
+                    resolve_playlist_selection(id, probe, &state, &app_handle).await;
+                    return;
+                }
+            }
+        }
+
         match try_local_ytdlp_download(
             id.clone(),
             &url_to_download,
@@ -2143,18 +2824,26 @@ async fn run_download_task(id: String, state: Arc<Mutex<AppState>>, app_handle: 
     {
         let mut state_lock = state.lock().unwrap_or_else(|error| error.into_inner());
         state_lock.cancellations.remove(&id);
-        if let Some(task) = state_lock.tasks.get_mut(&id) {
+        let (updated_task, settings) = if let Some(task) = state_lock.tasks.get_mut(&id) {
             task.status = "completed".to_string();
             task.progress = 1.0;
             task.downloaded_bytes = downloaded_bytes;
             task.speed = "0 B/s".to_string();
             task.eta = "Done".to_string();
-            let updated_task = task.clone();
-            let _ = app_handle.emit("task-updated", updated_task);
+            (Some(task.clone()), Some(state_lock.settings.clone()))
+        } else {
+            (None, None)
+        };
+        if let Some(task) = updated_task {
+            let _ = app_handle.emit("task-updated", task.clone());
             save_tasks(&state_lock.tasks, &state_lock.tasks_path);
+            drop(state_lock);
+            if let Some(settings) = settings {
+                notify_task_finished(&app_handle, &settings, &task);
+            }
         }
     }
-    
+
     process_queue(state, app_handle);
 }
 
@@ -2186,7 +2875,9 @@ async fn download_direct_stream(id: String, descriptor: DirectMediaDescriptor, s
     if let Some(decode_key) = descriptor.decode_key.as_deref() {
         if let Err(error) = decode_wechat_file(&output_path, decode_key) { let _ = std::fs::remove_file(&output_path); update_task_failed(id, format!("WeChat media decryption failed: {error}"), &state, &app_handle); return; }
     }
-    let mut lock = state.lock().unwrap_or_else(|error| error.into_inner()); lock.cancellations.remove(&id); if let Some(task) = lock.tasks.get_mut(&id) { task.status="completed".into(); task.progress=1.0; task.downloaded_bytes=downloaded; task.eta="Done".into(); let _ = app_handle.emit("task-updated", task.clone()); save_tasks(&lock.tasks, &lock.tasks_path); } drop(lock); process_queue(state, app_handle);
+    let (updated_task, settings) = { let mut lock = state.lock().unwrap_or_else(|error| error.into_inner()); lock.cancellations.remove(&id); let result = if let Some(task) = lock.tasks.get_mut(&id) { task.status="completed".into(); task.progress=1.0; task.downloaded_bytes=downloaded; task.eta="Done".into(); (Some(task.clone()), lock.settings.clone()) } else { (None, lock.settings.clone()) }; save_tasks(&lock.tasks, &lock.tasks_path); result };
+    if let Some(task) = updated_task { let _ = app_handle.emit("task-updated", task.clone()); notify_task_finished(&app_handle, &settings, &task); }
+    process_queue(state, app_handle);
 }
 
 fn decode_wechat_file(path: &std::path::Path, encoded_key: &str) -> Result<(), String> {
@@ -2286,17 +2977,25 @@ fn decode_wechat_isaac64(path: &std::path::Path, seed: u64) -> Result<(), String
 }
 
 fn update_task_failed(id: String, error_msg: String, state: &Arc<Mutex<AppState>>, app_handle: &tauri::AppHandle) {
-    let mut state_lock = state.lock().unwrap_or_else(|error| error.into_inner());
-    state_lock.cancellations.remove(&id);
-    if let Some(task) = state_lock.tasks.get_mut(&id) {
-        task.status = "failed".to_string();
-        task.error = Some(error_msg);
-        let updated_task = task.clone();
-        let _ = app_handle.emit("task-updated", updated_task);
-        save_tasks(&state_lock.tasks, &state_lock.tasks_path);
+    let (updated_task, settings) = {
+        let mut state_lock = state.lock().unwrap_or_else(|error| error.into_inner());
+        state_lock.cancellations.remove(&id);
+        let updated = state_lock.tasks.get_mut(&id).map(|task| {
+            task.status = "failed".to_string();
+            task.error = Some(error_msg);
+            task.clone()
+        });
+        (updated, state_lock.settings.clone())
+    };
+    if let Some(task) = updated_task {
+        let _ = app_handle.emit("task-updated", task.clone());
+        {
+            let state_lock = state.lock().unwrap_or_else(|error| error.into_inner());
+            save_tasks(&state_lock.tasks, &state_lock.tasks_path);
+        }
+        notify_task_finished(&app_handle, &settings, &task);
     }
-    drop(state_lock);
-    
+
     process_queue(state.clone(), app_handle.clone());
 }
 
@@ -2414,13 +3113,19 @@ fn delete_task(id: String, state: tauri::State<'_, Arc<Mutex<AppState>>>, app_ha
     if let Some(tx) = state_lock.cancellations.remove(&id) {
         let _ = tx.send(());
     }
-    
+    // A pending playlist picker must not keep waiting for a decision about a
+    // task that no longer exists.
+    state_lock.playlist_decisions.remove(&id);
+
     let task = state_lock.tasks.remove(&id);
     if let Some(t) = task {
         if vec!["downloading", "analyzing", "queued", "merging"].contains(&t.status.as_str()) {
             if let Some(ref path) = t.output_path {
                 let _ = std::fs::remove_file(path);
             }
+            // Resumable partials are useful while a task lives, but not once
+            // the user threw it away.
+            remove_task_partial_files(&t);
         }
         save_tasks(&state_lock.tasks, &state_lock.tasks_path);
         drop(state_lock);
@@ -2432,20 +3137,37 @@ fn delete_task(id: String, state: tauri::State<'_, Arc<Mutex<AppState>>>, app_ha
 
 #[tauri::command]
 fn clear_completed(state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Vec<DownloadTask> {
-    let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
-    state.tasks.retain(|_, task| !vec!["completed", "cancelled", "failed"].contains(&task.status.as_str()));
-    save_tasks(&state.tasks, &state.tasks_path);
-    state.tasks.values().cloned().collect()
+    let removed: Vec<DownloadTask> = {
+        let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
+        let removed: Vec<DownloadTask> = state
+            .tasks
+            .values()
+            .filter(|task| ["cancelled", "failed"].contains(&task.status.as_str()))
+            .cloned()
+            .collect();
+        state.tasks.retain(|_, task| !["completed", "cancelled", "failed"].contains(&task.status.as_str()));
+        save_tasks(&state.tasks, &state.tasks_path);
+        removed
+    };
+    for task in &removed {
+        remove_task_partial_files(task);
+    }
+    state.lock().unwrap_or_else(|error| error.into_inner()).tasks.values().cloned().collect()
 }
 
-#[tauri::command]
-fn download_url(url: String, state: tauri::State<'_, Arc<Mutex<AppState>>>, app_handle: tauri::AppHandle) -> DownloadTask {
+/// Create and queue a download task. Shared by the UI, the tray menu and
+/// `cobalt://` deep links so every entry point behaves identically.
+fn enqueue_download(
+    url: &str,
+    state: &Arc<Mutex<AppState>>,
+    app_handle: &tauri::AppHandle,
+) -> DownloadTask {
     let id = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos()
         .to_string();
-        
+
     let task = DownloadTask {
         id: id.clone(),
         url: url.trim().to_string(),
@@ -2462,18 +3184,25 @@ fn download_url(url: String, state: tauri::State<'_, Arc<Mutex<AppState>>>, app_
         engine: String::new(),
         items_total: 0,
         items_done: 0,
+        playlist_index: None,
+        playlist_count: None,
+        playlist_parent_id: None,
     };
-    
-    let mut state_lock = state.lock().unwrap_or_else(|error| error.into_inner());
-    state_lock.tasks.insert(id, task.clone());
-    save_tasks(&state_lock.tasks, &state_lock.tasks_path);
-    drop(state_lock);
-    
+
+    {
+        let mut state_lock = state.lock().unwrap_or_else(|error| error.into_inner());
+        state_lock.tasks.insert(id, task.clone());
+        save_tasks(&state_lock.tasks, &state_lock.tasks_path);
+    }
+
     let _ = app_handle.emit("task-updated", task.clone());
-    
-    process_queue(state.inner().clone(), app_handle);
-    
+    process_queue(state.clone(), app_handle.clone());
     task
+}
+
+#[tauri::command]
+fn download_url(url: String, state: tauri::State<'_, Arc<Mutex<AppState>>>, app_handle: tauri::AppHandle) -> DownloadTask {
+    enqueue_download(&url, state.inner(), &app_handle)
 }
 
 #[tauri::command]
@@ -2521,15 +3250,394 @@ fn restore_sniffer_system_proxy(sniffer_state: tauri::State<'_, Arc<Mutex<sniffe
 fn download_captured_resource(resource_id: String, sniffer_state: tauri::State<'_, Arc<Mutex<sniffer::SnifferState>>>, state: tauri::State<'_, Arc<Mutex<AppState>>>, app_handle: tauri::AppHandle) -> Result<DownloadTask, String> {
     let descriptor = sniffer::request_descriptor(sniffer_state.inner(), &resource_id)?;
     let id = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos().to_string();
-    let task = DownloadTask { id:id.clone(), url:format!("capture://{resource_id}"), title:descriptor.filename.clone(), status:"queued".into(), progress:0.0, speed:"0 B/s".into(), downloaded_bytes:0, total_bytes:0, eta:"--:--".into(), error:None, output_path:None, kind:"file".into(), engine:String::new(), items_total:0, items_done:0 };
+    let task = DownloadTask { id:id.clone(), url:format!("capture://{resource_id}"), title:descriptor.filename.clone(), status:"queued".into(), progress:0.0, speed:"0 B/s".into(), downloaded_bytes:0, total_bytes:0, eta:"--:--".into(), error:None, output_path:None, kind:"file".into(), engine:String::new(), items_total:0, items_done:0, playlist_index:None, playlist_count:None, playlist_parent_id:None };
     let mut lock = state.lock().unwrap_or_else(|error| error.into_inner()); lock.captured_downloads.insert(id.clone(), descriptor); lock.tasks.insert(id, task.clone()); save_tasks(&lock.tasks, &lock.tasks_path); drop(lock);
     let _ = app_handle.emit("task-updated", task.clone()); process_queue(state.inner().clone(), app_handle); Ok(task)
+}
+
+// -----------------------------------------------------------
+// Playlist episode picker
+// -----------------------------------------------------------
+
+/// Answer a pending playlist picker. An empty selection downloads every
+/// episode; otherwise only the listed 1-based indices are queued.
+#[tauri::command]
+fn resolve_playlist_choice(task_id: String, indices: Vec<u32>, state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Result<u32, String> {
+    let sender = {
+        let mut state_lock = state.lock().unwrap_or_else(|error| error.into_inner());
+        state_lock
+            .playlist_decisions
+            .remove(&task_id)
+            .ok_or_else(|| "This download is no longer waiting for a selection".to_string())?
+    };
+    let count = indices.len() as u32;
+    sender
+        .send(indices)
+        .map_err(|_| "The download that asked for a selection has already finished".to_string())?;
+    Ok(count)
+}
+
+// -----------------------------------------------------------
+// Engine management (yt-dlp self-update)
+// -----------------------------------------------------------
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct EngineInfo {
+    /// Version of the yt-dlp binary that downloads will actually use.
+    version: Option<String>,
+    /// "updated" (runtime download), "bundled" (shipped with the app) or "missing".
+    source: String,
+    /// Version of the engine that ships with the app bundle.
+    bundled_version: Option<String>,
+    /// Latest published release, when it has been looked up.
+    latest: Option<String>,
+    auto_update: bool,
+    updated_at: Option<u64>,
+    updated_version: Option<String>,
+    last_error: Option<String>,
+    just_updated: bool,
+}
+
+/// Bundled engine path only (never the runtime-updated one) so the UI can
+/// report which copy is in play.
+fn bundled_ytdlp_path(app_handle: &tauri::AppHandle) -> Option<PathBuf> {
+    [
+        app_handle.path().resolve("binaries/yt-dlp", BaseDirectory::Resource).ok(),
+        Some(PathBuf::from("src-tauri/binaries/yt-dlp")),
+        Some(PathBuf::from("/opt/homebrew/bin/yt-dlp")),
+        Some(PathBuf::from("/usr/local/bin/yt-dlp")),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|path| path.exists())
+}
+
+fn engine_info(app_handle: &tauri::AppHandle, settings: &Settings, last_error: Option<String>) -> EngineInfo {
+    let updated = app_handle
+        .path()
+        .app_data_dir()
+        .ok()
+        .map(|dir| engine_update::updated_binary_path(&dir))
+        .filter(|path| path.exists());
+    let (active, source) = match &updated {
+        Some(path) => (Some(path.clone()), "updated".to_string()),
+        None => match bundled_ytdlp_path(app_handle) {
+            Some(path) => (Some(path), "bundled".to_string()),
+            None => (None, "missing".to_string()),
+        },
+    };
+    let bundled_version = bundled_ytdlp_path(app_handle)
+        .as_deref()
+        .and_then(engine_update::installed_version);
+    EngineInfo {
+        version: active.as_deref().and_then(engine_update::installed_version),
+        source,
+        bundled_version,
+        latest: None,
+        auto_update: settings.ytdlp_auto_update,
+        updated_at: settings.ytdlp_updated_at,
+        updated_version: settings.ytdlp_updated_version.clone(),
+        last_error,
+        just_updated: false,
+    }
+}
+
+#[tauri::command]
+fn get_engine_info(app_handle: tauri::AppHandle, state: tauri::State<'_, Arc<Mutex<AppState>>>) -> EngineInfo {
+    let state_lock = state.lock().unwrap_or_else(|error| error.into_inner());
+    engine_info(&app_handle, &state_lock.settings, None)
+}
+
+#[tauri::command]
+async fn update_ytdlp_engine(
+    app_handle: tauri::AppHandle,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<EngineInfo, String> {
+    let (settings, app_data_dir) = {
+        let state_lock = state.lock().unwrap_or_else(|error| error.into_inner());
+        (
+            state_lock.settings.clone(),
+            app_handle
+                .path()
+                .app_data_dir()
+                .map_err(|error| format!("Could not locate the app data directory: {error}"))?,
+        )
+    };
+
+    let latest = engine_update::latest_version(settings.proxy_url()).await?;
+    let current_version = resolve_ytdlp_path(&app_handle)
+        .as_deref()
+        .and_then(engine_update::installed_version);
+    let up_to_date = current_version
+        .as_deref()
+        .map(|version| version.eq_ignore_ascii_case(latest.trim()))
+        .unwrap_or(false);
+    let just_updated = !up_to_date;
+    if just_updated {
+        let installed =
+            engine_update::download_version(&app_data_dir, latest.trim(), settings.proxy_url()).await?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        {
+            let mut state_lock = state.lock().unwrap_or_else(|error| error.into_inner());
+            state_lock.settings.ytdlp_updated_version = Some(installed.clone());
+            state_lock.settings.ytdlp_updated_at = Some(now);
+            let _ = write_atomic(
+                &state_lock.settings_path,
+                &serde_json::to_string_pretty(&state_lock.settings).unwrap(),
+            );
+        }
+        let _ = app_handle.emit("engine-updated", installed);
+    }
+
+    let mut info = {
+        let state_lock = state.lock().unwrap_or_else(|error| error.into_inner());
+        engine_info(&app_handle, &state_lock.settings, None)
+    };
+    info.latest = Some(latest);
+    info.just_updated = just_updated;
+    Ok(info)
+}
+
+// -----------------------------------------------------------
+// Window / deep link helpers
+// -----------------------------------------------------------
+
+/// Bring the main window to the front (tray icon, deep links, notifications).
+#[tauri::command]
+fn show_main_window(app_handle: tauri::AppHandle) -> bool {
+    if let Some(window) = app_handle.get_webview_window("main") {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+        true
+    } else {
+        false
+    }
+}
+
+/// Menu-bar entry points: show the window, download whatever link is on the
+/// clipboard, and quit. The status item is also what lets Cobalt stay reachable
+/// when every window is closed.
+fn build_tray(app_handle: &tauri::AppHandle) -> tauri::Result<()> {
+    use tauri::menu::{MenuBuilder, MenuItem, PredefinedMenuItem};
+    use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+
+    let show_item = MenuItem::with_id(app_handle, "show", "Show Cobalt", true, None::<&str>)?;
+    let clipboard_item = MenuItem::with_id(
+        app_handle,
+        "clipboard",
+        "Download Clipboard Link",
+        true,
+        None::<&str>,
+    )?;
+    let quit_item = MenuItem::with_id(app_handle, "quit", "Quit Cobalt", true, None::<&str>)?;
+    let separator = PredefinedMenuItem::separator(app_handle)?;
+    let menu = MenuBuilder::new(app_handle)
+        .items(&[&show_item, &clipboard_item, &separator, &quit_item])
+        .build()?;
+
+    let _tray = TrayIconBuilder::new()        .icon(
+            app_handle
+                .default_window_icon()
+                .cloned()
+                .ok_or_else(|| std::io::Error::other("Cobalt has no window icon to reuse for the tray icon"))?,
+        )
+        // The app icon is a full-colour logo, not a monochrome template, so it
+        // must not be marked as one.
+        .tooltip("Cobalt")
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(move |app_handle, event| match event.id().as_ref() {
+            "show" => {
+                if let Some(window) = app_handle.get_webview_window("main") {
+                    let _ = window.unminimize();
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                }
+            }
+            "clipboard" => {
+                if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                    if let Ok(text) = clipboard.get_text() {
+                        if let Some(url) = first_http_url(&text) {
+                            let app_state = app_handle.state::<Arc<Mutex<AppState>>>().inner().clone();
+                            let _ = enqueue_download(&url, &app_state, app_handle);
+                            return;
+                        }
+                    }
+                }
+                let _ = app_handle.emit("tray-no-link", ());
+            }
+            "quit" => app_handle.exit(0),
+            _ => {}
+        })
+        .on_tray_icon_event(move |tray, event| {
+            // Left click reveals the window instead of the menu.
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                let app_handle = tray.app_handle();
+                if let Some(window) = app_handle.get_webview_window("main") {
+                    let _ = window.unminimize();
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                }
+            }
+        })
+        .build(app_handle)?;
+    // The tray icon must outlive this function: dropping the handle removes it
+    // from the menu bar, so hand it to the app's state manager.
+    app_handle.manage(_tray);
+    Ok(())
+}
+
+/// First `http(s)` link in a blob of text (clipboard contents).
+fn first_http_url(text: &str) -> Option<String> {
+    text.split_whitespace()
+        .map(|token| token.trim_matches(|c: char| c.is_whitespace() || "\"'<>,;".contains(c)))
+        .find(|token| token.starts_with("http://") || token.starts_with("https://"))
+        .map(|token| token.trim_end_matches(['.', ')', ']', '"', '\'']).to_string())
+        .filter(|token| !token.is_empty())
+}
+
+/// Accept `cobalt://download?url=<encoded>` (browsers, Shortcuts, Alfred) and
+/// re-emit a plain event the webview can act on.
+fn register_deep_link(app_handle: &tauri::AppHandle) {
+    use tauri::Listener;
+    let handle = app_handle.clone();
+    app_handle.listen("deep-link://new-url", move |event| {
+        let payload = event.payload();
+        let urls: Vec<String> = serde_json::from_str::<Vec<String>>(payload).unwrap_or_default();
+        let mut handled = false;
+        for url in urls {
+            let Some(target) = deep_link_target_url(&url) else {
+                continue;
+            };
+            let app_state = handle.state::<Arc<Mutex<AppState>>>().inner().clone();
+            let _ = enqueue_download(&target, &app_state, &handle);
+            handled = true;
+        }
+        if handled {
+            if let Some(window) = handle.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }
+    });
+}
+
+fn deep_link_target_url(raw: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(raw).ok()?;
+    match parsed.scheme() {
+        "http" | "https" => Some(parsed.to_string()),
+        _ => {
+            let target = parsed
+                .query_pairs()
+                .find(|(key, _)| key == "url")
+                .map(|(_, value)| value.into_owned())?;
+            if target.starts_with("http://") || target.starts_with("https://") {
+                Some(target)
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Refresh the bundled yt-dlp engine in the background, at most once a day.
+///
+/// Site changes are fixed by yt-dlp releases, not by app releases; without
+/// this the engine goes stale between versions and "everything stops working".
+fn spawn_engine_auto_update(app_handle: &tauri::AppHandle, state: &Arc<Mutex<AppState>>) {
+    use std::time::Duration;
+
+    // Never compete with the first paint.
+    let app_handle = app_handle.clone();
+    let state = state.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(8)).await;
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let (enabled, last_check, proxy, data_dir) = {
+            let state_lock = state.lock().unwrap_or_else(|error| error.into_inner());
+            (
+                state_lock.settings.ytdlp_auto_update,
+                state_lock.settings.ytdlp_checked_at,
+                state_lock.settings.proxy_url().map(str::to_string),
+                app_handle.path().app_data_dir().ok(),
+            )
+        };
+        if !enabled {
+            return;
+        }
+        if let Some(last) = last_check {
+            if now < last + 24 * 60 * 60 {
+                return;
+            }
+        }
+        if resolve_ytdlp_path(&app_handle).is_none() {
+            return;
+        }
+        // Record the attempt first: an offline day must not re-check on every launch.
+        {
+            let mut state_lock = state.lock().unwrap_or_else(|error| error.into_inner());
+            state_lock.settings.ytdlp_checked_at = Some(now);
+            let _ = write_atomic(
+                &state_lock.settings_path,
+                &serde_json::to_string_pretty(&state_lock.settings).unwrap(),
+            );
+        }
+        let Some(data_dir) = data_dir else {
+            return;
+        };
+        let Ok(latest) = engine_update::latest_version(proxy.as_deref()).await else {
+            return;
+        };
+        let current = resolve_ytdlp_path(&app_handle)
+            .as_deref()
+            .and_then(engine_update::installed_version);
+        if current
+            .as_deref()
+            .map(|version| version.eq_ignore_ascii_case(latest.trim()))
+            .unwrap_or(false)
+        {
+            return;
+        }
+        match engine_update::download_version(&data_dir, latest.trim(), proxy.as_deref()).await {
+            Ok(version) => {
+                {
+                    let mut state_lock = state.lock().unwrap_or_else(|error| error.into_inner());
+                    state_lock.settings.ytdlp_updated_version = Some(version.clone());
+                    state_lock.settings.ytdlp_updated_at = Some(now);
+                    let _ = write_atomic(
+                        &state_lock.settings_path,
+                        &serde_json::to_string_pretty(&state_lock.settings).unwrap(),
+                    );
+                }
+                let _ = app_handle.emit("engine-updated", version);
+                println!("yt-dlp engine updated to {latest}");
+            }
+            Err(error) => eprintln!("yt-dlp engine auto-update failed: {error}"),
+        }
+    });
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_deep_link::init())
         .setup(|app| {
             let app_data_dir = app.path().app_data_dir().unwrap_or_else(|_| std::env::current_dir().unwrap());
             std::fs::create_dir_all(&app_data_dir).ok();
@@ -2607,6 +3715,8 @@ pub fn run() {
                 settings_path,
                 tasks_path,
                 captured_downloads: HashMap::new(),
+                playlist_decisions: HashMap::new(),
+                active_stems: HashSet::new(),
             }));
             
             app.manage(app_state.clone());
@@ -2621,6 +3731,10 @@ pub fn run() {
                 }
             }
             app.manage(sniffer_state);
+
+            build_tray(app.handle())?;
+            register_deep_link(app.handle());
+            spawn_engine_auto_update(app.handle(), &app_state);
             
             // Spawn background clipboard monitor
             let handle = app.handle().clone();
@@ -2671,7 +3785,11 @@ pub fn run() {
             install_sniffer_certificate,
             enable_sniffer_system_proxy,
             restore_sniffer_system_proxy,
-            download_captured_resource
+            download_captured_resource,
+            resolve_playlist_choice,
+            get_engine_info,
+            update_ytdlp_engine,
+            show_main_window
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -2698,9 +3816,144 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{api_request_url, decode_wechat_file, extractor_display_name, generic_video_id, is_ytdlp_probe_blocked, migrate_legacy_api_url, xor_wechat_isaac64_prefix, Isaac64, Settings};
+    use super::{api_request_url, decode_wechat_file, deep_link_target_url, extractor_display_name, first_http_url, generic_video_id, is_ytdlp_probe_blocked, migrate_legacy_api_url, remove_task_partial_files, xor_wechat_isaac64_prefix, AppState, DownloadTask, Isaac64, Settings};
+    use std::collections::{HashMap, HashSet};
     use std::path::PathBuf;
     use std::io::Write;
+
+    fn test_state() -> std::sync::Arc<std::sync::Mutex<AppState>> {
+        std::sync::Arc::new(std::sync::Mutex::new(AppState {
+            settings: Settings::default_with_download_dir(PathBuf::from("/tmp")),
+            tasks: HashMap::new(),
+            cancellations: HashMap::new(),
+            settings_path: PathBuf::from("/tmp/cobalt-test-settings.json"),
+            tasks_path: PathBuf::from("/tmp/cobalt-test-tasks.json"),
+            captured_downloads: HashMap::new(),
+            playlist_decisions: HashMap::new(),
+            active_stems: HashSet::new(),
+        }))
+    }
+
+    fn test_task(status: &str, output: Option<&str>) -> DownloadTask {
+        DownloadTask {
+            id: "task-1".to_string(),
+            url: "https://example.com/video/1".to_string(),
+            title: "Example".to_string(),
+            status: status.to_string(),
+            progress: 0.0,
+            speed: "0 B/s".to_string(),
+            downloaded_bytes: 0,
+            total_bytes: 0,
+            eta: "--:--".to_string(),
+            error: None,
+            output_path: output.map(str::to_string),
+            kind: "file".to_string(),
+            engine: String::new(),
+            items_total: 0,
+            items_done: 0,
+            playlist_index: None,
+            playlist_count: None,
+            playlist_parent_id: None,
+        }
+    }
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("cobalt-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn claimed_stems_are_exclusive_until_released() {
+        let state = test_state();
+        let dir = scratch_dir("stems");
+
+        let first = super::claim_ytdlp_stem(&state, &dir, "youtube_abc");
+        assert_eq!(first, "youtube_abc");
+        // A second task for the same media must not write into the first one's
+        // `.part` file / output.
+        let second = super::claim_ytdlp_stem(&state, &dir, "youtube_abc");
+        assert_eq!(second, "youtube_abc (1)");
+        let third = super::claim_ytdlp_stem(&state, &dir, "youtube_abc");
+        assert_eq!(third, "youtube_abc (2)");
+
+        super::release_ytdlp_stem(&state, &dir, &first);
+        // A finished file also keeps the name taken.
+        let _ = std::fs::write(dir.join("youtube_abc.mp4"), b"x").unwrap();
+        let re_claimed = super::claim_ytdlp_stem(&state, &dir, "youtube_abc");
+        assert_eq!(re_claimed, "youtube_abc (3)");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn partials_survive_a_cancel_but_not_a_delete() {
+        let dir = scratch_dir("partials");
+        let cancelled = test_task("cancelled", Some(&dir.join("youtube_abc.mp4").to_string_lossy().into_owned()));
+        // Progressive partial, DASH fragment partial and a subtitle sidecar.
+        let _ = std::fs::write(dir.join("youtube_abc.mp4.part"), b"0123456789").unwrap();
+        let _ = std::fs::write(dir.join("youtube_abc.f137.mp4.part"), b"0123456789").unwrap();
+        let _ = std::fs::write(dir.join("youtube_abc.en.srt"), b"1").unwrap();
+
+        remove_task_partial_files(&cancelled);
+        assert!(!dir.join("youtube_abc.mp4.part").exists());
+        assert!(!dir.join("youtube_abc.f137.mp4.part").exists());
+        assert!(!dir.join("youtube_abc.en.srt").exists());
+
+        // A completed task keeps everything it produced.
+        let _ = std::fs::write(dir.join("youtube_abc.mp4"), b"done").unwrap();
+        let _ = std::fs::write(dir.join("youtube_abc.en.srt"), b"1").unwrap();
+        remove_task_partial_files(&test_task(
+            "completed",
+            Some(&dir.join("youtube_abc.mp4").to_string_lossy().into_owned()),
+        ));
+        assert!(dir.join("youtube_abc.mp4").exists());
+        assert!(dir.join("youtube_abc.en.srt").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resume_markers_guard_against_a_changed_format() {
+        let dir = scratch_dir("resume");
+        let stem = "youtube_abc";
+        let settings = Settings::default_with_download_dir(dir.clone());
+        let format = super::ytdlp_format(&settings);
+        let fingerprint = super::ytdlp_request_fingerprint(&format, &settings, true);
+
+        assert!(!super::resume_marker_matches(&dir, stem, &fingerprint));
+        super::write_resume_marker(&dir, stem, &fingerprint);
+        assert!(super::resume_marker_matches(&dir, stem, &fingerprint));
+        // A different quality/format must not resume the old bytes.
+        assert!(!super::resume_marker_matches(&dir, stem, "v1|other|video|mp4|720"));
+
+        let _ = std::fs::write(dir.join(format!("{}.mp4.part", stem)), b"x").unwrap();
+        super::remove_ytdlp_partial_files(&dir, stem);
+        assert!(!dir.join(format!("{}.mp4.part", stem)).exists());
+        // The marker itself belongs to the stem's leftovers and goes with it.
+        super::remove_resume_marker(&dir, stem);
+        assert!(!super::resume_marker_matches(&dir, stem, &fingerprint));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deep_links_and_clipboard_text_yield_plain_urls() {
+        assert_eq!(
+            deep_link_target_url("cobalt://download?url=https%3A%2F%2Fexample.com%2Fa"),
+            Some("https://example.com/a".to_string())
+        );
+        assert_eq!(deep_link_target_url("https://example.com/a"), Some("https://example.com/a".to_string()));
+        assert_eq!(deep_link_target_url("cobalt://download"), None);
+        assert_eq!(deep_link_target_url("cobalt://download?url=ftp://example.com"), None);
+
+        assert_eq!(
+            first_http_url("  See https://example.com/a, and https://example.com/b "),
+            Some("https://example.com/a".to_string())
+        );
+        assert_eq!(first_http_url("no links here"), None);
+    }
 
     #[test]
     fn migrates_the_previous_default_api_url() {
