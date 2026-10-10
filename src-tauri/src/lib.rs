@@ -3206,8 +3206,13 @@ fn download_url(url: String, state: tauri::State<'_, Arc<Mutex<AppState>>>, app_
 }
 
 #[tauri::command]
-fn get_sniffer_state(sniffer_state: tauri::State<'_, Arc<Mutex<sniffer::SnifferState>>>) -> sniffer::SnifferViewState {
-    sniffer_state.lock().unwrap_or_else(|error| error.into_inner()).view()
+async fn get_sniffer_state(sniffer_state: tauri::State<'_, Arc<Mutex<sniffer::SnifferState>>>) -> Result<sniffer::SnifferViewState, String> {
+    let state = sniffer_state.inner().clone();
+    // view() checks system routes with netstat. Keep that subprocess and any
+    // wait for crash recovery away from the window's event loop.
+    tauri::async_runtime::spawn_blocking(move || {
+        state.lock().unwrap_or_else(|error| error.into_inner()).view()
+    }).await.map_err(|error| format!("Could not load resource capture state: {error}"))
 }
 
 #[tauri::command]
@@ -3313,7 +3318,7 @@ fn bundled_ytdlp_path(app_handle: &tauri::AppHandle) -> Option<PathBuf> {
     .find(|path| path.exists())
 }
 
-fn engine_info(app_handle: &tauri::AppHandle, settings: &Settings, last_error: Option<String>) -> EngineInfo {
+async fn engine_info(app_handle: &tauri::AppHandle, settings: &Settings, last_error: Option<String>) -> EngineInfo {
     let updated = app_handle
         .path()
         .app_data_dir()
@@ -3327,11 +3332,22 @@ fn engine_info(app_handle: &tauri::AppHandle, settings: &Settings, last_error: O
             None => (None, "missing".to_string()),
         },
     };
-    let bundled_version = bundled_ytdlp_path(app_handle)
-        .as_deref()
-        .and_then(engine_update::installed_version);
+    let bundled = bundled_ytdlp_path(app_handle);
+    let bundled_version = match bundled.as_deref() {
+        Some(path) => engine_update::installed_version(path).await,
+        None => None,
+    };
+    // The active copy is normally the bundled copy; probe it only once.
+    let version = if active == bundled {
+        bundled_version.clone()
+    } else {
+        match active.as_deref() {
+            Some(path) => engine_update::installed_version(path).await,
+            None => None,
+        }
+    };
     EngineInfo {
-        version: active.as_deref().and_then(engine_update::installed_version),
+        version,
         source,
         bundled_version,
         latest: None,
@@ -3344,9 +3360,9 @@ fn engine_info(app_handle: &tauri::AppHandle, settings: &Settings, last_error: O
 }
 
 #[tauri::command]
-fn get_engine_info(app_handle: tauri::AppHandle, state: tauri::State<'_, Arc<Mutex<AppState>>>) -> EngineInfo {
-    let state_lock = state.lock().unwrap_or_else(|error| error.into_inner());
-    engine_info(&app_handle, &state_lock.settings, None)
+async fn get_engine_info(app_handle: tauri::AppHandle, state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Result<EngineInfo, String> {
+    let settings = state.lock().unwrap_or_else(|error| error.into_inner()).settings.clone();
+    Ok(engine_info(&app_handle, &settings, None).await)
 }
 
 #[tauri::command]
@@ -3366,9 +3382,10 @@ async fn update_ytdlp_engine(
     };
 
     let latest = engine_update::latest_version(settings.proxy_url()).await?;
-    let current_version = resolve_ytdlp_path(&app_handle)
-        .as_deref()
-        .and_then(engine_update::installed_version);
+    let current_version = match resolve_ytdlp_path(&app_handle) {
+        Some(path) => engine_update::installed_version(&path).await,
+        None => None,
+    };
     let up_to_date = current_version
         .as_deref()
         .map(|version| version.eq_ignore_ascii_case(latest.trim()))
@@ -3393,10 +3410,11 @@ async fn update_ytdlp_engine(
         let _ = app_handle.emit("engine-updated", installed);
     }
 
-    let mut info = {
+    let settings = {
         let state_lock = state.lock().unwrap_or_else(|error| error.into_inner());
-        engine_info(&app_handle, &state_lock.settings, None)
+        state_lock.settings.clone()
     };
+    let mut info = engine_info(&app_handle, &settings, None).await;
     info.latest = Some(latest);
     info.just_updated = just_updated;
     Ok(info)
@@ -3603,9 +3621,10 @@ fn spawn_engine_auto_update(app_handle: &tauri::AppHandle, state: &Arc<Mutex<App
         let Ok(latest) = engine_update::latest_version(proxy.as_deref()).await else {
             return;
         };
-        let current = resolve_ytdlp_path(&app_handle)
-            .as_deref()
-            .and_then(engine_update::installed_version);
+        let current = match resolve_ytdlp_path(&app_handle) {
+            Some(path) => engine_update::installed_version(&path).await,
+            None => None,
+        };
         if current
             .as_deref()
             .map(|version| version.eq_ignore_ascii_case(latest.trim()))
@@ -3721,16 +3740,21 @@ pub fn run() {
             
             app.manage(app_state.clone());
             let sniffer_state = Arc::new(Mutex::new(sniffer::SnifferState::new(app_data_dir.join("resource-sniffer"))));
-            // A previous crash must not leave the machine pointed at a dead loopback proxy.
-            if let Ok(mut state) = sniffer_state.lock() {
+            app.manage(sniffer_state.clone());
+            // Restore after a crash without delaying window creation. The
+            // capture-state query waits on this worker, independently of the
+            // settings and task queries, so link downloads remain responsive.
+            let recovery_handle = app.handle().clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                let mut state = sniffer_state.lock().unwrap_or_else(|error| error.into_inner());
                 if state.data_dir.join("sniffer-proxy-session.json").exists() {
                     state.message = match sniffer::restore_system_proxy(&mut state) {
                         Ok(()) => Some("Restored network proxy settings from the previous capture session.".into()),
                         Err(error) => Some(format!("Cobalt could not restore the previous proxy automatically: {error}")),
                     };
+                    let _ = recovery_handle.emit("sniffer-updated", state.view());
                 }
-            }
-            app.manage(sniffer_state);
+            });
 
             build_tray(app.handle())?;
             register_deep_link(app.handle());

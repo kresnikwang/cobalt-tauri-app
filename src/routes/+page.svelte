@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
   import { fade, fly } from 'svelte/transition';
-  import { invoke } from "@tauri-apps/api/core";
+  import { invoke, isTauri } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
   import { getVersion } from "@tauri-apps/api/app";
 
@@ -81,6 +81,7 @@
   let activeTab = $state<TabId>('all');
   let sniffer = $state<any>({ status: 'stopped', port: 8899, captures: [], message: null, supportedSources: [], certificateInstalled: false, proxyActive: false, wechatHooks: 0, tunProxyDetected: null });
   let snifferBusy = $state(false);
+  let snifferReady = $state(false);
   let snifferError = $state('');
   let captureSearch = $state('');
   let thumbFailed = $state<Record<string, boolean>>({});
@@ -94,6 +95,7 @@
   // Download engine (yt-dlp) status.
   let engine = $state<any>({ version: '', source: '', bundledVersion: '', autoUpdate: true, latest: '' });
   let engineBusy = $state(false);
+  let engineLoading = $state(false);
   let engineError = $state('');
   let engineMessage = $state('');
 
@@ -157,77 +159,81 @@
     for (const id of lastStatus.keys()) if (!live.has(id)) lastStatus.delete(id);
   });
 
-  let unlistenTask: (() => void) | null = null;
-  let unlistenClipboard: (() => void) | null = null;
-  let unlistenSniffer: (() => void) | null = null;
-  let unlistenPlaylist: (() => void) | null = null;
-  let unlistenEngine: (() => void) | null = null;
-  let unlistenDeepLink: (() => void) | null = null;
-
-  onMount(async () => {
+  onMount(() => {
     initLocale();
+    // A browser preview has no native backend; don't show a connection error.
+    if (!isTauri()) return;
+    let disposed = false;
+    const unlisteners: (() => void)[] = [];
 
-    // Real app version from Tauri (comes from tauri.conf.json/package.json),
-    // instead of a hard-coded string in the settings footer.
-    try { appVersion = await getVersion(); } catch { /* web/preview */ }
+    void getVersion().then(version => { if (!disposed) appVersion = version; }).catch(() => {});
+    void loadInitialState();
 
-    // Register listeners BEFORE fetching initial state. If any of the invokes below
-    // rejects, the app must not end up permanently deaf to task/clipboard/sniffer events.
-    try {
-      [unlistenTask, unlistenClipboard, unlistenSniffer, unlistenPlaylist, unlistenEngine, unlistenDeepLink] = await Promise.all([
-        listen('task-updated', (event) => {
-          const updatedTask = event.payload as any;
-          const index = tasks.findIndex(task => task.id === updatedTask.id);
-          if (index !== -1) {
-            tasks[index] = updatedTask;
-            tasks = [...tasks]; // force Svelte 5 array proxy update
-          } else {
-            tasks = [updatedTask, ...tasks];
-          }
-        }),
-        listen('clipboard-detected', (event) => {
-          pushClipboardToast(event.payload as string);
-        }),
-        listen('sniffer-updated', (event) => {
-          sniffer = event.payload as any;
-        }),
-        listen('playlist-choice', (event) => {
-          openPlaylistRequest(event.payload as any);
-        }),
-        listen('engine-updated', () => {
-          // A background engine update landed: show the new version.
-          refreshEngine();
-        }),
-        listen('deep-link://new-url', (event) => {
-          const urls = (event.payload as unknown as string[]) ?? [];
-          for (const raw of urls) {
-            const target = deepLinkTarget(raw);
-            if (target) { handleDownload(target); }
-          }
-        }),
+    async function loadInitialState() {
+      // Register listeners BEFORE fetching initial state. If any of the invokes below
+      // rejects, the app must not end up permanently deaf to task/clipboard/sniffer events.
+      try {
+        await Promise.all([
+          listen('task-updated', (event) => {
+            const updatedTask = event.payload as any;
+            const index = tasks.findIndex(task => task.id === updatedTask.id);
+            if (index !== -1) {
+              tasks[index] = updatedTask;
+              tasks = [...tasks]; // force Svelte 5 array proxy update
+            } else {
+              tasks = [updatedTask, ...tasks];
+            }
+          }),
+          listen('clipboard-detected', (event) => {
+            pushClipboardToast(event.payload as string);
+          }),
+          listen('sniffer-updated', (event) => {
+            sniffer = event.payload as any;
+          }),
+          listen('playlist-choice', (event) => {
+            openPlaylistRequest(event.payload as any);
+          }),
+          listen('engine-updated', () => {
+            // A background engine update landed: show the new version.
+            refreshEngine();
+          }),
+          listen('deep-link://new-url', (event) => {
+            const urls = (event.payload as unknown as string[]) ?? [];
+            for (const raw of urls) {
+              const target = deepLinkTarget(raw);
+              if (target) { handleDownload(target); }
+            }
+          }),
+        ].map(subscription => subscription.then(unlisten => {
+          if (disposed) unlisten();
+          else unlisteners.push(unlisten);
+        })));
+      } catch (error) {
+        if (!disposed) bootError = `Failed to connect to the backend: ${error}`;
+        return;
+      }
+
+      if (disposed) return;
+
+      // Load independently: proxy recovery must not delay settings or history.
+      // Engine inspection is deferred until Preferences is opened.
+      await Promise.all([
+        invoke<typeof settings>('get_settings').then(value => { if (disposed) return; settings = value; settingsReady = true; })
+          .catch(error => { if (!disposed) bootError = bootError || `Failed to load settings: ${error}`; }),
+        invoke<any[]>('get_tasks').then(value => { if (disposed) return; tasks = value; })
+          .catch(error => { if (!disposed) bootError = bootError || `Failed to load tasks: ${error}`; }),
+        invoke('get_sniffer_state').then(value => { if (disposed) return; sniffer = value; snifferReady = true; })
+          .catch(error => { if (!disposed) bootError = bootError || `Failed to load sniffer state: ${error}`; }),
       ]);
-    } catch (error) {
-      bootError = `Failed to connect to the backend: ${error}`;
-      return;
     }
 
-    // Each fetch is independent so one failure cannot strand the other two.
-    try { settings = await invoke('get_settings'); settingsReady = true; }
-    catch (error) { bootError = `Failed to load settings: ${error}`; }
-    try { tasks = await invoke('get_tasks'); }
-    catch (error) { bootError = bootError || `Failed to load tasks: ${error}`; }
-    try { sniffer = await invoke('get_sniffer_state'); }
-    catch (error) { bootError = bootError || `Failed to load sniffer state: ${error}`; }
-    try { await refreshEngine(); } catch { /* shown in the engine panel */ }
+    return () => {
+      disposed = true;
+      for (const unlisten of unlisteners) unlisten();
+    };
   });
 
   onDestroy(() => {
-    if (unlistenTask) unlistenTask();
-    if (unlistenClipboard) unlistenClipboard();
-    if (unlistenSniffer) unlistenSniffer();
-    if (unlistenPlaylist) unlistenPlaylist();
-    if (unlistenEngine) unlistenEngine();
-    if (unlistenDeepLink) unlistenDeepLink();
     for (const timer of toastTimers) clearTimeout(timer);
   });
 
@@ -310,11 +316,15 @@
 
   // --- Download engine (yt-dlp) ----------------------------------------
   async function refreshEngine() {
+    if (engineLoading || !isTauri()) return;
+    engineLoading = true;
     try {
       engineError = '';
       engine = await invoke('get_engine_info');
     } catch (error) {
       engineError = String(error);
+    } finally {
+      engineLoading = false;
     }
   }
 
@@ -362,6 +372,7 @@
   }
 
   async function startSniffer() {
+    if (!snifferReady || snifferBusy) return;
     snifferBusy = true;
     snifferError = '';
     try { sniffer = await invoke('start_sniffer'); }
@@ -488,6 +499,7 @@
   function openSettings() {
     actionError = '';
     showSettings = true;
+    void refreshEngine();
   }
 
   function closeSettings() {
@@ -617,7 +629,7 @@
   {/if}
 
   <!-- Header / Window Bar -->
-  <header class="window-header drag-handle">
+  <header class="window-header drag-handle" data-tauri-drag-region>
     <div class="header-title no-drag">
       <span class="gradient-text">COBALT</span>
     </div>
@@ -636,293 +648,295 @@
     </div>
   </header>
 
-  <div
-    class="mode-switch"
-    role="tablist"
-    tabindex="-1"
-    aria-label={t('sniffer.mode_label')}
-    onkeydown={(e) => {
-      if (e.key === 'ArrowRight') { e.preventDefault(); inputMode = inputMode === 'url' ? 'sniffer' : 'url'; }
-      if (e.key === 'ArrowLeft') { e.preventDefault(); inputMode = inputMode === 'sniffer' ? 'url' : 'sniffer'; }
-    }}
-  >
-    <button
-      role="tab"
-      class:active={inputMode === 'url'}
-      aria-selected={inputMode === 'url'}
-      tabindex={inputMode === 'url' ? 0 : -1}
-      onclick={() => inputMode = 'url'}
-    ><IconDownload size={15} />{t('sniffer.mode_url')}</button>
-    <button
-      role="tab"
-      class:active={inputMode === 'sniffer'}
-      aria-selected={inputMode === 'sniffer'}
-      tabindex={inputMode === 'sniffer' ? 0 : -1}
-      onclick={() => inputMode = 'sniffer'}
-    ><IconRadar size={15} />{t('sniffer.mode_capture')}</button>
-  </div>
+  <div class="workspace" class:capture-mode={inputMode === 'sniffer'}>
+    <div
+      class="mode-switch"
+      role="tablist"
+      tabindex="-1"
+      aria-label={t('sniffer.mode_label')}
+      onkeydown={(e) => {
+        if (e.key === 'ArrowRight') { e.preventDefault(); inputMode = inputMode === 'url' ? 'sniffer' : 'url'; }
+        if (e.key === 'ArrowLeft') { e.preventDefault(); inputMode = inputMode === 'sniffer' ? 'url' : 'sniffer'; }
+      }}
+    >
+      <button
+        role="tab"
+        class:active={inputMode === 'url'}
+        aria-selected={inputMode === 'url'}
+        tabindex={inputMode === 'url' ? 0 : -1}
+        onclick={() => inputMode = 'url'}
+      ><IconDownload size={15} />{t('sniffer.mode_url')}</button>
+      <button
+        role="tab"
+        class:active={inputMode === 'sniffer'}
+        aria-selected={inputMode === 'sniffer'}
+        tabindex={inputMode === 'sniffer' ? 0 : -1}
+        onclick={() => inputMode = 'sniffer'}
+      ><IconRadar size={15} />{t('sniffer.mode_capture')}</button>
+    </div>
 
-  {#if bootError || actionError}
-    <p class="app-banner" role="alert">{bootError || actionError}</p>
-  {/if}
-
-  <!-- URL Paste Section -->
-  {#if inputMode === 'url'}
-  <section class="paste-section">
-    <div class="input-glow-wrapper">
-      <input 
-        type="text" 
-        placeholder={t('input.placeholder')}
-        bind:value={inputUrl}
-        onkeydown={(e) => e.key === 'Enter' && handleDownload()}
-        autocapitalize="off"
-        autocomplete="off"
-        spellcheck="false"
-        class="url-input"
-      />
-      <button class="download-trigger-btn" onclick={() => handleDownload()} disabled={!inputUrl.trim() || submitting}>
-        <IconDownload size={18} />
-        <span>{submitting ? t('download.submitting') : t('analyze')}</span>
-      </button>
-    </div>
-  </section>
-  {:else}
-  <section class="sniffer-section">
-    <div class="sniffer-heading">
-      <div>
-        <h2>{t('sniffer.title')}</h2>
-        <p>{t('sniffer.description')}</p>
-      </div>
-      {#if sniffer.status === 'running' || sniffer.status === 'starting'}
-        <button class="sniffer-control stop" onclick={stopSniffer} disabled={snifferBusy}><IconPlayerStop size={16} />{t('sniffer.stop')}</button>
-      {:else}
-        <button class="sniffer-control" onclick={startSniffer} disabled={snifferBusy}><IconRadar size={16} />{t('sniffer.start')}</button>
-      {/if}
-    </div>
-    <div class="sniffer-notice">
-      <strong>{t('sniffer.proxy_title')}</strong>
-      <span>{t('sniffer.proxy_note', { port: sniffer.port })}</span>
-      {#if sniffer.tunProxyDetected}
-        <p class="sniffer-tun-warning">{t('sniffer.tun_warning', { app: sniffer.tunProxyDetected })}</p>
-      {/if}
-      <div class="sniffer-setup-actions">
-        <button class:complete={sniffer.certificateInstalled} onclick={installSnifferCertificate} disabled={sniffer.certificateInstalled || snifferBusy}>
-          {#if sniffer.certificateInstalled}<IconCheck size={14} />{/if}
-          {sniffer.certificateInstalled ? t('sniffer.certificate_installed') : t('sniffer.install_certificate')}
-        </button>
-        {#if sniffer.proxyActive}
-          <button class="complete" onclick={restoreSnifferProxy} disabled={snifferBusy}><IconCheck size={14} />{t('sniffer.proxy_enabled')}</button>
-        {:else}
-          <button onclick={enableSnifferProxy} disabled={sniffer.status !== 'running' || snifferBusy || !!sniffer.tunProxyDetected}>{t('sniffer.enable_proxy')}</button>
-        {/if}
-      </div>
-    </div>
-    {#if snifferError}
-      <p class="sniffer-error">{snifferError}</p>
-    {:else if sniffer.message}
-      <p class="sniffer-message">{sniffer.message}</p>
+    {#if bootError || actionError}
+      <p class="app-banner" role="alert">{bootError || actionError}</p>
     {/if}
-    <div class="sniffer-capture-header">
-      <span>{t('sniffer.captures')} <b>{sniffer.captures.length}</b></span>
-      <div class="capture-header-tools">
-        {#if sniffer.status === 'running'}
-          <span class:ready={sniffer.proxyActive && sniffer.wechatHooks > 0} class="sniffer-hook-status">
-            {!sniffer.proxyActive ? t('sniffer.waiting_proxy') : sniffer.wechatHooks > 0 ? t('sniffer.hook_ready') : t('sniffer.waiting_hook')}
-          </span>
-        {/if}
-        <input class="capture-search" type="search" placeholder={t('sniffer.search_placeholder')} bind:value={captureSearch} />
-        <button class="capture-clear" onclick={clearSniffer} disabled={sniffer.captures.length === 0} title={t('sniffer.clear')}><IconRefresh size={15} /></button>
+
+    <!-- URL Paste Section -->
+    {#if inputMode === 'url'}
+    <section class="paste-section">
+      <div class="input-glow-wrapper">
+        <input
+          type="text"
+          aria-label={t('input.placeholder')}
+          placeholder={t('input.placeholder')}
+          bind:value={inputUrl}
+          onkeydown={(e) => e.key === 'Enter' && handleDownload()}
+          autocapitalize="off"
+          autocomplete="off"
+          spellcheck="false"
+          class="url-input"
+        />
+        <button class="download-trigger-btn" onclick={() => handleDownload()} disabled={!inputUrl.trim() || submitting}>
+          <IconDownload size={18} />
+          <span>{submitting ? t('download.submitting') : t('analyze')}</span>
+        </button>
       </div>
-    </div>
-    {#if sniffer.captures.length === 0}
-      <div class="sniffer-empty"><IconRadar size={28} /><span>{t('sniffer.empty')}</span></div>
-    {:else if filteredCaptures.length === 0}
-      <div class="sniffer-empty"><IconSearch size={24} /><span>{t('sniffer.no_match')}</span></div>
+    </section>
     {:else}
-      <div class="capture-grid">
-        {#each filteredCaptures as capture (capture.id)}
-          <div class="capture-card">
-            <div class="capture-thumb">
-              {#if capture.coverUrl && !thumbFailed[capture.coverUrl]}
-                <img src={capture.coverUrl} alt="" loading="lazy" referrerpolicy="no-referrer" onerror={() => (thumbFailed[capture.coverUrl] = true)} />
-              {:else}
-                <div class="capture-thumb-fallback"><IconVideo size={22} /></div>
-              {/if}
-              <span class="capture-kind-pill">{capture.kind === 'playlist' ? 'HLS' : capture.kind.toUpperCase()}</span>
-            </div>
-            <div class="capture-info">
-              <strong title={capture.title}>{capture.title}</strong>
-              <span>{capture.source} · {capture.size > 0 ? formatBytes(capture.size) : t('task.unknown_size')}</span>
-            </div>
-            <button class="capture-download" onclick={() => downloadCapture(capture.id)} disabled={capture.kind === 'playlist'}>
-              <IconDownload size={15} />{capture.kind === 'playlist' ? 'HLS' : t('sniffer.download')}
-            </button>
-          </div>
-        {/each}
-      </div>
-    {/if}
-  </section>
-  {/if}
-
-  <!-- Tabs Navigation -->
-  <nav class="tabs-nav" aria-label={t('tabs.label')}>
-    <div class="tabs-list" role="tablist" tabindex="-1" onkeydown={(e) => {
-      if (e.key === 'ArrowRight') { e.preventDefault(); moveTab(1); }
-      else if (e.key === 'ArrowLeft') { e.preventDefault(); moveTab(-1); }
-      else if (e.key === 'Home') { e.preventDefault(); activeTab = TABS[0]; }
-      else if (e.key === 'End') { e.preventDefault(); activeTab = TABS[TABS.length - 1]; }
-    }}>
-      {#each TABS as tab}
-        <button
-          class="tab-btn"
-          class:active={activeTab === tab}
-          role="tab"
-          aria-selected={activeTab === tab}
-          tabindex={activeTab === tab ? 0 : -1}
-          bind:this={tabButtons[tab]}
-          onclick={() => activeTab = tab}
-        >
-          {t(`tabs.${tab}`)} <span class="tab-count">{tabCounts[tab]}</span>
-        </button>
-      {/each}
-    </div>
-    {#if hasSettledTasks}
-      <button class="clear-btn" onclick={clearCompleted}>
-        {t('tabs.clear_finished')}
-      </button>
-    {/if}
-  </nav>
-
-  <!-- Downloads List Area -->
-  <section class="downloads-area">
-    {#if filteredTasks.length === 0}
-      <div class="empty-state">
-        <div class="empty-icon-pulse">
-          <IconSearch size={40} color="var(--text-muted)" />
+    <section class="sniffer-section">
+      <div class="sniffer-heading">
+        <div>
+          <h2>{t('sniffer.title')}</h2>
+          <p>{t('sniffer.description')}</p>
         </div>
-        {#if isFilteredEmpty}
-          <h3>{t('empty.filtered.title')}</h3>
-          <p>{t('empty.filtered.subtitle')}</p>
+        {#if sniffer.status === 'running' || sniffer.status === 'starting'}
+          <button class="sniffer-control stop" onclick={stopSniffer} disabled={snifferBusy}><IconPlayerStop size={16} />{t('sniffer.stop')}</button>
         {:else}
-          <h3>{t('empty.title')}</h3>
-          <p>{t('empty.subtitle')}</p>
+          <button class="sniffer-control" onclick={startSniffer} disabled={snifferBusy || !snifferReady}><IconRadar size={16} />{t('sniffer.start')}</button>
         {/if}
       </div>
-    {:else}
-      <div class="tasks-list">
-        {#each filteredTasks as task (task.id)}
-          {@const service = getServiceInfo(task.url, t('service.unknown'), platformName)}
-          <div class="task-card glass">
-            <div class="service-icon" style="--service-bg: {service.bg}; --service-color: {service.color}">
-              {#if settings.downloadMode === 'audio'}
-                <IconMusic size={18} />
-              {:else}
-                <IconVideo size={18} />
-              {/if}
-            </div>
-
-            <!-- Main Info Column -->
-            <div class="task-info-col">
-              <div class="task-header">
-                <div class="task-title-group">
-                  <span class="task-title" title={task.title}>{task.title}</span>
-                  <span class="task-service" style="color: {service.color}">{service.name}</span>
-                </div>
-                <span class="task-status-badge {task.status}">{t(`task.status.${task.status}`)}</span>
-              </div>
-
-              <!-- Progress bar -->
-              <div class="progress-bar-wrapper">
-                <div
-                  class="progress-bar-bg"
-                  role="progressbar"
-                  aria-label={t('progress.label')}
-                  aria-valuenow={Math.round(task.progress * 100)}
-                  aria-valuemin="0"
-                  aria-valuemax="100"
-                >
-                  <div
-                    class="progress-bar-fill {task.status}"
-                    class:indeterminate={task.status === 'downloading' && task.kind !== 'gallery' && task.totalBytes === 0}
-                    style="width: {task.progress * 100}%"
-                  ></div>
-                </div>
-              </div>
-
-              <!-- Status line -->
-              <div class="task-status-footer">
-                {#if task.status === 'queued'}
-                  <span class="stats-text">{t('task.waiting_slot')}</span>
-                {:else if task.status === 'downloading'}
-                  {#if task.kind === 'gallery'}
-                    <span class="stats-text">{t('task.gallery_items', { done: task.itemsDone, total: task.itemsTotal > 0 ? task.itemsTotal : '…' })}</span>
-                  {:else}
-                    <span class="stats-text">
-                      {formatBytes(task.downloadedBytes)} / {task.totalBytes > 0 ? formatBytes(task.totalBytes) : t('task.unknown_size')}
-                    </span>
-                    <span class="stats-text speed">{task.speed}</span>
-                    <span class="stats-text eta">{t('task.eta')}: {task.eta}</span>
-                  {/if}
-                {:else if task.status === 'analyzing'}
-                  {#if task.kind === 'gallery'}
-                    <span class="stats-text animated-dots">{t('task.gallery_analyzing')}</span>
-                  {:else}
-                    <span class="stats-text animated-dots">{t('task.connecting')}</span>
-                  {/if}
-                {:else if task.status === 'merging'}
-                  <span class="stats-text animated-dots font-semibold text-indigo-400">{t('task.merging')}</span>
-                {:else if task.status === 'completed'}
-                  {#if task.kind === 'gallery'}
-                    <span class="stats-text success">{t('task.gallery_done', { total: task.itemsTotal })}</span>
-                  {:else}
-                    <span class="stats-text success">{t('task.completed')}</span>
-                  {/if}
-                {:else if task.status === 'failed'}
-                  <span class="stats-text error" title={task.error}>{humanTaskError(task.error)}</span>
-                {:else if task.status === 'cancelled'}
-                  <span class="stats-text warning">{t('task.cancelled')}</span>
+      <div class="sniffer-notice">
+        <strong>{t('sniffer.proxy_title')}</strong>
+        <span>{t('sniffer.proxy_note', { port: sniffer.port })}</span>
+        {#if sniffer.tunProxyDetected}
+          <p class="sniffer-tun-warning">{t('sniffer.tun_warning', { app: sniffer.tunProxyDetected })}</p>
+        {/if}
+        <div class="sniffer-setup-actions">
+          <button class:complete={sniffer.certificateInstalled} onclick={installSnifferCertificate} disabled={sniffer.certificateInstalled || snifferBusy || !snifferReady}>
+            {#if sniffer.certificateInstalled}<IconCheck size={14} />{/if}
+            {sniffer.certificateInstalled ? t('sniffer.certificate_installed') : t('sniffer.install_certificate')}
+          </button>
+          {#if sniffer.proxyActive}
+            <button class="complete" onclick={restoreSnifferProxy} disabled={snifferBusy}><IconCheck size={14} />{t('sniffer.proxy_enabled')}</button>
+          {:else}
+            <button onclick={enableSnifferProxy} disabled={sniffer.status !== 'running' || snifferBusy || !!sniffer.tunProxyDetected}>{t('sniffer.enable_proxy')}</button>
+          {/if}
+        </div>
+      </div>
+      {#if snifferError}
+        <p class="sniffer-error">{snifferError}</p>
+      {:else if sniffer.message}
+        <p class="sniffer-message">{sniffer.message}</p>
+      {/if}
+      <div class="sniffer-capture-header">
+        <span>{t('sniffer.captures')} <b>{sniffer.captures.length}</b></span>
+        <div class="capture-header-tools">
+          {#if sniffer.status === 'running'}
+            <span class:ready={sniffer.proxyActive && sniffer.wechatHooks > 0} class="sniffer-hook-status">
+              {!sniffer.proxyActive ? t('sniffer.waiting_proxy') : sniffer.wechatHooks > 0 ? t('sniffer.hook_ready') : t('sniffer.waiting_hook')}
+            </span>
+          {/if}
+          <input class="capture-search" type="search" aria-label={t('sniffer.search_placeholder')} placeholder={t('sniffer.search_placeholder')} bind:value={captureSearch} />
+          <button class="capture-clear" onclick={clearSniffer} disabled={sniffer.captures.length === 0} title={t('sniffer.clear')} aria-label={t('sniffer.clear')}><IconRefresh size={15} /></button>
+        </div>
+      </div>
+      {#if sniffer.captures.length === 0}
+        <div class="sniffer-empty"><IconRadar size={28} /><span>{t('sniffer.empty')}</span></div>
+      {:else if filteredCaptures.length === 0}
+        <div class="sniffer-empty"><IconSearch size={24} /><span>{t('sniffer.no_match')}</span></div>
+      {:else}
+        <div class="capture-grid">
+          {#each filteredCaptures as capture (capture.id)}
+            <div class="capture-card">
+              <div class="capture-thumb">
+                {#if capture.coverUrl && !thumbFailed[capture.coverUrl]}
+                  <img src={capture.coverUrl} alt="" loading="lazy" referrerpolicy="no-referrer" onerror={() => (thumbFailed[capture.coverUrl] = true)} />
+                {:else}
+                  <div class="capture-thumb-fallback"><IconVideo size={22} /></div>
                 {/if}
+                <span class="capture-kind-pill">{capture.kind === 'playlist' ? 'HLS' : capture.kind.toUpperCase()}</span>
               </div>
+              <div class="capture-info">
+                <strong title={capture.title}>{capture.title}</strong>
+                <span>{capture.source} · {capture.size > 0 ? formatBytes(capture.size) : t('task.unknown_size')}</span>
+              </div>
+              <button class="capture-download" onclick={() => downloadCapture(capture.id)} disabled={capture.kind === 'playlist'}>
+                <IconDownload size={15} />{capture.kind === 'playlist' ? 'HLS' : t('sniffer.download')}
+              </button>
             </div>
+          {/each}
+        </div>
+      {/if}
+    </section>
+    {/if}
 
-            <!-- Actions Column -->
-            <div class="task-actions-col">
-              {#if RUNNING_STATUSES.includes(task.status)}
-                <button class="action-circle-btn danger" onclick={() => cancelTask(task.id)} title={t('action.cancel')} aria-label={t('action.cancel')}>
-                  <IconX size={14} />
-                </button>
-              {:else if task.status === 'completed'}
-                <button class="action-circle-btn success" onclick={() => openFile(task.outputPath)} title={t('action.play')} aria-label={t('action.play')}>
-                  <IconPlayerPlay size={14} />
-                </button>
-                <button class="action-circle-btn secondary" onclick={() => revealInFinder(task.outputPath)} title={t('action.reveal')} aria-label={t('action.reveal')}>
-                  <IconFolder size={14} />
-                </button>
-                <button class="action-circle-btn secondary" onclick={() => deleteTask(task.id)} title={t('action.remove')} aria-label={t('action.remove')}>
-                  <IconTrash size={14} />
-                </button>
-              {:else}
-                {#if task.kind === 'gallery' || task.status === 'failed'}
-                  <button class="action-circle-btn" onclick={openSnifferForGallery} title={t('task.use_sniffer')} aria-label={t('task.use_sniffer')}>
-                    <IconRadar size={14} />
-                  </button>
-                {/if}
-                {#if !task.url.startsWith('capture://')}
-                  <button class="action-circle-btn" onclick={() => handleDownload(task.url)} title={t('action.retry')} aria-label={t('action.retry')}>
-                    <IconRefresh size={14} />
-                  </button>
-                {/if}
-                <button class="action-circle-btn secondary" onclick={() => deleteTask(task.id)} title={t('action.remove')} aria-label={t('action.remove')}>
-                  <IconTrash size={14} />
-                </button>
-              {/if}
-            </div>
-          </div>
+    <!-- Tabs Navigation -->
+    <nav class="tabs-nav" aria-label={t('tabs.label')}>
+      <div class="tabs-list" role="tablist" tabindex="-1" onkeydown={(e) => {
+        if (e.key === 'ArrowRight') { e.preventDefault(); moveTab(1); }
+        else if (e.key === 'ArrowLeft') { e.preventDefault(); moveTab(-1); }
+        else if (e.key === 'Home') { e.preventDefault(); activeTab = TABS[0]; }
+        else if (e.key === 'End') { e.preventDefault(); activeTab = TABS[TABS.length - 1]; }
+      }}>
+        {#each TABS as tab}
+          <button
+            class="tab-btn"
+            class:active={activeTab === tab}
+            role="tab"
+            aria-selected={activeTab === tab}
+            tabindex={activeTab === tab ? 0 : -1}
+            bind:this={tabButtons[tab]}
+            onclick={() => activeTab = tab}
+          >
+            {t(`tabs.${tab}`)} <span class="tab-count">{tabCounts[tab]}</span>
+          </button>
         {/each}
       </div>
-    {/if}
-  </section>
+      {#if hasSettledTasks}
+        <button class="clear-btn" onclick={clearCompleted}>
+          {t('tabs.clear_finished')}
+        </button>
+      {/if}
+    </nav>
 
+    <!-- Downloads List Area -->
+    <section class="downloads-area">
+      {#if filteredTasks.length === 0}
+        <div class="empty-state">
+          <div class="empty-icon-pulse">
+            <IconSearch size={40} color="var(--text-muted)" />
+          </div>
+          {#if isFilteredEmpty}
+            <h3>{t('empty.filtered.title')}</h3>
+            <p>{t('empty.filtered.subtitle')}</p>
+          {:else}
+            <h3>{t('empty.title')}</h3>
+            <p>{t('empty.subtitle')}</p>
+          {/if}
+        </div>
+      {:else}
+        <div class="tasks-list">
+          {#each filteredTasks as task (task.id)}
+            {@const service = getServiceInfo(task.url, t('service.unknown'), platformName)}
+            <div class="task-card glass">
+              <div class="service-icon" style="--service-bg: {service.bg}; --service-color: {service.color}">
+                {#if settings.downloadMode === 'audio'}
+                  <IconMusic size={18} />
+                {:else}
+                  <IconVideo size={18} />
+                {/if}
+              </div>
+
+              <!-- Main Info Column -->
+              <div class="task-info-col">
+                <div class="task-header">
+                  <div class="task-title-group">
+                    <span class="task-title" title={task.title}>{task.title}</span>
+                    <span class="task-service" style="color: {service.color}">{service.name}</span>
+                  </div>
+                  <span class="task-status-badge {task.status}">{t(`task.status.${task.status}`)}</span>
+                </div>
+
+                <!-- Progress bar -->
+                <div class="progress-bar-wrapper">
+                  <div
+                    class="progress-bar-bg"
+                    role="progressbar"
+                    aria-label={t('progress.label')}
+                    aria-valuenow={Math.round(task.progress * 100)}
+                    aria-valuemin="0"
+                    aria-valuemax="100"
+                  >
+                    <div
+                      class="progress-bar-fill {task.status}"
+                      class:indeterminate={task.status === 'downloading' && task.kind !== 'gallery' && task.totalBytes === 0}
+                      style="width: {task.progress * 100}%"
+                    ></div>
+                  </div>
+                </div>
+
+                <!-- Status line -->
+                <div class="task-status-footer">
+                  {#if task.status === 'queued'}
+                    <span class="stats-text">{t('task.waiting_slot')}</span>
+                  {:else if task.status === 'downloading'}
+                    {#if task.kind === 'gallery'}
+                      <span class="stats-text">{t('task.gallery_items', { done: task.itemsDone, total: task.itemsTotal > 0 ? task.itemsTotal : '…' })}</span>
+                    {:else}
+                      <span class="stats-text">
+                        {formatBytes(task.downloadedBytes)} / {task.totalBytes > 0 ? formatBytes(task.totalBytes) : t('task.unknown_size')}
+                      </span>
+                      <span class="stats-text speed">{task.speed}</span>
+                      <span class="stats-text eta">{t('task.eta')}: {task.eta}</span>
+                    {/if}
+                  {:else if task.status === 'analyzing'}
+                    {#if task.kind === 'gallery'}
+                      <span class="stats-text animated-dots">{t('task.gallery_analyzing')}</span>
+                    {:else}
+                      <span class="stats-text animated-dots">{t('task.connecting')}</span>
+                    {/if}
+                  {:else if task.status === 'merging'}
+                    <span class="stats-text animated-dots font-semibold text-indigo-400">{t('task.merging')}</span>
+                  {:else if task.status === 'completed'}
+                    {#if task.kind === 'gallery'}
+                      <span class="stats-text success">{t('task.gallery_done', { total: task.itemsTotal })}</span>
+                    {:else}
+                      <span class="stats-text success">{t('task.completed')}</span>
+                    {/if}
+                  {:else if task.status === 'failed'}
+                    <span class="stats-text error" title={task.error}>{humanTaskError(task.error)}</span>
+                  {:else if task.status === 'cancelled'}
+                    <span class="stats-text warning">{t('task.cancelled')}</span>
+                  {/if}
+                </div>
+              </div>
+
+              <!-- Actions Column -->
+              <div class="task-actions-col">
+                {#if RUNNING_STATUSES.includes(task.status)}
+                  <button class="action-circle-btn danger" onclick={() => cancelTask(task.id)} title={t('action.cancel')} aria-label={t('action.cancel')}>
+                    <IconX size={14} />
+                  </button>
+                {:else if task.status === 'completed'}
+                  <button class="action-circle-btn success" onclick={() => openFile(task.outputPath)} title={t('action.play')} aria-label={t('action.play')}>
+                    <IconPlayerPlay size={14} />
+                  </button>
+                  <button class="action-circle-btn secondary" onclick={() => revealInFinder(task.outputPath)} title={t('action.reveal')} aria-label={t('action.reveal')}>
+                    <IconFolder size={14} />
+                  </button>
+                  <button class="action-circle-btn secondary" onclick={() => deleteTask(task.id)} title={t('action.remove')} aria-label={t('action.remove')}>
+                    <IconTrash size={14} />
+                  </button>
+                {:else}
+                  {#if task.kind === 'gallery' || task.status === 'failed'}
+                    <button class="action-circle-btn" onclick={openSnifferForGallery} title={t('task.use_sniffer')} aria-label={t('task.use_sniffer')}>
+                      <IconRadar size={14} />
+                    </button>
+                  {/if}
+                  {#if !task.url.startsWith('capture://')}
+                    <button class="action-circle-btn" onclick={() => handleDownload(task.url)} title={t('action.retry')} aria-label={t('action.retry')}>
+                      <IconRefresh size={14} />
+                    </button>
+                  {/if}
+                  <button class="action-circle-btn secondary" onclick={() => deleteTask(task.id)} title={t('action.remove')} aria-label={t('action.remove')}>
+                    <IconTrash size={14} />
+                  </button>
+                {/if}
+              </div>
+            </div>
+          {/each}
+        </div>
+      {/if}
+    </section>
+  </div>
   <!-- Screen-reader announcements for task state changes -->
   <div class="sr-only" aria-live="polite" aria-atomic="true">{announcement}</div>
 
@@ -1038,11 +1052,13 @@
 
           <div class="setting-item engine-item">
             <div class="engine-status">
-              <span class="engine-version">{t('engine.version', { version: engine.version || '–' })}</span>
-              <span class="engine-source {engine.source}">{t(`engine.source.${engine.source || 'missing'}`)}</span>
+              <span class="engine-version">{engineLoading ? t('engine.loading') : t('engine.version', { version: engine.version || '–' })}</span>
+              {#if !engineLoading && engine.source}
+                <span class="engine-source {engine.source}">{t(`engine.source.${engine.source}`)}</span>
+              {/if}
             </div>
             <div class="engine-actions">
-              <button class="btn-select-dir" onclick={updateEngine} disabled={engineBusy} title={t('engine.check_update')} aria-label={t('engine.check_update')}>
+              <button class="btn-select-dir" onclick={updateEngine} disabled={engineBusy || engineLoading} title={t('engine.check_update')} aria-label={t('engine.check_update')}>
                 <IconRefresh size={16} />
               </button>
             </div>
@@ -1238,6 +1254,19 @@
     flex-direction: column;
     position: relative;
     box-sizing: border-box;
+    min-height: 0;
+    overflow: hidden;
+  }
+
+  .workspace {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    overflow-x: hidden;
+    display: flex;
+    flex-direction: column;
+    scrollbar-gutter: stable;
+    overscroll-behavior: contain;
   }
 
   /* Drop overlay */
@@ -1285,19 +1314,19 @@
 
   /* Window Header */
   .window-header {
-    min-height: 56px;
-    padding-top: 12px; /* Margin for Traffic Lights on macOS */
-    padding-left: 20px; /* Flush with the content column; native macOS adds clearance below */
-    padding-right: 20px;
+    flex: 0 0 auto;
+    height: 60px;
+    padding: 0 var(--page-gutter);
+    box-sizing: border-box;
     display: flex;
     align-items: center;
     justify-content: space-between;
     border-bottom: 1px solid var(--border-color);
   }
 
-  /* Keep the wordmark clear of the traffic-light buttons only in the real macOS app. */
+  /* Transparent native titlebars already reserve a strip for window controls. */
   :global(html.native-mac) .window-header {
-    padding-left: 80px;
+    height: 52px;
   }
 
   .header-title {
@@ -1348,7 +1377,8 @@
 
   /* URL Paste Section */
   .paste-section {
-    padding: var(--page-gutter) var(--page-gutter) 14px;
+    flex: 0 0 auto;
+    padding: 16px var(--page-gutter) 0;
   }
 
   .input-glow-wrapper {
@@ -1390,6 +1420,8 @@
   }
 
   .download-trigger-btn {
+    flex: 0 0 auto;
+    white-space: nowrap;
     background: var(--accent-primary);
     border: 1px solid var(--accent-primary);
     color: #f7f6f2;
@@ -1426,7 +1458,8 @@
   }
 
   .app-banner {
-    margin: 12px 20px 0;
+    flex: 0 0 auto;
+    margin: 12px var(--page-gutter) 0;
     padding: 9px 12px;
     border: 1px solid #e6c8c2;
     border-radius: var(--radius-md);
@@ -1439,25 +1472,30 @@
 
   /* Tabs Nav */
   .tabs-nav {
+    flex: 0 0 auto;
+    flex-wrap: wrap;
     display: flex;
     align-items: center;
     justify-content: space-between;
     padding: 0 var(--page-gutter);
-    margin-bottom: 14px;
-    gap: 12px;
+    margin: 24px 0 12px;
+    gap: 8px 12px;
   }
 
   .tabs-list {
+    min-width: 0;
+    flex-wrap: wrap;
     display: flex;
     gap: 4px;
     background: var(--bg-track);
     padding: 3px;
     border-radius: var(--radius-lg);
     box-shadow: none;
-    overflow-x: auto;
   }
 
   .tab-btn {
+    white-space: nowrap;
+    flex: 1 0 auto;
     background: transparent;
     border: none;
     color: var(--text-secondary);
@@ -1505,9 +1543,11 @@
   }
 
   .clear-btn {
+    margin-left: auto;
+    flex: 0 0 auto;
     background: transparent;
     border: none;
-    color: var(--text-muted);
+    color: var(--text-secondary);
     font-size: 11px;
     cursor: pointer;
     min-height: 40px;
@@ -1527,10 +1567,14 @@
 
   /* Downloads Area */
   .downloads-area {
-    flex: 1;
-    overflow-y: auto;
+    flex: 1 0 auto;
+    display: flex;
+    flex-direction: column;
     padding: 0 var(--page-gutter) var(--page-gutter);
   }
+
+  .capture-mode .downloads-area { flex-grow: 0; }
+  .capture-mode .empty-state { min-height: 160px; }
 
   .tasks-list {
     display: flex;
@@ -1593,7 +1637,6 @@
     overflow: hidden;
     text-overflow: ellipsis;
     max-width: 100%;
-    text-wrap: pretty;
   }
 
   .task-service {
@@ -1680,10 +1723,11 @@
   }
 
   .task-status-footer {
+    flex-wrap: wrap;
     display: flex;
     align-items: center;
     justify-content: flex-start;
-    gap: 12px;
+    gap: 4px 12px;
     min-width: 0;
     font-size: 11px;
     color: var(--text-secondary);
@@ -1771,13 +1815,15 @@
 
   /* Empty State */
   .empty-state {
+    flex: 1;
+    box-sizing: border-box;
     display: flex;
     flex-direction: column;
     align-items: center;
     justify-content: center;
     text-align: center;
     padding: 38px 32px 34px;
-    min-height: 360px;
+    min-height: 240px;
   }
 
   .empty-icon-pulse {
@@ -1805,7 +1851,7 @@
     font-size: 13px;
     width: min(100%, 520px);
     text-wrap: pretty;
-    margin: 0 0 32px 0;
+    margin: 0;
     line-height: 1.5;
   }
 
@@ -1934,6 +1980,8 @@
   }
 
   .settings-panel {
+    box-sizing: border-box;
+    min-height: 0;
     width: min(360px, 100%);
     height: 100%;
     background: #fbfaf7;
@@ -1952,6 +2000,8 @@
   }
 
   .settings-header {
+    flex: 0 0 auto;
+    box-sizing: border-box;
     height: 52px;
     padding: 0 20px;
     display: flex;
@@ -2000,6 +2050,8 @@
     flex-direction: column;
     gap: 20px;
     overflow-y: auto;
+    min-height: 0;
+    overflow-x: hidden;
   }
 
   .setting-item {
@@ -2023,6 +2075,7 @@
 
   .path-input {
     flex: 1;
+    min-width: 0;
     background: var(--bg-input);
     border: 1px solid var(--border-color);
     border-radius: var(--radius-md);
@@ -2035,6 +2088,7 @@
   }
 
   .btn-select-dir {
+    flex: 0 0 40px;
     background: var(--bg-subtle);
     border: 1px solid var(--border-color);
     color: var(--text-primary);
@@ -2325,6 +2379,8 @@
   }
 
   .mode-switch {
+    flex: 0 0 auto;
+    align-self: flex-start;
     display: inline-flex;
     align-items: center;
     gap: 3px;
@@ -2346,22 +2402,18 @@
   }
   .mode-switch button { color: var(--text-secondary); background: transparent; padding: 7px 12px; border-radius: var(--radius-md); font-size: 12px; transition: background-color .15s ease, color .15s ease; }
   .mode-switch button.active { color: #f7f6f2; background: var(--accent-primary); }
-  /* min-height:0 lets this section shrink below its content height and scroll, instead of
-     pushing the downloads list off the bottom of the window. flex-basis stays auto so the
-     downloads area below keeps its share. */
+  /* Capture setup and downloads share the workspace scroll, so neither is squeezed shut. */
   .sniffer-section {
-    flex: 0 1 auto;
-    min-height: 0;
-    overflow-y: auto;
+    flex: 0 0 auto;
     margin: var(--section-gap) var(--page-gutter) 0;
-    padding: 20px;
+    padding: 16px;
     border: 1px solid var(--border-color);
     border-radius: var(--radius-xl);
     background: var(--bg-card);
   }
   .sniffer-heading { display:flex; align-items:flex-start; justify-content:space-between; gap:18px; }
   .sniffer-heading h2 { margin:0; color:var(--text-primary); font-size:18px; font-weight:600; }
-  .sniffer-heading p { margin:7px 0 0; color:var(--text-muted); font-size:13px; line-height:1.55; }
+  .sniffer-heading p { margin:7px 0 0; color:var(--text-secondary); font-size:13px; line-height:1.55; }
   .sniffer-control { flex:0 0 auto; padding:9px 14px; color:#f7f6f2; background:var(--accent-primary); border-radius:var(--radius-md); font-size:12px; font-weight:500; }
   .sniffer-control.stop { background:var(--danger-gradient); }
   .sniffer-control:disabled, .capture-clear:disabled, .capture-download:disabled { opacity:.45; cursor:not-allowed; }
@@ -2377,10 +2429,10 @@
   .sniffer-message { margin:11px 0 0; color:var(--success-text); font-size:12px; line-height:1.5; }
   .sniffer-capture-header { display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:10px; margin-top:17px; color:var(--text-secondary); font-size:13px; }
   .sniffer-capture-header b { color:var(--text-primary); font-variant-numeric:tabular-nums; }
-  .capture-header-tools { display:flex; align-items:center; gap:8px; margin-left:auto; }
+  .capture-header-tools { display:flex; flex-wrap:wrap; align-items:center; justify-content:flex-end; gap:8px; margin-left:auto; min-width:0; max-width:100%; }
   .sniffer-hook-status { color:var(--text-muted); font-size:11px; }
   .sniffer-hook-status.ready { color:var(--success-text); }
-  .capture-search { width:200px; height:30px; padding:0 10px; color:var(--text-primary); background:var(--bg-input); border:1px solid var(--border-color); border-radius:var(--radius-md); font:inherit; font-size:12px; outline:none; transition:border-color .15s ease, box-shadow .15s ease; }
+  .capture-search { width:180px; min-width:0; max-width:100%; box-sizing:border-box; height:30px; padding:0 10px; color:var(--text-primary); background:var(--bg-input); border:1px solid var(--border-color); border-radius:var(--radius-md); font:inherit; font-size:12px; outline:none; transition:border-color .15s ease, box-shadow .15s ease; }
   .capture-search::placeholder { color:var(--text-muted); }
   .capture-search:focus { border-color:var(--border-focus); box-shadow:0 0 0 3px rgba(47,45,41,.1); }
   .capture-clear { width:30px; height:30px; color:var(--text-muted); background:transparent; border-radius:var(--radius-md); transition:color .15s ease, background .15s ease, transform .12s ease; }
@@ -2388,7 +2440,7 @@
   .capture-clear:active:not(:disabled) { transform:scale(.96); }
   .sniffer-empty { display:flex; flex-direction:column; align-items:center; gap:9px; padding:27px 10px 12px; color:var(--text-muted); text-align:center; font-size:12px; }
   /* The section itself scrolls now, so the grid must not open a second scroll area. */
-  .capture-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(228px,1fr)); gap:12px; margin-top:12px; padding:2px 4px 10px; }
+  .capture-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(min(100%,228px),1fr)); gap:12px; margin-top:12px; padding:2px 4px 10px; }
   .capture-card { display:flex; flex-direction:column; gap:9px; padding:9px; border-radius:var(--radius-lg); background:var(--bg-card-hover); border:1px solid var(--border-color); box-shadow:none; transition:border-color .15s ease, background .15s ease; }
   .capture-card:hover { background:var(--bg-card); border-color:var(--border-hover); }
   .capture-thumb { position:relative; aspect-ratio:16/9; border-radius:var(--radius-md); overflow:hidden; background:var(--bg-subtle); }
@@ -2406,54 +2458,23 @@
   .capture-grid::-webkit-scrollbar-thumb { background:rgba(58,53,45,.18); border-radius:4px; }
   .capture-grid::-webkit-scrollbar-thumb:hover { background:rgba(58,53,45,.3); }
 
-  @media (max-width: 560px) {
-    .mode-switch, .sniffer-section { margin-left:16px; margin-right:16px; }
-    .sniffer-heading { flex-direction:column; }
-    .sniffer-control { width:100%; }
+  @media (max-width: 600px) {
+    .app-container { --page-gutter: 16px; }
+    .tabs-list { flex: 1; gap: 2px; }
+    .tab-btn { justify-content: center; padding: 0 9px; }
+    .sniffer-heading { flex-wrap: wrap; gap: 12px; }
+    .empty-state { padding-left: 16px; padding-right: 16px; }
+    .task-card { gap: 10px; padding-left: 10px; padding-right: 10px; }
+    .service-icon { width: 36px; height: 36px; flex-basis: 36px; }
+    .task-actions-col { flex-direction: column; }
   }
 
-  @media (max-width: 600px) {
-    .window-header {
-      padding-right: 14px;
-    }
-
-    .paste-section,
-    .tabs-nav {
-      padding-left: 14px;
-      padding-right: 14px;
-    }
-
-    .downloads-area {
-      padding-left: 14px;
-      padding-right: 14px;
-    }
-
-    .tabs-list {
-      gap: 2px;
-      flex: 1;
-    }
-
-    .tab-btn {
-      justify-content: center;
-      padding: 0 9px;
-      white-space: nowrap;
-    }
-
-    .empty-state {
-      padding-left: 16px;
-      padding-right: 16px;
-    }
-
-    .task-card {
-      gap: 10px;
-      padding-left: 10px;
-      padding-right: 10px;
-    }
-
-    .service-icon {
-      width: 40px;
-      height: 40px;
-      flex-basis: 40px;
-    }
+  @media (max-width: 400px) {
+    .tabs-list { flex-basis: 100%; }
+    .tab-btn { flex-basis: calc(50% - 2px); }
+    .sniffer-heading { flex-direction: column; }
+    .sniffer-control { align-self: flex-start; }
+    .capture-header-tools { width: 100%; }
+    .capture-search { flex: 1; }
   }
 </style>

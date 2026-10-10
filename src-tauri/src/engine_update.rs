@@ -9,8 +9,9 @@
 // offline fallback).
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::Duration;
+use tokio::process::Command;
 
 const RELEASE_API: &str = "https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest";
 const RELEASE_DOWNLOAD: &str = "https://github.com/yt-dlp/yt-dlp/releases/download";
@@ -39,18 +40,28 @@ pub fn updated_binary_path(app_data_dir: &Path) -> PathBuf {
 }
 
 /// Run `<binary> --version`. Returns the trimmed version string.
-pub fn installed_version(path: &Path) -> Option<String> {
+pub async fn installed_version(path: &Path) -> Option<String> {
+    installed_version_with_timeout(path, Duration::from_secs(5)).await
+}
+
+async fn installed_version_with_timeout(path: &Path, timeout: Duration) -> Option<String> {
     if !path.exists() {
         return None;
     }
-    // Adefunct build must never block startup for long; the smoke run only
-    // prints a version string.
-    let output = Command::new(path)
+    // A cold standalone engine can take seconds to unpack. Never wait on the
+    // UI thread, and kill a hung probe when the timeout drops its future.
+    let child = Command::new(path)
         .arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .output()
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|error| eprintln!("Could not inspect engine {}: {error}", path.display()))
+        .ok()?;
+    let output = tokio::time::timeout(timeout, child.wait_with_output())
+        .await
+        .ok()?
         .ok()?;
     if !output.status.success() {
         return None;
@@ -70,7 +81,8 @@ fn request_client(proxy_url: Option<&str>) -> Result<reqwest::Client, String> {
     if let Some(proxy_url) = proxy_url.map(str::trim).filter(|value| !value.is_empty()) {
         let proxy = reqwest::Proxy::all(proxy_url)
             .map_err(|error| format!("Invalid proxy URL '{proxy_url}': {error}"))?;
-        builder = builder.proxy(proxy.no_proxy(reqwest::NoProxy::from_string("localhost,127.0.0.1")));
+        builder =
+            builder.proxy(proxy.no_proxy(reqwest::NoProxy::from_string("localhost,127.0.0.1")));
     }
     builder
         .build()
@@ -157,7 +169,9 @@ pub async fn download_version(
     // fetch failure here must not block an otherwise sound update.
     match tokio::time::timeout(
         Duration::from_secs(60),
-        client.get(format!("{RELEASE_DOWNLOAD}/{version}/SHA2-256SUMS")).send(),
+        client
+            .get(format!("{RELEASE_DOWNLOAD}/{version}/SHA2-256SUMS"))
+            .send(),
     )
     .await
     {
@@ -167,7 +181,8 @@ pub async fn download_version(
                     let mut parts = line.split_whitespace();
                     let digest = parts.next()?;
                     let name = parts.next()?;
-                    (name == asset || name == format!("*{asset}")).then(|| digest.trim().to_ascii_lowercase())
+                    (name == asset || name == format!("*{asset}"))
+                        .then(|| digest.trim().to_ascii_lowercase())
                 });
                 if let Some(expected) = expected {
                     let actual = hex_digest(&binary);
@@ -179,7 +194,9 @@ pub async fn download_version(
                 }
             }
         }
-        _ => eprintln!("yt-dlp SHA2-256SUMS unavailable; installing the downloaded binary unchecked"),
+        _ => {
+            eprintln!("yt-dlp SHA2-256SUMS unavailable; installing the downloaded binary unchecked")
+        }
     }
 
     // Stage, then promote: a mid-write crash must not leave a half-installed
@@ -190,6 +207,7 @@ pub async fn download_version(
     set_executable(&staged)?;
 
     let staged_version = installed_version(&staged)
+        .await
         .ok_or_else(|| "Downloaded yt-dlp engine failed its smoke test".to_string())?;
     if !staged_version.trim().eq_ignore_ascii_case(version.trim()) {
         let _ = std::fs::remove_file(&staged);
@@ -222,4 +240,82 @@ fn set_executable(path: &Path) -> Result<(), String> {
 #[cfg(not(unix))]
 fn set_executable(_path: &Path) -> Result<(), String> {
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    struct Probe(PathBuf);
+    static PROBE_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    impl Probe {
+        fn new(script: &str) -> Self {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let sequence = PROBE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!(
+                "cobalt-engine-probe-{}-{nonce}-{sequence}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("probe");
+            std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
+            set_executable(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(self.0.parent().unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn version_probe_reads_success_and_rejects_invalid_output() {
+        let valid = Probe::new("printf ' 2026.10.10\\n'");
+        assert_eq!(
+            installed_version(&valid.0).await.as_deref(),
+            Some("2026.10.10")
+        );
+        let failed = Probe::new("printf '2026.10.10\\n'; exit 1");
+        assert!(installed_version(&failed.0).await.is_none());
+        let empty = Probe::new("printf '  \\n'");
+        assert!(installed_version(&empty.0).await.is_none());
+        assert!(installed_version(&empty.0.with_file_name("missing"))
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn hung_version_probe_times_out_without_blocking_or_leaking_child() {
+        let hung = Probe::new("echo $$ > \"$0.pid\"\nexec /bin/sleep 30");
+        let started = std::time::Instant::now();
+        let probe = installed_version_with_timeout(&hung.0, Duration::from_secs(3));
+        let heartbeat = async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "probe blocked the async executor"
+            );
+        };
+        let (version, ()) = tokio::join!(probe, heartbeat);
+        assert!(version.is_none());
+        assert!(started.elapsed() < Duration::from_secs(5));
+
+        let pid = std::fs::read_to_string(hung.0.with_extension("pid")).unwrap();
+        // kill_on_drop sends the signal immediately; allow the OS to reap it.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let alive = Command::new("/bin/kill")
+            .args(["-0", pid.trim()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .unwrap();
+        assert!(!alive.success(), "timed-out probe was left running");
+    }
 }

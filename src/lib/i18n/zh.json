@@ -123,6 +123,7 @@
     "status.announce.failed": "下载失败：{title}",
     "status.announce.cancelled": "下载已取消：{title}",
     "settings.engine": "下载引擎",
+    "engine.loading": "正在读取引擎版本…",
     "engine.version": "yt-dlp {version}",
     "engine.source.bundled": "内置",
     "engine.source.updated": "已更新",

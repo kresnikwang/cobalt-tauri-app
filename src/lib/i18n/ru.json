@@ -123,6 +123,7 @@
     "status.announce.failed": "Ошибка загрузки: {title}",
     "status.announce.cancelled": "Загрузка отменена: {title}",
     "settings.engine": "Движок загрузки",
+    "engine.loading": "Проверка версии движка…",
     "engine.version": "yt-dlp {version}",
     "engine.source.bundled": "в сборке",
     "engine.source.updated": "обновлён",

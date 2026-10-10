@@ -123,6 +123,7 @@
     "status.announce.failed": "Download failed: {title}",
     "status.announce.cancelled": "Download cancelled: {title}",
     "settings.engine": "Download Engine",
+    "engine.loading": "Reading engine version…",
     "engine.version": "yt-dlp {version}",
     "engine.source.bundled": "bundled",
     "engine.source.updated": "updated",
