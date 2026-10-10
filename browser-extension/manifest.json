@@ -1,0 +1,20 @@
+{
+  "manifest_version": 3,
+  "name": "Send to Cobalt",
+  "version": "1.0.0",
+  "description": "Send the current page or any link to Cobalt Desktop for download.",
+  "permissions": ["activeTab", "contextMenus"],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Send to Cobalt"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "cobalt@kresnikwang.app",
+      "strict_min_version": "121.0"
+    }
+  }
+}

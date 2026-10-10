@@ -15,6 +15,7 @@ mod xinpianchang;
 mod gallerydl;
 mod engine_update;
 mod playlist;
+mod uge;
 
 const LEGACY_API_URL: &str = "http://43.156.122.169";
 const DEFAULT_API_URL: &str = "http://47.241.10.142/cobalt-api";
@@ -78,6 +79,14 @@ pub struct Settings {
     /// UNIX timestamp of the last auto-update check (rate limited to daily).
     #[serde(default)]
     pub ytdlp_checked_at: Option<u64>,
+    /// Skip sponsor / self-promo / interaction segments on YouTube via
+    /// yt-dlp's SponsorBlock integration.
+    #[serde(default)]
+    pub sponsorblock_enabled: bool,
+    /// `"remove"` cuts the segments out of the file; `"mark"` keeps the video
+    /// intact and only adds SponsorBlock chapter markers.
+    #[serde(default = "default_sponsorblock_mode")]
+    pub sponsorblock_mode: String,
 }
 
 fn default_true() -> bool {
@@ -90,6 +99,10 @@ fn default_concurrent_fragments() -> u32 {
 
 fn default_subtitle_langs() -> String {
     "zh.*,en.*,en,zh-Hans,zh-Hant".to_string()
+}
+
+fn default_sponsorblock_mode() -> String {
+    "remove".to_string()
 }
 
 impl Settings {
@@ -117,6 +130,8 @@ impl Settings {
             ytdlp_updated_version: None,
             ytdlp_updated_at: None,
             ytdlp_checked_at: None,
+            sponsorblock_enabled: false,
+            sponsorblock_mode: default_sponsorblock_mode(),
         }
     }
 
@@ -1251,6 +1266,19 @@ fn ytdlp_format(settings: &Settings) -> String {
     )
 }
 
+/// yt-dlp SponsorBlock flags for the chosen mode, or empty when disabled.
+/// `"all"` covers every SponsorBlock category (sponsor, self-promo, interaction…).
+/// Only meaningful for YouTube; callers gate on the host themselves.
+fn sponsorblock_args(enabled: bool, mode: &str) -> Vec<&'static str> {
+    if !enabled {
+        return Vec::new();
+    }
+    match mode.trim() {
+        "mark" => vec!["--sponsorblock-mark", "all"],
+        _ => vec!["--sponsorblock-remove", "all"],
+    }
+}
+
 fn ytdlp_error_text(stderr: &str) -> String {
     let lower = stderr.to_lowercase();
     if lower.contains("sign in to confirm") || lower.contains("not a bot") {
@@ -1613,6 +1641,13 @@ async fn try_local_ytdlp_download(
             }
             if settings.embed_thumbnail {
                 cmd.arg("--embed-thumbnail");
+            }
+        }
+
+        // SponsorBlock is a YouTube-only feature; other extractors ignore it.
+        if is_youtube {
+            for flag in sponsorblock_args(settings.sponsorblock_enabled, &settings.sponsorblock_mode) {
+                cmd.arg(flag);
             }
         }
 
@@ -3205,6 +3240,92 @@ fn download_url(url: String, state: tauri::State<'_, Arc<Mutex<AppState>>>, app_
     enqueue_download(&url, state.inner(), &app_handle)
 }
 
+/// User-Guided Extraction: open a real browser window at `url`, let the user
+/// play the video, and hand the detected progressive stream to the direct
+/// downloader. The Downie-style fallback for sites no engine resolves.
+#[tauri::command]
+async fn start_manual_extraction(
+    url: String,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+    app_handle: tauri::AppHandle,
+) -> Result<DownloadTask, String> {
+    let page_url = url.trim().to_string();
+    if !uge::is_candidate(&page_url) {
+        return Err("Manual extraction needs an http(s) page URL".to_string());
+    }
+
+    let id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+        .to_string();
+
+    let task = DownloadTask {
+        id: id.clone(),
+        url: page_url.clone(),
+        title: "Extracting…".to_string(),
+        status: "analyzing".to_string(),
+        progress: 0.0,
+        speed: "0 B/s".to_string(),
+        downloaded_bytes: 0,
+        total_bytes: 0,
+        eta: "--:--".to_string(),
+        error: None,
+        output_path: None,
+        kind: "file".to_string(),
+        engine: String::new(),
+        items_total: 0,
+        items_done: 0,
+        playlist_index: None,
+        playlist_count: None,
+        playlist_parent_id: None,
+    };
+    {
+        let mut lock = state.lock().unwrap_or_else(|error| error.into_inner());
+        lock.tasks.insert(id.clone(), task.clone());
+        save_tasks(&lock.tasks, &lock.tasks_path);
+    }
+    let _ = app_handle.emit("task-updated", task.clone());
+
+    let settings = {
+        let lock = state.lock().unwrap_or_else(|error| error.into_inner());
+        lock.settings.clone()
+    };
+
+    match uge::start_uge(&app_handle, &page_url).await {
+        Ok(resolved) => {
+            let descriptor = DirectMediaDescriptor {
+                url: resolved.url,
+                headers: HashMap::from([
+                    ("Referer".to_string(), page_url.clone()),
+                    ("Range".to_string(), "bytes=0-".to_string()),
+                    ("Accept".to_string(), "*/*".to_string()),
+                    ("User-Agent".to_string(),
+                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.6 Safari/605.1.15".to_string()),
+                ]),
+                filename: resolved.filename,
+                expected_bytes: resolved.expected_bytes,
+                decode_key: None,
+                use_proxy: true,
+            };
+            {
+                let mut lock = state.lock().unwrap_or_else(|error| error.into_inner());
+                if let Some(existing) = lock.tasks.get_mut(&id) {
+                    existing.status = "downloading".to_string();
+                    existing.speed = "Manual extract".to_string();
+                    let _ = app_handle.emit("task-updated", existing.clone());
+                }
+            }
+            download_direct_stream(id, descriptor, settings, state.inner().clone(), app_handle).await;
+            Ok(task)
+        }
+        Err(error) => {
+            update_task_failed(id, format!("Manual extraction failed: {error}"), state.inner(), &app_handle);
+            Err(error)
+        }
+    }
+}
+
 #[tauri::command]
 async fn get_sniffer_state(sniffer_state: tauri::State<'_, Arc<Mutex<sniffer::SnifferState>>>) -> Result<sniffer::SnifferViewState, String> {
     let state = sniffer_state.inner().clone();
@@ -3802,6 +3923,7 @@ pub fn run() {
             delete_task,
             clear_completed,
             download_url,
+            start_manual_extraction,
             get_sniffer_state,
             start_sniffer,
             stop_sniffer,
@@ -3840,7 +3962,7 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{api_request_url, decode_wechat_file, deep_link_target_url, extractor_display_name, first_http_url, generic_video_id, is_ytdlp_probe_blocked, migrate_legacy_api_url, remove_task_partial_files, xor_wechat_isaac64_prefix, AppState, DownloadTask, Isaac64, Settings};
+    use super::{api_request_url, decode_wechat_file, deep_link_target_url, extractor_display_name, first_http_url, generic_video_id, is_ytdlp_probe_blocked, migrate_legacy_api_url, remove_task_partial_files, sponsorblock_args, xor_wechat_isaac64_prefix, AppState, DownloadTask, Isaac64, Settings};
     use std::collections::{HashMap, HashSet};
     use std::path::PathBuf;
     use std::io::Write;
@@ -4060,6 +4182,19 @@ mod tests {
         );
         assert_eq!(generic_video_id("https://example.com/"), None);
         assert_eq!(generic_video_id("not a url"), None);
+    }
+
+    #[test]
+    fn sponsorblock_flags_follow_mode_and_toggle() {
+        // Disabled → no flags at all.
+        assert!(sponsorblock_args(false, "remove").is_empty());
+        assert!(sponsorblock_args(false, "mark").is_empty());
+        // Default/unknown mode → remove.
+        assert_eq!(sponsorblock_args(true, "remove"), vec!["--sponsorblock-remove", "all"]);
+        assert_eq!(sponsorblock_args(true, ""), vec!["--sponsorblock-remove", "all"]);
+        assert_eq!(sponsorblock_args(true, "bogus"), vec!["--sponsorblock-remove", "all"]);
+        // Mark mode → chapter markers only.
+        assert_eq!(sponsorblock_args(true, "mark"), vec!["--sponsorblock-mark", "all"]);
     }
 
     #[test]

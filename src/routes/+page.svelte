@@ -20,7 +20,8 @@
     IconPlayerStop,
     IconRefresh,
     IconCheck,
-    IconSearch
+    IconSearch,
+    IconBrowser
   } from "@tabler/icons-svelte";
 
   import { t, getLocale, setLocale, initLocale, availableLocales } from '$lib/i18n.svelte';
@@ -36,6 +37,7 @@
 
   // State declaration using Svelte 5 Runes
   let inputUrl = $state('');
+  let extracting = $state(false);
   let isDragging = $state(false);
   let showSettings = $state(false);
   let inputMode = $state<'url' | 'sniffer'>('url');
@@ -66,6 +68,8 @@
     embedSubtitles: true,
     embedMetadata: true,
     embedThumbnail: false,
+    sponsorblockEnabled: false,
+    sponsorblockMode: 'remove',
     playlistPrompt: true,
     notifyOnFinish: true,
     ytdlpAutoUpdate: true
@@ -368,6 +372,21 @@
       actionError = String(error);
     } finally {
       submitting = false;
+    }
+  }
+
+  async function handleManualExtract() {
+    const cleanUrl = (inputUrl ?? '').trim();
+    if (!cleanUrl || submitting || extracting) return;
+    inputUrl = '';
+    extracting = true;
+    actionError = '';
+    try {
+      await invoke('start_manual_extraction', { url: cleanUrl });
+    } catch (error) {
+      actionError = String(error);
+    } finally {
+      extracting = false;
     }
   }
 
@@ -697,6 +716,15 @@
         <button class="download-trigger-btn" onclick={() => handleDownload()} disabled={!inputUrl.trim() || submitting}>
           <IconDownload size={18} />
           <span>{submitting ? t('download.submitting') : t('analyze')}</span>
+        </button>
+        <button
+          class="manual-extract-btn"
+          onclick={() => handleManualExtract()}
+          disabled={!inputUrl.trim() || submitting || extracting}
+          title={t('home.manual_extract')}
+        >
+          <IconBrowser size={16} />
+          <span>{extracting ? t('download.submitting') : t('home.manual_extract')}</span>
         </button>
       </div>
     </section>
@@ -1134,6 +1162,22 @@
             <label for="embed-thumbnail">{t('settings.embed_thumbnail')}</label>
           </div>
 
+          <!-- SponsorBlock (YouTube) -->
+          <div class="setting-item checkbox-item">
+            <input type="checkbox" id="sponsorblock" bind:checked={settings.sponsorblockEnabled} onchange={saveSettings} />
+            <label for="sponsorblock">{t('settings.sponsorblock')}</label>
+          </div>
+
+          {#if settings.sponsorblockEnabled}
+            <div class="setting-item">
+              <select id="sponsorblock-mode" bind:value={settings.sponsorblockMode} onchange={saveSettings} class="settings-select">
+                <option value="remove">{t('settings.sponsorblock.remove')}</option>
+                <option value="mark">{t('settings.sponsorblock.mark')}</option>
+              </select>
+              <span class="setting-hint">{t('settings.sponsorblock.hint')}</span>
+            </div>
+          {/if}
+
           <!-- Remote API -->
           <div class="setting-divider"></div>
           <div class="setting-section-title">{t('settings.api')}</div>
@@ -1454,6 +1498,38 @@
     border-color: var(--bg-track);
     color: var(--text-muted);
     box-shadow: none;
+    cursor: not-allowed;
+  }
+
+  .manual-extract-btn {
+    flex: 0 0 auto;
+    white-space: nowrap;
+    background: transparent;
+    border: 1px solid var(--border-color);
+    color: var(--text-secondary);
+    padding: 0 12px;
+    height: 42px;
+    margin-right: 8px;
+    border-radius: var(--radius-lg);
+    font-weight: 500;
+    font-size: 13px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    cursor: pointer;
+    transition-property: background-color, border-color, color;
+    transition-duration: 150ms;
+    transition-timing-function: ease-out;
+  }
+
+  .manual-extract-btn:hover:not(:disabled) {
+    background: var(--bg-track);
+    border-color: var(--border-focus);
+    color: var(--text-primary);
+  }
+
+  .manual-extract-btn:disabled {
+    color: var(--text-muted);
     cursor: not-allowed;
   }
 

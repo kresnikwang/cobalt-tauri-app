@@ -40,6 +40,9 @@ Tauri 重构版采取了**解耦进程架构**：
 - **🖥 菜单栏 + URL Scheme**：菜单栏图标可呼出窗口、下载剪贴板链接；浏览器/快捷指令支持 `cobalt://download?url=<链接>` 直接投递给应用。
 - **🌐 远程服务辅助解析**：对 Instagram、X、Pinterest 等平台保留服务端辅助下载路径，降低本地解析复杂度。
 - **➕ yt-dlp 通用兜底**：远程服务报"不支持"的站点，自动用本地 `yt-dlp --dump-json` 探测（1700+ 站点 extractor），能解析就本地下载——Vimeo、Rutube、AcFun、西瓜视频等长尾站点开箱即用；抖音 / TikTok / 小红书等登录墙站点自动跳过探测避免空等。
+- **🧭 手动提取（UGE）**：对任何引擎都搞不定的站点，点「手动提取」打开内置浏览器，播放视频后自动嗅探网络里的媒体流并列出，点选即可下载（Downie 式万能兜底）。
+- **🧩 浏览器扩展**：`browser-extension/` 提供 Chrome / Edge / Firefox 一键扩展，工具栏按钮或右键菜单即可把当前页面 / 链接 / 视频投递给应用（走现有 `cobalt://` 深链）。
+- **🚫 SponsorBlock**：YouTube 下载可自动跳过广告、自我推广与互动片段，支持「移除片段」或「标记为章节」两种模式。
 - **🖧 完整 HTTP 代理支持**：支持注入 Clash / Clash Verge 等本地代理服务，所有请求及下载分片均经过代理转发，确保顺畅拉取外网资源。
 - **🌐 动态多语言支持**：支持 英文 (English)、中文 (简体中文) 和 俄文 (Русский)，采用 Svelte 5 的 Rune 状态机驱动，实现一键无缝切换语言。
 - **🎨 深色高级 UI/UX**：基于 Svelte 5 新特性 Runes 构建暗色工作台界面，包含紧凑任务卡、下载上下文提示、平台能力标签与拖拽检测。
@@ -86,6 +89,9 @@ The Tauri rebuild decouples these components:
 - **🖥 Menu-bar icon + URL scheme**: the tray icon shows the window or downloads the clipboard link, and browsers / Shortcuts can hand a link to Cobalt with `cobalt://download?url=<url>`.
 - **🌐 Server-assisted fallback**: Remote media service integration remains available for Instagram, X, Pinterest, and similar sites.
 - **➕ yt-dlp generic fallback**: When the remote service reports "unsupported", the app probes the URL with local `yt-dlp --dump-json` (1700+ site extractors) and downloads locally if it can resolve it — Vimeo, Rutube, AcFun, Xigua and other long-tail sites work out of the box. Login-walled hosts (Douyin / TikTok / Xiaohongshu) are auto-skipped to avoid pointless waits.
+- **🧭 Manual extraction (UGE)**: For any site no engine can handle, click "Manual extract" to open a built-in browser, play the video, and Cobalt sniffs the network for media streams and lists them — pick one to download (the Downie-style universal fallback).
+- **🧩 Browser extension**: `browser-extension/` ships a one-click extension for Chrome / Edge / Firefox — toolbar button or right-click menu sends the current page / link / video to the app via the existing `cobalt://` deep link.
+- **🚫 SponsorBlock**: YouTube downloads can skip sponsor, self-promo and interaction segments, in "remove" or "mark as chapters" mode.
 - **🖧 Full HTTP Proxy Support**: Seamlessly routes all scrapers and stream downloads through local Clash / Verge proxies.
 - **🌐 Dynamic Multi-language**: Translated into English, Chinese (中文), and Russian (Русский).
 - **🎨 Compact dark-mode UI**: Built with Svelte 5 runes (`$state`, `$derived`), with task cards, context pills, platform capability labels, and link drag-and-drop detection.
