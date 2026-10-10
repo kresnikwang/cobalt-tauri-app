@@ -59,23 +59,39 @@ describe('crypto — encryptStream / decryptStream', () => {
     });
 
     describe('decryption errors', () => {
+        // aes-256-cbc is unauthenticated: a wrong key/IV or tampered bytes is
+        // rejected through PKCS#7 padding only ~255/256 of the time, so asserting
+        // `.toThrow()` was flaky. The real guarantee is confidentiality — the
+        // original plaintext must never be recovered. When padding happens to be
+        // valid the output is garbled (and the caller's JSON.parse in
+        // stream/manage.js rejects it), so assert that property deterministically.
+        const original = Buffer.from(JSON.stringify({ x: 1 }));
+        const assertUnreadable = (ciphertext, useIV, useSecret) => {
+            try {
+                const output = decryptStream(ciphertext, useIV, useSecret);
+                expect(Buffer.compare(output, original)).not.toBe(0);
+            } catch {
+                // Invalid PKCS#7 padding: the decipher rejected the data, as expected.
+            }
+        };
+
         it('should fail to decrypt with wrong IV', () => {
             const wrongIV = randomBytes(16).toString('base64url');
             const ciphertext = encryptStream({ x: 1 }, iv, secret);
-            expect(() => decryptStream(ciphertext, wrongIV, secret)).toThrow();
+            assertUnreadable(ciphertext, wrongIV, secret);
         });
 
         it('should fail to decrypt with wrong secret', () => {
             const wrongSecret = randomBytes(32).toString('base64url');
             const ciphertext = encryptStream({ x: 1 }, iv, secret);
-            expect(() => decryptStream(ciphertext, iv, wrongSecret)).toThrow();
+            assertUnreadable(ciphertext, iv, wrongSecret);
         });
 
         it('should fail to decrypt corrupt data', () => {
             const ciphertext = encryptStream({ x: 1 }, iv, secret);
-            // Tamper with the ciphertext
-            ciphertext[0] = ciphertext[0] ^ 0xFF;
-            expect(() => decryptStream(ciphertext, iv, secret)).toThrow();
+            // Flip the last byte so the final (padding) block is affected.
+            ciphertext[ciphertext.length - 1] ^= 0xff;
+            assertUnreadable(ciphertext, iv, secret);
         });
     });
 

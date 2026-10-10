@@ -60,8 +60,10 @@ git fetch upstream --tags
 - `api/src/processing/__tests__/url.test.js`
 - `api/src/store/__tests__/memory-store.test.js`
 - `api/src/security/__tests__/secrets.test.js`
-- `api/src/misc/__tests__/crypto.test.js`（**含一个已知偶发用例**：AES-256-CBC 翻转 ciphertext 首字节，
-  单块 padding 仍合法概率约 1/256，约 0.4% 概率误过；如要稳定可改为翻转末字节）
+- `api/src/misc/__tests__/crypto.test.js`（AES-256-CBC **无完整性校验**：错误 key/IV/篡改只靠 PKCS#7
+  padding 报错，而单块 padding 恰好合法的概率约 1/256（≈0.4%），旧的 `.toThrow()` 断言因此偶发误失败。
+  三个「解密应失败」用例已改为**确定性断言**——decipher 抛错或产出乱码都算正确拒绝，只断言原文不可恢复，
+  篡改位也改到末字节；**勿再改回 `.toThrow()`**。4 万次错误密钥实测：156 次 padding 合法、0 次还原原文）
 - `api/src/misc/__tests__/api-url.test.js`
 - 配套测试接线改动：`api/src/misc/run-test.js`、`api/src/util/test.js`
 
