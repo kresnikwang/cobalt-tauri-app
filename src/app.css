@@ -1,41 +1,49 @@
 :root {
   --font-primary: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', sans-serif;
   --font-display: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', sans-serif;
-  
-  /* Modern Dark Premium Palette */
-  --bg-app: #08090c;
-  --bg-card: rgba(19, 20, 25, 0.9);
-  --bg-card-hover: rgba(24, 25, 31, 0.95);
-  --bg-input: rgba(7, 8, 11, 0.9);
-  
-  --border-color: rgba(255, 255, 255, 0.08);
-  --border-hover: rgba(255, 255, 255, 0.15);
-  --border-focus: rgba(119, 133, 255, 0.56);
-  
-  --text-primary: #f4f5f7;
-  --text-secondary: #a0a4ae;
-  --text-muted: #6f7480;
-  
-  /* Accents */
-  --accent-primary: #7785ff;
-  --accent-secondary: #6372ee;
-  --accent-gradient: linear-gradient(135deg, #8494ff 0%, #6877f0 100%);
-  --success-gradient: linear-gradient(135deg, #34d399 0%, #10b981 100%);
-  --danger-gradient: linear-gradient(135deg, #f87171 0%, #ef4444 100%);
-  --warning-gradient: linear-gradient(135deg, #fbbf24 0%, #f59e0b 100%);
-  
-  --shadow-sm: 0 2px 8px -2px rgba(0, 0, 0, 0.5);
-  --shadow-md: 0 8px 20px -6px rgba(0, 0, 0, 0.6);
-  --shadow-lg: 0 16px 36px -12px rgba(0, 0, 0, 0.7);
-  --shadow-border: 0 0 0 1px rgba(255, 255, 255, 0.075);
-  --shadow-border-hover: 0 0 0 1px rgba(255, 255, 255, 0.13);
 
-  /* Shape and spacing scale. Screens that were written with one-off 5px/6px/7px/8px
-     radii read as subtly inconsistent next to each other; these keep them on a ladder. */
-  --radius-sm: 6px;
-  --radius-md: 8px;
-  --radius-lg: 12px;
-  --radius-xl: 16px;
+  /* MUJI: warm paper, white surfaces, charcoal ink, hairline rules.
+     No gradients, no glass, no glow — flat, matte, quiet. */
+  --bg-app: #f4f3ef;          /* warm unbleached paper */
+  --bg-card: #ffffff;
+  --bg-card-hover: #fbfaf7;
+  --bg-input: #ffffff;
+  --bg-track: #eceae5;        /* segmented tracks, well fills */
+  --bg-subtle: #f1efe9;       /* quiet neutral fills */
+
+  --border-color: #e3e0d8;
+  --border-hover: #d2cec5;
+  --border-focus: #3a3733;
+
+  --text-primary: #2b2926;    /* charcoal ink */
+  --text-secondary: #6d675e;
+  --text-muted: #9b958a;
+
+  /* One restrained "accent": near-black charcoal. Status colours are muted,
+     natural dyes (moss / brick / ochre) used sparingly. */
+  --accent-primary: #2f2d29;
+  --accent-secondary: #4a4742;
+  --accent-gradient: #2f2d29;            /* kept as a token name, but flat now */
+  --success-gradient: #5f7d56;           /* moss */
+  --danger-gradient: #b5483a;            /* brick red */
+  --warning-gradient: #b07d2b;           /* ochre */
+
+  --success-text: #4f6b48;
+  --danger-text: #a73f33;
+  --warning-text: #94681f;
+
+  /* Soft, light, barely-there shadows; hairline borders do most of the work. */
+  --shadow-sm: 0 1px 2px rgba(58, 53, 45, 0.05);
+  --shadow-md: 0 3px 12px rgba(58, 53, 45, 0.07);
+  --shadow-lg: 0 10px 32px rgba(58, 53, 45, 0.12);
+  --shadow-border: 0 0 0 1px var(--border-color);
+  --shadow-border-hover: 0 0 0 1px var(--border-hover);
+
+  /* Tighter, squarer corners than the previous rounded dark theme. */
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
+  --radius-xl: 10px;
 
   --page-gutter: 20px;
   --section-gap: 16px;
@@ -44,7 +52,7 @@
 /* One scrollbar treatment for every scrollable region in the app. */
 * {
   scrollbar-width: thin;
-  scrollbar-color: rgba(255, 255, 255, 0.14) transparent;
+  scrollbar-color: rgba(58, 53, 45, 0.2) transparent;
 }
 
 *::-webkit-scrollbar {
@@ -57,12 +65,12 @@
 }
 
 *::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.14);
+  background: rgba(58, 53, 45, 0.18);
   border-radius: 4px;
 }
 
 *::-webkit-scrollbar-thumb:hover {
-  background: rgba(255, 255, 255, 0.24);
+  background: rgba(58, 53, 45, 0.3);
 }
 
 html, body {
@@ -71,7 +79,7 @@ html, body {
   width: 100%;
   height: 100%;
   overflow: hidden;
-  background: transparent !important; /* Allow macOS Vibrancy to show */
+  background: transparent !important; /* keep rounded window corners; #app paints paper */
   color: var(--text-primary);
   font-family: var(--font-primary);
   -webkit-font-smoothing: antialiased;
@@ -87,39 +95,21 @@ html, body {
   box-sizing: border-box;
 }
 
-/* Custom Scrollbars */
-::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
-}
-
-::-webkit-scrollbar-track {
-  background: transparent;
-}
-
-::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.1);
-  border-radius: 4px;
-}
-
-::-webkit-scrollbar-thumb:hover {
-  background: rgba(255, 255, 255, 0.2);
-}
-
-/* Common utilities */
+/* Common surface: flat white card separated by a hairline, not frosted glass. */
 .glass {
   background: var(--bg-card);
-  backdrop-filter: blur(16px);
-  border: 0;
-  box-shadow: var(--shadow-border), var(--shadow-sm);
-  transition-property: background-color, box-shadow;
-  transition-duration: 180ms;
+  backdrop-filter: none;
+  border: 1px solid var(--border-color);
+  box-shadow: var(--shadow-sm);
+  transition-property: background-color, border-color, box-shadow;
+  transition-duration: 160ms;
   transition-timing-function: ease-out;
 }
 
 .glass:hover {
   background: var(--bg-card-hover);
-  box-shadow: var(--shadow-border-hover), var(--shadow-md);
+  border-color: var(--border-hover);
+  box-shadow: var(--shadow-md);
 }
 
 button,
@@ -131,7 +121,7 @@ input {
 button:focus-visible,
 select:focus-visible,
 input:focus-visible {
-  outline: 2px solid var(--accent-primary);
+  outline: 2px solid var(--text-primary);
   outline-offset: 2px;
 }
 

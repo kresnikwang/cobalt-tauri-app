@@ -17,7 +17,7 @@ export const platforms: ServicePlatform[] = [
   { id: 'bilibili', fallbackName: 'Bilibili', domain: 'bilibili.com', color: '#00aeec', bg: 'rgba(0, 174, 236, 0.15)', hosts: ['bilibili.com', 'b23.tv'], keywords: ['bilibili', 'bili'] },
   { id: 'xinpianchang', fallbackName: '新片场', domain: 'xinpianchang.com', color: '#f5b21b', bg: 'rgba(245, 178, 27, 0.15)', hosts: ['xinpianchang.com'], keywords: ['xinpianchang'] },
   { id: 'instagram', fallbackName: 'Instagram', domain: 'instagram.com', color: '#e1306c', bg: 'rgba(225, 48, 108, 0.15)', hosts: ['instagram.com', 'ddinstagram.com'], keywords: ['instagram'] },
-  { id: 'twitter', fallbackName: 'Twitter / X', domain: 'x.com', color: '#e7e9ee', bg: 'rgba(255, 255, 255, 0.08)', hosts: ['x.com', 'twitter.com', 'vxtwitter.com', 'fixvx.com'], keywords: ['twitter', 'x.com'] },
+  { id: 'twitter', fallbackName: 'Twitter / X', domain: 'x.com', color: '#1d1d1f', bg: 'rgba(29, 29, 31, 0.08)', hosts: ['x.com', 'twitter.com', 'vxtwitter.com', 'fixvx.com'], keywords: ['twitter', 'x.com'] },
   { id: 'soundcloud', fallbackName: 'SoundCloud', domain: 'soundcloud.com', color: '#ff5500', bg: 'rgba(255, 85, 0, 0.15)', hosts: ['soundcloud.com'], keywords: ['soundcloud'] },
   { id: 'pinterest', fallbackName: 'Pinterest', domain: 'pinterest.com', color: '#bd081c', bg: 'rgba(189, 8, 28, 0.15)', hosts: ['pinterest.com'], keywords: ['pinterest'] },
   { id: 'dailymotion', fallbackName: 'Dailymotion', domain: 'dailymotion.com', color: '#0066dc', bg: 'rgba(0, 102, 220, 0.15)', hosts: ['dailymotion.com', 'dai.ly'], keywords: ['dailymotion'] }
@@ -60,7 +60,7 @@ export function getServiceInfo(url: string, unknownLabel: string, nameFor: (id: 
   const id = getServiceId(url);
   const platform = id ? matchPlatform(id) : undefined;
   if (!platform) {
-    return { name: unknownLabel, color: '#6366f1', bg: 'rgba(99, 102, 241, 0.15)' };
+    return { name: unknownLabel, color: '#2f2d29', bg: 'rgba(47, 45, 41, 0.1)' };
   }
   return { name: nameFor(platform.id), color: platform.color, bg: platform.bg };
 }
