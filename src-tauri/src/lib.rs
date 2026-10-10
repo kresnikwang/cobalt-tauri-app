@@ -1,21 +1,21 @@
+use base64::Engine;
+use futures_util::StreamExt;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use serde::{Serialize, Deserialize};
+use std::sync::{Arc, Mutex};
+use tauri::path::BaseDirectory;
+use tauri::{Emitter, Manager};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command as TokioCommand;
-use futures_util::StreamExt;
-use tauri::{Emitter, Manager};
-use tauri::path::BaseDirectory;
-use base64::Engine;
 
-mod sniffer;
-mod xinpianchang;
-mod gallerydl;
 mod engine_update;
+mod gallerydl;
 mod playlist;
+mod sniffer;
 mod uge;
+mod xinpianchang;
 
 const LEGACY_API_URL: &str = "http://43.156.122.169";
 const DEFAULT_API_URL: &str = "http://47.241.10.142/cobalt-api";
@@ -161,8 +161,8 @@ pub struct DownloadTask {
     pub url: String,
     pub title: String,
     pub status: String, // "queued" | "analyzing" | "downloading" | "merging" | "completed" | "failed" | "cancelled"
-    pub progress: f64,       // 0–1
-    pub speed: String,          // e.g. "4.5 MB/s"
+    pub progress: f64,  // 0–1
+    pub speed: String,  // e.g. "4.5 MB/s"
     pub downloaded_bytes: u64,
     pub total_bytes: u64,
     pub eta: String,
@@ -199,8 +199,14 @@ fn default_task_kind() -> String {
 // Write via a temp file + rename. A plain overwrite can leave a truncated JSON behind if the
 // process dies mid-write, and the loader then silently discards every setting and task.
 fn write_atomic(path: &std::path::Path, content: &str) -> std::io::Result<()> {
-    let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| std::path::Path::new("."));
-    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("cobalt-data.json");
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("cobalt-data.json");
     let temp = parent.join(format!(".{file_name}.tmp"));
     std::fs::write(&temp, content)?;
     match std::fs::rename(&temp, path) {
@@ -285,10 +291,11 @@ fn is_youtube_url(url: &str) -> bool {
 
 fn is_bilibili_url(url: &str) -> bool {
     if let Ok(parsed) = reqwest::Url::parse(url) {
-        if let Some(host) = parsed.host_str().map(|h| h.trim_start_matches("www.").to_ascii_lowercase()) {
-            return host == "bilibili.com"
-                || host.ends_with(".bilibili.com")
-                || host == "b23.tv";
+        if let Some(host) = parsed
+            .host_str()
+            .map(|h| h.trim_start_matches("www.").to_ascii_lowercase())
+        {
+            return host == "bilibili.com" || host.ends_with(".bilibili.com") || host == "b23.tv";
         }
     }
     false
@@ -296,7 +303,10 @@ fn is_bilibili_url(url: &str) -> bool {
 
 fn is_dailymotion_url(url: &str) -> bool {
     if let Ok(parsed) = reqwest::Url::parse(url) {
-        if let Some(host) = parsed.host_str().map(|h| h.trim_start_matches("www.").to_ascii_lowercase()) {
+        if let Some(host) = parsed
+            .host_str()
+            .map(|h| h.trim_start_matches("www.").to_ascii_lowercase())
+        {
             return host == "dailymotion.com"
                 || host.ends_with(".dailymotion.com")
                 || host == "dai.ly";
@@ -316,7 +326,10 @@ fn is_ytdlp_probe_blocked(url: &str) -> bool {
     let Ok(parsed) = reqwest::Url::parse(url) else {
         return true;
     };
-    let Some(host) = parsed.host_str().map(|h| h.trim_start_matches("www.").to_ascii_lowercase()) else {
+    let Some(host) = parsed
+        .host_str()
+        .map(|h| h.trim_start_matches("www.").to_ascii_lowercase())
+    else {
         return true;
     };
     // Already covered by dedicated local paths.
@@ -364,7 +377,9 @@ fn is_ytdlp_probe_blocked(url: &str) -> bool {
         "fb.watch",
     ];
     BLOCKED_EXACT.iter().any(|b| host == *b)
-        || BLOCKED_SUFFIX.iter().any(|s| host == *s || host.ends_with(&format!(".{s}")))
+        || BLOCKED_SUFFIX
+            .iter()
+            .any(|s| host == *s || host.ends_with(&format!(".{s}")))
 }
 
 /// Friendly display name for a probed extractor, e.g. "Vimeo" for "vimeo".
@@ -394,7 +409,13 @@ fn generic_video_id(url: &str) -> Option<String> {
     // Keep it filesystem-safe.
     let safe: String = candidate
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     let safe = safe.trim_matches('_').to_string();
     if safe.is_empty() {
@@ -563,11 +584,12 @@ fn expand_playlist_selection(
             .find(|entry| entry.index == *index)
             .map(|entry| entry.title.clone())
             .filter(|title| !title.is_empty());
-        let fallback = if playlist_title.trim().is_empty() || playlist_title.starts_with("Analyzing") {
-            format!("Episode {}", index)
-        } else {
-            format!("{} · {}", playlist_title.trim(), index)
-        };
+        let fallback =
+            if playlist_title.trim().is_empty() || playlist_title.starts_with("Analyzing") {
+                format!("Episode {}", index)
+            } else {
+                format!("{} · {}", playlist_title.trim(), index)
+            };
         let title = entry_title.unwrap_or(fallback);
         let child_id = format!("{}-p{}-{}", now, offset, index);
         let child = DownloadTask {
@@ -649,7 +671,9 @@ async fn resolve_playlist_selection(
         let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
         let (decision_tx, decision_channel) = tokio::sync::oneshot::channel::<Vec<u32>>();
         state_lock.cancellations.insert(id.clone(), cancel_tx);
-        state_lock.playlist_decisions.insert(id.clone(), decision_tx);
+        state_lock
+            .playlist_decisions
+            .insert(id.clone(), decision_tx);
         drop(state_lock);
         let _ = app_handle.emit("task-updated", updated);
         cancelled_rx = cancel_rx;
@@ -679,9 +703,7 @@ async fn resolve_playlist_selection(
     // An empty selection means "every episode". The picker only lists the first
     // MAX_ENTRIES, so a larger collection is capped there too (the UI says so).
     let selections: Vec<u32> = if selections.is_empty() {
-        (1..=probe.count)
-            .take(playlist::MAX_ENTRIES)
-            .collect()
+        (1..=probe.count).take(playlist::MAX_ENTRIES).collect()
     } else {
         selections
     };
@@ -707,7 +729,10 @@ fn should_relay_download_through_server(url: &str) -> bool {
     let Ok(parsed) = reqwest::Url::parse(url) else {
         return true;
     };
-    let Some(host) = parsed.host_str().map(|h| h.trim_start_matches("www.").to_ascii_lowercase()) else {
+    let Some(host) = parsed
+        .host_str()
+        .map(|h| h.trim_start_matches("www.").to_ascii_lowercase())
+    else {
         return true;
     };
 
@@ -754,14 +779,19 @@ fn absolute_api_url(settings: &Settings, path_or_url: &str) -> String {
     }
 }
 
-async fn request_media_service(payload: serde_json::Value, settings: &Settings, client: &reqwest::Client) -> Result<serde_json::Value, reqwest::Error> {
-    let res = client.post(api_request_url(settings))
+async fn request_media_service(
+    payload: serde_json::Value,
+    settings: &Settings,
+    client: &reqwest::Client,
+) -> Result<serde_json::Value, reqwest::Error> {
+    let res = client
+        .post(api_request_url(settings))
         .header("Accept", "application/json")
         .header("Content-Type", "application/json")
         .json(&payload)
         .send()
         .await?;
-        
+
     res.json::<serde_json::Value>().await
 }
 
@@ -865,11 +895,13 @@ fn unique_output_path(save_dir: &std::path::Path, filename: &str) -> PathBuf {
         .and_then(|s| s.to_str())
         .unwrap_or(filename);
     let mut output_path = save_dir.join(safe_filename);
-    let ext = output_path.extension()
+    let ext = output_path
+        .extension()
         .and_then(|s| s.to_str())
         .map(|s| format!(".{}", s))
         .unwrap_or_else(|| "".to_string());
-    let base = output_path.file_stem()
+    let base = output_path
+        .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or(safe_filename)
         .to_string();
@@ -890,12 +922,28 @@ const YTDLP_MEDIA_EXTS: &[&str] = &[
 /// Extensions yt-dlp writes next to the media file when subtitles or metadata
 /// are requested. They must never be mistaken for the download's own output.
 const YTDLP_SIDE_EXTS: &[&str] = &[
-    "srt", "vtt", "ass", "ssa", "lrc", "ttml", "sbv", "srv1", "srv2", "srv3",
-    "json3", "description", "jpg", "jpeg", "png", "webp",
+    "srt",
+    "vtt",
+    "ass",
+    "ssa",
+    "lrc",
+    "ttml",
+    "sbv",
+    "srv1",
+    "srv2",
+    "srv3",
+    "json3",
+    "description",
+    "jpg",
+    "jpeg",
+    "png",
+    "webp",
 ];
 
 fn ytdlp_stem_has_output(save_dir: &std::path::Path, stem: &str) -> bool {
-    YTDLP_MEDIA_EXTS.iter().any(|ext| save_dir.join(format!("{}.{}", stem, ext)).exists())
+    YTDLP_MEDIA_EXTS
+        .iter()
+        .any(|ext| save_dir.join(format!("{}.{}", stem, ext)).exists())
 }
 
 /// Extra files yt-dlp leaves behind for a stem (subtitles, thumbnails, ...).
@@ -950,7 +998,11 @@ fn stem_key(save_dir: &std::path::Path, stem: &str) -> String {
 /// Pick a collision-free basename for yt-dlp's `%(ext)s` template and mark it
 /// as in-flight so a task queued for the same media cannot write to the same
 /// `.part`/output while this one is still running.
-fn claim_ytdlp_stem(state: &Arc<Mutex<AppState>>, save_dir: &std::path::Path, base: &str) -> String {
+fn claim_ytdlp_stem(
+    state: &Arc<Mutex<AppState>>,
+    save_dir: &std::path::Path,
+    base: &str,
+) -> String {
     let safe_base = std::path::Path::new(base)
         .file_name()
         .and_then(|s| s.to_str())
@@ -1026,7 +1078,10 @@ fn resolve_ytdlp_path(app_handle: &tauri::AppHandle) -> Option<PathBuf> {
         .filter(|path| path.exists());
     [
         updated,
-        app_handle.path().resolve("binaries/yt-dlp", BaseDirectory::Resource).ok(),
+        app_handle
+            .path()
+            .resolve("binaries/yt-dlp", BaseDirectory::Resource)
+            .ok(),
         Some(PathBuf::from("src-tauri/binaries/yt-dlp")),
         Some(PathBuf::from("/opt/homebrew/bin/yt-dlp")),
         Some(PathBuf::from("/usr/local/bin/yt-dlp")),
@@ -1050,10 +1105,7 @@ fn ytdlp_request_fingerprint(format: &str, settings: &Settings, is_youtube: bool
     };
     format!(
         "v1|{}|{}|{}|{}",
-        format,
-        settings.download_mode,
-        merge,
-        settings.video_quality,
+        format, settings.download_mode, merge, settings.video_quality,
     )
 }
 
@@ -1114,11 +1166,7 @@ fn remove_task_partial_files(task: &DownloadTask) {
 }
 
 /// Post a system notification for a finished task (opt-out in settings).
-fn notify_task_finished(
-    app_handle: &tauri::AppHandle,
-    settings: &Settings,
-    task: &DownloadTask,
-) {
+fn notify_task_finished(app_handle: &tauri::AppHandle, settings: &Settings, task: &DownloadTask) {
     if !settings.notify_on_finish {
         return;
     }
@@ -1131,7 +1179,11 @@ fn notify_task_finished(
                     "{} · {} {}",
                     task.title,
                     task.items_total,
-                    if task.items_total == 1 { "image" } else { "images" }
+                    if task.items_total == 1 {
+                        "image"
+                    } else {
+                        "images"
+                    }
                 )
             } else {
                 task.title.clone()
@@ -1142,7 +1194,9 @@ fn notify_task_finished(
             format!(
                 "{} — {}",
                 task.title,
-                task.error.clone().unwrap_or_else(|| "Download failed".to_string())
+                task.error
+                    .clone()
+                    .unwrap_or_else(|| "Download failed".to_string())
             ),
         ),
         _ => return,
@@ -1161,7 +1215,10 @@ fn notify_task_finished(
 
 fn resolve_node_path(app_handle: &tauri::AppHandle) -> Option<PathBuf> {
     [
-        app_handle.path().resolve("binaries/node", BaseDirectory::Resource).ok(),
+        app_handle
+            .path()
+            .resolve("binaries/node", BaseDirectory::Resource)
+            .ok(),
         Some(PathBuf::from("src-tauri/binaries/node")),
         Some(PathBuf::from("/usr/local/bin/node")),
         Some(PathBuf::from("/opt/homebrew/bin/node")),
@@ -1173,7 +1230,10 @@ fn resolve_node_path(app_handle: &tauri::AppHandle) -> Option<PathBuf> {
 
 fn resolve_ffmpeg_path(app_handle: &tauri::AppHandle) -> Option<PathBuf> {
     [
-        app_handle.path().resolve("binaries/ffmpeg", BaseDirectory::Resource).ok(),
+        app_handle
+            .path()
+            .resolve("binaries/ffmpeg", BaseDirectory::Resource)
+            .ok(),
         Some(PathBuf::from("src-tauri/binaries/ffmpeg")),
         Some(PathBuf::from("/opt/homebrew/bin/ffmpeg")),
         Some(PathBuf::from("/usr/local/bin/ffmpeg")),
@@ -1285,15 +1345,21 @@ fn ytdlp_error_text(stderr: &str) -> String {
         return "YouTube requires local browser cookies. Please log in to YouTube in Chrome/Safari and try again.".to_string();
     }
     if lower.contains("cookies are no longer valid") {
-        return "Local YouTube cookies are expired. Please refresh browser login and try again.".to_string();
+        return "Local YouTube cookies are expired. Please refresh browser login and try again."
+            .to_string();
     }
     if lower.contains("http error 412") || lower.contains("precondition failed") {
         return "Bilibili rejected this request with HTTP 412. Please open Bilibili in Chrome, refresh the page, then retry.".to_string();
     }
-    if lower.contains("login") || lower.contains("not logged in") || lower.contains("请先登录") || lower.contains("登录") {
+    if lower.contains("login")
+        || lower.contains("not logged in")
+        || lower.contains("请先登录")
+        || lower.contains("登录")
+    {
         return "Bilibili login cookies were not accepted. Please make sure Bilibili is logged in with the active Chrome profile.".to_string();
     }
-    stderr.lines()
+    stderr
+        .lines()
         .rev()
         .find(|line| line.contains("ERROR:"))
         .or_else(|| stderr.lines().rev().find(|line| !line.trim().is_empty()))
@@ -1352,15 +1418,15 @@ fn parse_ytdlp_progress_line(line: &str) -> Option<YtdlpProgress> {
         .rfind(|c: char| c.is_whitespace())
         .map(|idx| idx + 1)
         .unwrap_or(0);
-    let percent = text[percent_start..percent_end].trim().parse::<f64>().ok()?;
+    let percent = text[percent_start..percent_end]
+        .trim()
+        .parse::<f64>()
+        .ok()?;
     let progress = (percent / 100.0).clamp(0.0, 0.99);
 
     let total_bytes = if let Some(of_pos) = text.find(" of ") {
         let after_of = &text[of_pos + 4..];
-        let size_token = after_of
-            .split_whitespace()
-            .next()
-            .unwrap_or("");
+        let size_token = after_of.split_whitespace().next().unwrap_or("");
         parse_size_to_bytes(size_token).unwrap_or(0)
     } else {
         0
@@ -1425,7 +1491,10 @@ async fn try_local_ytdlp_download(
         ("Dailymotion".to_string(), "dailymotion".to_string())
     } else if let Some(probe) = generic_probe.as_ref() {
         // Generic yt-dlp fallback: use the extractor name + probed title.
-        (extractor_display_name(&probe.extractor), probe.extractor.clone())
+        (
+            extractor_display_name(&probe.extractor),
+            probe.extractor.clone(),
+        )
     } else {
         ("Dailymotion".to_string(), "dailymotion".to_string())
     };
@@ -1437,7 +1506,8 @@ async fn try_local_ytdlp_download(
         dailymotion_video_id(url)
     } else {
         generic_probe.as_ref().map(|probe| probe.video_id.clone())
-    }.unwrap_or_else(|| id.clone());
+    }
+    .unwrap_or_else(|| id.clone());
     if let Some(probe) = generic_probe.as_ref() {
         // Show the real video title instead of a bare file stem.
         let mut state_lock = state.lock().unwrap_or_else(|error| error.into_inner());
@@ -1525,8 +1595,13 @@ async fn try_local_ytdlp_download(
         sources.extend([Some("safari".to_string()), Some("firefox".to_string())]);
         sources
     } else if is_bilibili {
-        let mut sources: Vec<Option<String>> = chrome_cookie_sources().into_iter().map(Some).collect();
-        sources.extend([Some("safari".to_string()), Some("firefox".to_string()), None]);
+        let mut sources: Vec<Option<String>> =
+            chrome_cookie_sources().into_iter().map(Some).collect();
+        sources.extend([
+            Some("safari".to_string()),
+            Some("firefox".to_string()),
+            None,
+        ]);
         sources
     } else {
         let mut sources = vec![None];
@@ -1589,8 +1664,7 @@ async fn try_local_ytdlp_download(
         if is_youtube {
             // Use yt-dlp defaults (android_vr etc.) so adaptive 720p–4K streams are available.
             // Forcing mweb/web without PO tokens often collapses to progressive ~360p only.
-            cmd.arg("--remote-components")
-                .arg("ejs:github");
+            cmd.arg("--remote-components").arg("ejs:github");
         }
 
         if settings.download_mode == "video" {
@@ -1646,15 +1720,16 @@ async fn try_local_ytdlp_download(
 
         // SponsorBlock is a YouTube-only feature; other extractors ignore it.
         if is_youtube {
-            for flag in sponsorblock_args(settings.sponsorblock_enabled, &settings.sponsorblock_mode) {
+            for flag in
+                sponsorblock_args(settings.sponsorblock_enabled, &settings.sponsorblock_mode)
+            {
                 cmd.arg(flag);
             }
         }
 
         if let Some(ffmpeg_path) = &ffmpeg_path {
             if ffmpeg_path.exists() {
-                cmd.arg("--ffmpeg-location")
-                    .arg(ffmpeg_path);
+                cmd.arg("--ffmpeg-location").arg(ffmpeg_path);
             }
         }
 
@@ -1672,7 +1747,8 @@ async fn try_local_ytdlp_download(
             cmd.env("HTTPS_PROXY", proxy);
         }
 
-        let mut child = cmd.spawn()
+        let mut child = cmd
+            .spawn()
             .map_err(|e| format!("Failed to start local yt-dlp: {}", e))?;
         let mut stdout_pipe = child.stdout.take();
         let mut stderr_pipe = child.stderr.take();
@@ -1680,8 +1756,8 @@ async fn try_local_ytdlp_download(
         let progress_app_handle = app_handle.clone();
         let progress_id = id.clone();
         // Aggregate multi-stage progress for any DASH merge (YouTube/Bilibili video).
-        let aggregate_dash_progress = settings.download_mode == "video"
-            && (is_bilibili || is_youtube);
+        let aggregate_dash_progress =
+            settings.download_mode == "video" && (is_bilibili || is_youtube);
         let progress_task = stdout_pipe.take().map(|stdout_reader| {
             tauri::async_runtime::spawn(async move {
                 let reader = BufReader::new(stdout_reader);
@@ -1708,13 +1784,18 @@ async fn try_local_ytdlp_download(
                             }
                         } else {
                             progress.progress
-                        }.max(last_mapped_progress).min(0.99);
+                        }
+                        .max(last_mapped_progress)
+                        .min(0.99);
 
-                        if now.duration_since(last_emit).as_millis() < 120 && mapped_progress < 0.99 {
+                        if now.duration_since(last_emit).as_millis() < 120 && mapped_progress < 0.99
+                        {
                             continue;
                         }
 
-                        let mut state_lock = progress_state.lock().unwrap_or_else(|error| error.into_inner());
+                        let mut state_lock = progress_state
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner());
                         if let Some(task) = state_lock.tasks.get_mut(&progress_id) {
                             task.status = "downloading".to_string();
                             task.progress = mapped_progress;
@@ -1732,8 +1813,13 @@ async fn try_local_ytdlp_download(
                         }
                         last_mapped_progress = mapped_progress;
                         last_emit = now;
-                    } else if trimmed.contains("[Merger]") || trimmed.contains("[ExtractAudio]") || trimmed.contains("Merging formats") {
-                        let mut state_lock = progress_state.lock().unwrap_or_else(|error| error.into_inner());
+                    } else if trimmed.contains("[Merger]")
+                        || trimmed.contains("[ExtractAudio]")
+                        || trimmed.contains("Merging formats")
+                    {
+                        let mut state_lock = progress_state
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner());
                         if let Some(task) = state_lock.tasks.get_mut(&progress_id) {
                             task.status = "merging".to_string();
                             task.progress = task.progress.max(0.99);
@@ -1778,9 +1864,8 @@ async fn try_local_ytdlp_download(
         match wait_result {
             Ok(status) if status.success() => {
                 if let Some(final_path) = resolve_ytdlp_output(&save_path, &output_stem) {
-                    let downloaded_bytes = std::fs::metadata(&final_path)
-                        .map(|m| m.len())
-                        .unwrap_or(0);
+                    let downloaded_bytes =
+                        std::fs::metadata(&final_path).map(|m| m.len()).unwrap_or(0);
                     if downloaded_bytes > 0 {
                         let final_name = final_path
                             .file_name()
@@ -1797,11 +1882,13 @@ async fn try_local_ytdlp_download(
                         }
                         remove_resume_marker(&save_path, &output_stem);
                         {
-                            let mut state_lock = state.lock().unwrap_or_else(|error| error.into_inner());
+                            let mut state_lock =
+                                state.lock().unwrap_or_else(|error| error.into_inner());
                             state_lock.cancellations.remove(&id);
                         }
                         release_ytdlp_stem(state, &save_path, &output_stem);
-                        let mut state_lock = state.lock().unwrap_or_else(|error| error.into_inner());
+                        let mut state_lock =
+                            state.lock().unwrap_or_else(|error| error.into_inner());
                         if let Some(task) = state_lock.tasks.get_mut(&id) {
                             task.title = final_name;
                             task.output_path = Some(final_path.to_string_lossy().into_owned());
@@ -1850,7 +1937,13 @@ async fn try_local_ytdlp_download(
 fn sanitize_path_component(raw: &str) -> String {
     let cleaned: String = raw
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     let mut cleaned = cleaned;
     while cleaned.contains("__") {
@@ -1874,10 +1967,44 @@ fn gallery_folder_name(url: &str, fallback: &str) -> String {
             }
         }
         const STOP_SEGMENTS: &[&str] = &[
-            "photos", "photo", "artwork", "art", "post", "posts", "a", "gallery", "galleries",
-            "u", "user", "users", "r", "comments", "comment", "pin", "p", "reel", "reels", "tv",
-            "board", "boards", "album", "albums", "images", "image", "view", "blog", "tags",
-            "tag", "search", "profile", "sets", "people", "photostream", "en", "ja", "zh",
+            "photos",
+            "photo",
+            "artwork",
+            "art",
+            "post",
+            "posts",
+            "a",
+            "gallery",
+            "galleries",
+            "u",
+            "user",
+            "users",
+            "r",
+            "comments",
+            "comment",
+            "pin",
+            "p",
+            "reel",
+            "reels",
+            "tv",
+            "board",
+            "boards",
+            "album",
+            "albums",
+            "images",
+            "image",
+            "view",
+            "blog",
+            "tags",
+            "tag",
+            "search",
+            "profile",
+            "sets",
+            "people",
+            "photostream",
+            "en",
+            "ja",
+            "zh",
         ];
         if let Some(segment) = parsed
             .path()
@@ -1962,14 +2089,20 @@ fn gallerydl_error_text(stderr: &str) -> String {
     {
         return "This gallery requires a browser login. Open the page in Chrome and retry, or enable the resource sniffer and play the media there.".to_string();
     }
-    if lower.contains("proxy") || lower.contains("connection") || lower.contains("timed out") || lower.contains("timeout") {
+    if lower.contains("proxy")
+        || lower.contains("connection")
+        || lower.contains("timed out")
+        || lower.contains("timeout")
+    {
         return "gallery-dl could not reach the site through the configured proxy. Check the proxy settings and retry.".to_string();
     }
     stderr
         .lines()
         .map(str::trim)
         .rev()
-        .find(|line| !line.is_empty() && (line.to_lowercase().contains("error") || line.contains("http")))
+        .find(|line| {
+            !line.is_empty() && (line.to_lowercase().contains("error") || line.contains("http"))
+        })
         .unwrap_or("gallery-dl download failed")
         .to_string()
 }
@@ -2183,10 +2316,14 @@ async fn try_local_gallery_download(
             if !trimmed.starts_with('#') && trimmed.starts_with(&progress_folder) {
                 done = done.saturating_add(1);
                 let now = std::time::Instant::now();
-                if now.duration_since(last_emit).as_millis() < 200 && (done as usize) < progress_total {
+                if now.duration_since(last_emit).as_millis() < 200
+                    && (done as usize) < progress_total
+                {
                     continue;
                 }
-                let mut lock = progress_state.lock().unwrap_or_else(|error| error.into_inner());
+                let mut lock = progress_state
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
                 if let Some(task) = lock.tasks.get_mut(&progress_id) {
                     task.items_done = done;
                     if progress_total > 0 {
@@ -2312,12 +2449,21 @@ async fn request_media_service_with_fallbacks(
                     return Ok(result);
                 }
 
-                last_error = result.get("text")
+                last_error = result
+                    .get("text")
                     .and_then(|t| t.as_str())
-                    .or_else(|| result.get("error").and_then(|e| e.get("code")).and_then(|c| c.as_str()))
+                    .or_else(|| {
+                        result
+                            .get("error")
+                            .and_then(|e| e.get("code"))
+                            .and_then(|c| c.as_str())
+                    })
                     .unwrap_or("Unknown media service error")
                     .to_string();
-                println!("YouTube media service request with {} failed: {}", label, last_error);
+                println!(
+                    "YouTube media service request with {} failed: {}",
+                    label, last_error
+                );
             }
             Err(e) => {
                 last_error = format!("Media service error with {}: {}", label, e);
@@ -2343,7 +2489,9 @@ fn process_queue(state: Arc<Mutex<AppState>>, app_handle: tauri::AppHandle) {
         let limit = (state_lock.settings.max_parallel_downloads as usize).max(1);
 
         const RUNNING_STATUSES: [&str; 3] = ["analyzing", "downloading", "merging"];
-        let running_count = state_lock.tasks.values()
+        let running_count = state_lock
+            .tasks
+            .values()
             .filter(|t| RUNNING_STATUSES.contains(&t.status.as_str()))
             .count();
 
@@ -2351,9 +2499,12 @@ fn process_queue(state: Arc<Mutex<AppState>>, app_handle: tauri::AppHandle) {
             return;
         }
 
-        let Some(next_task_id) = state_lock.tasks.iter()
+        let Some(next_task_id) = state_lock
+            .tasks
+            .iter()
             .find(|(_, t)| t.status == "queued")
-            .map(|(id, _)| id.clone()) else {
+            .map(|(id, _)| id.clone())
+        else {
             return;
         };
 
@@ -2384,19 +2535,34 @@ fn process_queue(state: Arc<Mutex<AppState>>, app_handle: tauri::AppHandle) {
 async fn run_download_task(id: String, state: Arc<Mutex<AppState>>, app_handle: tauri::AppHandle) {
     let (url_to_download, settings) = {
         let state_lock = state.lock().unwrap_or_else(|error| error.into_inner());
-        let url = state_lock.tasks.get(&id).map(|task| task.url.clone()).unwrap_or_default();
+        let url = state_lock
+            .tasks
+            .get(&id)
+            .map(|task| task.url.clone())
+            .unwrap_or_default();
         let settings = state_lock.settings.clone();
         (url, settings)
     };
-    
+
     if url_to_download.is_empty() {
         // The task was already flipped to "analyzing" by process_queue, so returning bare would
         // hold a concurrency slot forever. Fail it properly and free the slot.
-        update_task_failed(id, "No URL was provided for this download.".to_string(), &state, &app_handle);
+        update_task_failed(
+            id,
+            "No URL was provided for this download.".to_string(),
+            &state,
+            &app_handle,
+        );
         return;
     }
 
-    let captured_descriptor = { state.lock().unwrap_or_else(|error| error.into_inner()).captured_downloads.remove(&id) };
+    let captured_descriptor = {
+        state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .captured_downloads
+            .remove(&id)
+    };
     if let Some(descriptor) = captured_descriptor {
         if descriptor.kind == "playlist" {
             update_task_failed(id, "Playlist captures are not supported yet. Capture a direct video or audio request instead.".into(), &state, &app_handle);
@@ -2408,7 +2574,12 @@ async fn run_download_task(id: String, state: Arc<Mutex<AppState>>, app_handle: 
 
     if xinpianchang::is_xinpianchang_url(&url_to_download) {
         if settings.download_mode != "video" {
-            update_task_failed(id, "Xinpianchang link downloads currently support video mode only.".into(), &state, &app_handle);
+            update_task_failed(
+                id,
+                "Xinpianchang link downloads currently support video mode only.".into(),
+                &state,
+                &app_handle,
+            );
             return;
         }
         {
@@ -2420,7 +2591,11 @@ async fn run_download_task(id: String, state: Arc<Mutex<AppState>>, app_handle: 
             }
         }
         let resolution = xinpianchang::resolve(&app_handle, &url_to_download).await;
-        let task_is_active = state.lock().unwrap_or_else(|error| error.into_inner()).tasks.get(&id)
+        let task_is_active = state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .tasks
+            .get(&id)
             .map(|task| task.status == "analyzing")
             .unwrap_or(false);
         if !task_is_active {
@@ -2429,7 +2604,12 @@ async fn run_download_task(id: String, state: Arc<Mutex<AppState>>, app_handle: 
         let resolved = match resolution {
             Ok(resolved) => resolved,
             Err(error) => {
-                update_task_failed(id, format!("Xinpianchang resolution failed: {error}"), &state, &app_handle);
+                update_task_failed(
+                    id,
+                    format!("Xinpianchang resolution failed: {error}"),
+                    &state,
+                    &app_handle,
+                );
                 return;
             }
         };
@@ -2514,7 +2694,9 @@ async fn run_download_task(id: String, state: Arc<Mutex<AppState>>, app_handle: 
             &state,
             &app_handle,
             None,
-        ).await {
+        )
+        .await
+        {
             Ok(true) => {
                 process_queue(state, app_handle);
                 return;
@@ -2522,15 +2704,23 @@ async fn run_download_task(id: String, state: Arc<Mutex<AppState>>, app_handle: 
             Ok(false) => {}
             Err(e) => {
                 if local_source_name == "Dailymotion" {
-                    println!("Local Dailymotion download failed, falling back to remote service: {}", e);
+                    println!(
+                        "Local Dailymotion download failed, falling back to remote service: {}",
+                        e
+                    );
                 } else {
-                    update_task_failed(id, format!("Local {} download failed: {}", local_source_name, e), &state, &app_handle);
+                    update_task_failed(
+                        id,
+                        format!("Local {} download failed: {}", local_source_name, e),
+                        &state,
+                        &app_handle,
+                    );
                     return;
                 }
             }
         }
     }
-    
+
     // This client is shared by the resolve request and the media GET that follows, so it must
     // not carry a total timeout — only a connect timeout. The resolve call is bounded separately.
     let mut client_builder = reqwest::Client::builder()
@@ -2545,7 +2735,16 @@ async fn run_download_task(id: String, state: Arc<Mutex<AppState>>, app_handle: 
                 client_builder = client_builder.proxy(proxy);
             }
             Err(error) => {
-                update_task_failed(id, format!("Invalid proxy URL '{}': {}", settings.proxy_url.trim(), error), &state, &app_handle);
+                update_task_failed(
+                    id,
+                    format!(
+                        "Invalid proxy URL '{}': {}",
+                        settings.proxy_url.trim(),
+                        error
+                    ),
+                    &state,
+                    &app_handle,
+                );
                 return;
             }
         }
@@ -2553,34 +2752,52 @@ async fn run_download_task(id: String, state: Arc<Mutex<AppState>>, app_handle: 
     let client = match client_builder.build() {
         Ok(c) => c,
         Err(e) => {
-            update_task_failed(id, format!("Failed to build HTTP client: {}", e), &state, &app_handle);
+            update_task_failed(
+                id,
+                format!("Failed to build HTTP client: {}", e),
+                &state,
+                &app_handle,
+            );
             return;
         }
     };
-    
+
     // The shared client has no total timeout (the media GET reuses it), so bound the resolve
     // call here. Without this a hung server leaves the task in "downloading" forever and its
     // cancellation entry is never reclaimed.
     let result = match tokio::time::timeout(
         std::time::Duration::from_secs(60),
         request_media_service_with_fallbacks(&url_to_download, &settings, &client),
-    ).await {
+    )
+    .await
+    {
         Ok(Ok(res)) => res,
         Ok(Err(e)) => {
             update_task_failed(id, e, &state, &app_handle);
             return;
         }
         Err(_) => {
-            update_task_failed(id, "Media service did not respond within 60 seconds".to_string(), &state, &app_handle);
+            update_task_failed(
+                id,
+                "Media service did not respond within 60 seconds".to_string(),
+                &state,
+                &app_handle,
+            );
             return;
         }
     };
-    
+
     let status = result.get("status").and_then(|s| s.as_str()).unwrap_or("");
     if status == "error" {
-        let err_msg = result.get("text")
+        let err_msg = result
+            .get("text")
             .and_then(|t| t.as_str())
-            .or_else(|| result.get("error").and_then(|e| e.get("code")).and_then(|c| c.as_str()))
+            .or_else(|| {
+                result
+                    .get("error")
+                    .and_then(|e| e.get("code"))
+                    .and_then(|c| c.as_str())
+            })
             .unwrap_or("Unknown media service error");
 
         // The remote picker rejected a post on an image-capable host (single
@@ -2639,12 +2856,10 @@ async fn run_download_task(id: String, state: Arc<Mutex<AppState>>, app_handle: 
                     None
                 };
                 let node_path = resolve_node_path(&app_handle);
-                if let Some(probe) = probe_ytdlp_url(
-                    &ytdlp_path,
-                    node_path.as_deref(),
-                    &url_to_download,
-                    proxy,
-                ).await {
+                if let Some(probe) =
+                    probe_ytdlp_url(&ytdlp_path, node_path.as_deref(), &url_to_download, proxy)
+                        .await
+                {
                     println!(
                         "Remote service failed ({}), local yt-dlp can handle it via extractor '{}'. Retrying locally.",
                         err_msg, probe.extractor
@@ -2656,14 +2871,21 @@ async fn run_download_task(id: String, state: Arc<Mutex<AppState>>, app_handle: 
                         &state,
                         &app_handle,
                         Some(probe),
-                    ).await {
+                    )
+                    .await
+                    {
                         Ok(true) => {
                             process_queue(state, app_handle);
                             return;
                         }
                         Ok(false) => {}
                         Err(e) => {
-                            update_task_failed(id, format!("Local yt-dlp download failed: {}", e), &state, &app_handle);
+                            update_task_failed(
+                                id,
+                                format!("Local yt-dlp download failed: {}", e),
+                                &state,
+                                &app_handle,
+                            );
                             return;
                         }
                     }
@@ -2675,9 +2897,10 @@ async fn run_download_task(id: String, state: Arc<Mutex<AppState>>, app_handle: 
         update_task_failed(id, err_msg.to_string(), &state, &app_handle);
         return;
     }
-    
+
     let download_url;
-    let mut filename = result.get("filename")
+    let mut filename = result
+        .get("filename")
         .and_then(|f| f.as_str())
         .map(|s| s.to_string())
         .unwrap_or_else(|| format!("cobalt_{}", id));
@@ -2692,40 +2915,62 @@ async fn run_download_task(id: String, state: Arc<Mutex<AppState>>, app_handle: 
     } else if status == "picker" {
         if let Some(picker) = result.get("picker").and_then(|p| p.as_array()) {
             if picker.is_empty() {
-                update_task_failed(id, "Picker response returned no items".to_string(), &state, &app_handle);
+                update_task_failed(
+                    id,
+                    "Picker response returned no items".to_string(),
+                    &state,
+                    &app_handle,
+                );
                 return;
             }
-            let chosen = picker.iter()
+            let chosen = picker
+                .iter()
                 .find(|item| item.get("type").and_then(|t| t.as_str()) == Some("video"))
                 .unwrap_or(&picker[0]);
             download_url = absolute_api_url(
                 &settings,
-                chosen.get("url").and_then(|u| u.as_str()).unwrap_or("")
+                chosen.get("url").and_then(|u| u.as_str()).unwrap_or(""),
             );
             if result.get("filename").is_none() {
-                let ext = if chosen.get("type").and_then(|t| t.as_str()) == Some("photo") { "jpg" } else { "mp4" };
+                let ext = if chosen.get("type").and_then(|t| t.as_str()) == Some("photo") {
+                    "jpg"
+                } else {
+                    "mp4"
+                };
                 filename = format!("cobalt_{}.{}", id, ext);
             }
         } else {
-            update_task_failed(id, "Invalid picker response format".to_string(), &state, &app_handle);
+            update_task_failed(
+                id,
+                "Invalid picker response format".to_string(),
+                &state,
+                &app_handle,
+            );
             return;
         }
     } else {
-        update_task_failed(id, format!("Unsupported response status: {}", status), &state, &app_handle);
+        update_task_failed(
+            id,
+            format!("Unsupported response status: {}", status),
+            &state,
+            &app_handle,
+        );
         return;
     }
-    
+
     let save_path = std::path::PathBuf::from(&settings.save_path);
     if !save_path.exists() {
         std::fs::create_dir_all(&save_path).ok();
     }
     let output_path = unique_output_path(&save_path, &filename);
-    
+
     let mut abort_rx = {
         let mut state_lock = state.lock().unwrap_or_else(|error| error.into_inner());
         if let Some(task) = state_lock.tasks.get_mut(&id) {
             // Same guard as the yt-dlp and direct-stream paths: don't revive a cancelled task.
-            if task.status == "cancelled" { return }
+            if task.status == "cancelled" {
+                return;
+            }
             task.title = filename.clone();
             task.status = "downloading".to_string();
             task.output_path = Some(output_path.to_string_lossy().into_owned());
@@ -2733,20 +2978,25 @@ async fn run_download_task(id: String, state: Arc<Mutex<AppState>>, app_handle: 
             let _ = app_handle.emit("task-updated", updated_task);
             save_tasks(&state_lock.tasks, &state_lock.tasks_path);
         }
-        
+
         let (abort_tx, abort_rx) = tokio::sync::oneshot::channel::<()>();
         state_lock.cancellations.insert(id.clone(), abort_tx);
         abort_rx
     };
-    
+
     let media_res = match client.get(&download_url).send().await {
         Ok(res) => res,
         Err(e) => {
-            update_task_failed(id, format!("Media server error: {}", e), &state, &app_handle);
+            update_task_failed(
+                id,
+                format!("Media server error: {}", e),
+                &state,
+                &app_handle,
+            );
             return;
         }
     };
-    
+
     let media_status = media_res.status();
     if !media_status.is_success() {
         let error_text = media_res.text().await.unwrap_or_default();
@@ -2755,10 +3005,15 @@ async fn run_download_task(id: String, state: Arc<Mutex<AppState>>, app_handle: 
         } else {
             format!("{}: {}", media_status, error_text.trim())
         };
-        update_task_failed(id, format!("Media server error: {}", detail), &state, &app_handle);
+        update_task_failed(
+            id,
+            format!("Media server error: {}", detail),
+            &state,
+            &app_handle,
+        );
         return;
     }
-    
+
     let total_bytes = media_res.content_length().unwrap_or(0);
     {
         let mut state_lock = state.lock().unwrap_or_else(|error| error.into_inner());
@@ -2767,7 +3022,7 @@ async fn run_download_task(id: String, state: Arc<Mutex<AppState>>, app_handle: 
             let _ = app_handle.emit("task-updated", task.clone());
         }
     }
-    
+
     let mut file = match tokio::fs::File::create(&output_path).await {
         Ok(f) => f,
         Err(e) => {
@@ -2775,13 +3030,13 @@ async fn run_download_task(id: String, state: Arc<Mutex<AppState>>, app_handle: 
             return;
         }
     };
-    
+
     let mut stream = media_res.bytes_stream();
     let mut downloaded_bytes = 0u64;
     let mut last_speed_time = std::time::Instant::now();
     let mut last_speed_bytes = 0u64;
     let mut last_ui_update = std::time::Instant::now();
-    
+
     loop {
         tokio::select! {
             _ = &mut abort_rx => {
@@ -2797,28 +3052,28 @@ async fn run_download_task(id: String, state: Arc<Mutex<AppState>>, app_handle: 
                             return;
                         }
                         downloaded_bytes += bytes.len() as u64;
-                        
+
                         let now = std::time::Instant::now();
                         let ui_elapsed = now.duration_since(last_ui_update).as_millis();
-                        
+
                         if ui_elapsed >= 120 {
                             let speed_elapsed = now.duration_since(last_speed_time).as_millis();
                             let mut speed_str = "0 B/s".to_string();
                             let mut eta_str = "--:--".to_string();
-                            
+
                             if speed_elapsed >= 1000 {
                                 let speed_bps = ((downloaded_bytes - last_speed_bytes) as f64 / (speed_elapsed as f64)) * 1000.0;
                                 speed_str = format!("{}/s", format_bytes(speed_bps));
-                                
+
                                 if total_bytes > 0 && speed_bps > 0.0 {
                                     let eta_secs = (total_bytes.saturating_sub(downloaded_bytes) as f64 / speed_bps) as u32;
                                     eta_str = format!("{}:{:02}", eta_secs / 60, eta_secs % 60);
                                 }
-                                
+
                                 last_speed_time = now;
                                 last_speed_bytes = downloaded_bytes;
                             }
-                            
+
                             let mut state_lock = state.lock().unwrap_or_else(|error| error.into_inner());
                             if let Some(task) = state_lock.tasks.get_mut(&id) {
                                 task.downloaded_bytes = downloaded_bytes;
@@ -2844,18 +3099,23 @@ async fn run_download_task(id: String, state: Arc<Mutex<AppState>>, app_handle: 
             }
         }
     }
-    
+
     if let Err(e) = file.flush().await {
         update_task_failed(id, format!("Disk flush error: {}", e), &state, &app_handle);
         return;
     }
     drop(file);
-    
+
     if downloaded_bytes == 0 {
-        update_task_failed(id, "No data received from media server (0-byte file)".to_string(), &state, &app_handle);
+        update_task_failed(
+            id,
+            "No data received from media server (0-byte file)".to_string(),
+            &state,
+            &app_handle,
+        );
         return;
     }
-    
+
     {
         let mut state_lock = state.lock().unwrap_or_else(|error| error.into_inner());
         state_lock.cancellations.remove(&id);
@@ -2882,136 +3142,378 @@ async fn run_download_task(id: String, state: Arc<Mutex<AppState>>, app_handle: 
     process_queue(state, app_handle);
 }
 
-async fn download_direct_stream(id: String, descriptor: DirectMediaDescriptor, settings: Settings, state: Arc<Mutex<AppState>>, app_handle: tauri::AppHandle) {
+async fn download_direct_stream(
+    id: String,
+    descriptor: DirectMediaDescriptor,
+    settings: Settings,
+    state: Arc<Mutex<AppState>>,
+    app_handle: tauri::AppHandle,
+) {
     let mut builder = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(30))
         .read_timeout(std::time::Duration::from_secs(60));
     if descriptor.use_proxy && settings.proxy_enabled && !settings.proxy_url.trim().is_empty() {
         match reqwest::Proxy::all(settings.proxy_url.trim()) {
-            Ok(proxy) => { builder = builder.proxy(proxy.no_proxy(reqwest::NoProxy::from_string("localhost,127.0.0.1"))); }
-            Err(error) => { update_task_failed(id, format!("Invalid proxy URL '{}': {}", settings.proxy_url.trim(), error), &state, &app_handle); return; }
+            Ok(proxy) => {
+                builder = builder
+                    .proxy(proxy.no_proxy(reqwest::NoProxy::from_string("localhost,127.0.0.1")));
+            }
+            Err(error) => {
+                update_task_failed(
+                    id,
+                    format!(
+                        "Invalid proxy URL '{}': {}",
+                        settings.proxy_url.trim(),
+                        error
+                    ),
+                    &state,
+                    &app_handle,
+                );
+                return;
+            }
         }
     }
-    let client = match builder.build() { Ok(client) => client, Err(error) => { update_task_failed(id, format!("Failed to build HTTP client: {error}"), &state, &app_handle); return; } };
-    let save_path = PathBuf::from(&settings.save_path); let _ = std::fs::create_dir_all(&save_path); let output_path = unique_output_path(&save_path, &descriptor.filename);
+    let client = match builder.build() {
+        Ok(client) => client,
+        Err(error) => {
+            update_task_failed(
+                id,
+                format!("Failed to build HTTP client: {error}"),
+                &state,
+                &app_handle,
+            );
+            return;
+        }
+    };
+    let save_path = PathBuf::from(&settings.save_path);
+    let _ = std::fs::create_dir_all(&save_path);
+    let output_path = unique_output_path(&save_path, &descriptor.filename);
     let mut request = client.get(&descriptor.url);
-    for (name, value) in &descriptor.headers { request = request.header(name, value); }
-    let response = match request.send().await { Ok(response) => response, Err(error) => { update_task_failed(id, format!("Media request failed: {error}"), &state, &app_handle); return; } };
-    if !response.status().is_success() { update_task_failed(id, format!("Media server returned {}", response.status()), &state, &app_handle); return; }
-    let total_bytes = response.content_length().unwrap_or(descriptor.expected_bytes);
-    let mut abort_rx = { let mut lock = state.lock().unwrap_or_else(|error| error.into_inner()); let Some(task) = lock.tasks.get_mut(&id) else { return; }; if task.status == "cancelled" { return; } task.title = descriptor.filename.clone(); task.status = "downloading".into(); task.total_bytes = total_bytes; task.output_path = Some(output_path.to_string_lossy().into_owned()); let _ = app_handle.emit("task-updated", task.clone()); let (tx, rx) = tokio::sync::oneshot::channel(); lock.cancellations.insert(id.clone(), tx); rx };
-    let mut file = match tokio::fs::File::create(&output_path).await { Ok(file) => file, Err(error) => { update_task_failed(id, format!("Disk write error: {error}"), &state, &app_handle); return; } };
-    let mut stream = response.bytes_stream(); let mut downloaded = 0u64; let mut last_update = std::time::Instant::now();
-    loop { tokio::select! {
-        _ = &mut abort_rx => { drop(file); let _ = std::fs::remove_file(&output_path); return; }
-        chunk = stream.next() => match chunk { Some(Ok(chunk)) => { if let Err(error) = file.write_all(&chunk).await { update_task_failed(id, format!("Disk write error: {error}"), &state, &app_handle); return; } downloaded += chunk.len() as u64; if last_update.elapsed().as_millis() >= 120 { let mut lock = state.lock().unwrap_or_else(|error| error.into_inner()); if let Some(task) = lock.tasks.get_mut(&id) { task.downloaded_bytes = downloaded; if total_bytes > 0 { task.progress = (downloaded as f64 / total_bytes as f64).min(0.99); } let _ = app_handle.emit("task-updated", task.clone()); } last_update = std::time::Instant::now(); } }, Some(Err(error)) => { update_task_failed(id, format!("Media download error: {error}"), &state, &app_handle); return; }, None => break }
-    }}
-    if downloaded == 0 { update_task_failed(id, "No data received from media URL".into(), &state, &app_handle); return; }
-    if let Some(decode_key) = descriptor.decode_key.as_deref() {
-        if let Err(error) = decode_wechat_file(&output_path, decode_key) { let _ = std::fs::remove_file(&output_path); update_task_failed(id, format!("WeChat media decryption failed: {error}"), &state, &app_handle); return; }
+    for (name, value) in &descriptor.headers {
+        request = request.header(name, value);
     }
-    let (updated_task, settings) = { let mut lock = state.lock().unwrap_or_else(|error| error.into_inner()); lock.cancellations.remove(&id); let result = if let Some(task) = lock.tasks.get_mut(&id) { task.status="completed".into(); task.progress=1.0; task.downloaded_bytes=downloaded; task.eta="Done".into(); (Some(task.clone()), lock.settings.clone()) } else { (None, lock.settings.clone()) }; save_tasks(&lock.tasks, &lock.tasks_path); result };
-    if let Some(task) = updated_task { let _ = app_handle.emit("task-updated", task.clone()); notify_task_finished(&app_handle, &settings, &task); }
+    let response = match request.send().await {
+        Ok(response) => response,
+        Err(error) => {
+            update_task_failed(
+                id,
+                format!("Media request failed: {error}"),
+                &state,
+                &app_handle,
+            );
+            return;
+        }
+    };
+    if !response.status().is_success() {
+        update_task_failed(
+            id,
+            format!("Media server returned {}", response.status()),
+            &state,
+            &app_handle,
+        );
+        return;
+    }
+    let total_bytes = response
+        .content_length()
+        .unwrap_or(descriptor.expected_bytes);
+    let mut abort_rx = {
+        let mut lock = state.lock().unwrap_or_else(|error| error.into_inner());
+        let Some(task) = lock.tasks.get_mut(&id) else {
+            return;
+        };
+        if task.status == "cancelled" {
+            return;
+        }
+        task.title = descriptor.filename.clone();
+        task.status = "downloading".into();
+        task.total_bytes = total_bytes;
+        task.output_path = Some(output_path.to_string_lossy().into_owned());
+        let _ = app_handle.emit("task-updated", task.clone());
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        lock.cancellations.insert(id.clone(), tx);
+        rx
+    };
+    let mut file = match tokio::fs::File::create(&output_path).await {
+        Ok(file) => file,
+        Err(error) => {
+            update_task_failed(
+                id,
+                format!("Disk write error: {error}"),
+                &state,
+                &app_handle,
+            );
+            return;
+        }
+    };
+    let mut stream = response.bytes_stream();
+    let mut downloaded = 0u64;
+    let mut last_update = std::time::Instant::now();
+    loop {
+        tokio::select! {
+            _ = &mut abort_rx => { drop(file); let _ = std::fs::remove_file(&output_path); return; }
+            chunk = stream.next() => match chunk { Some(Ok(chunk)) => { if let Err(error) = file.write_all(&chunk).await { update_task_failed(id, format!("Disk write error: {error}"), &state, &app_handle); return; } downloaded += chunk.len() as u64; if last_update.elapsed().as_millis() >= 120 { let mut lock = state.lock().unwrap_or_else(|error| error.into_inner()); if let Some(task) = lock.tasks.get_mut(&id) { task.downloaded_bytes = downloaded; if total_bytes > 0 { task.progress = (downloaded as f64 / total_bytes as f64).min(0.99); } let _ = app_handle.emit("task-updated", task.clone()); } last_update = std::time::Instant::now(); } }, Some(Err(error)) => { update_task_failed(id, format!("Media download error: {error}"), &state, &app_handle); return; }, None => break }
+        }
+    }
+    if downloaded == 0 {
+        update_task_failed(
+            id,
+            "No data received from media URL".into(),
+            &state,
+            &app_handle,
+        );
+        return;
+    }
+    if let Some(decode_key) = descriptor.decode_key.as_deref() {
+        if let Err(error) = decode_wechat_file(&output_path, decode_key) {
+            let _ = std::fs::remove_file(&output_path);
+            update_task_failed(
+                id,
+                format!("WeChat media decryption failed: {error}"),
+                &state,
+                &app_handle,
+            );
+            return;
+        }
+    }
+    let (updated_task, settings) = {
+        let mut lock = state.lock().unwrap_or_else(|error| error.into_inner());
+        lock.cancellations.remove(&id);
+        let result = if let Some(task) = lock.tasks.get_mut(&id) {
+            task.status = "completed".into();
+            task.progress = 1.0;
+            task.downloaded_bytes = downloaded;
+            task.eta = "Done".into();
+            (Some(task.clone()), lock.settings.clone())
+        } else {
+            (None, lock.settings.clone())
+        };
+        save_tasks(&lock.tasks, &lock.tasks_path);
+        result
+    };
+    if let Some(task) = updated_task {
+        let _ = app_handle.emit("task-updated", task.clone());
+        notify_task_finished(&app_handle, &settings, &task);
+    }
     process_queue(state, app_handle);
 }
 
 fn decode_wechat_file(path: &std::path::Path, encoded_key: &str) -> Result<(), String> {
-    if encoded_key.is_empty() { return Ok(()); }
+    if encoded_key.is_empty() {
+        return Ok(());
+    }
     if let Ok(seed) = encoded_key.trim().parse::<u64>() {
         return decode_wechat_isaac64(path, seed);
     }
-    let key = base64::engine::general_purpose::STANDARD.decode(encoded_key).map_err(|error| error.to_string())?;
-    if key.is_empty() { return Ok(()); }
+    let key = base64::engine::general_purpose::STANDARD
+        .decode(encoded_key)
+        .map_err(|error| error.to_string())?;
+    if key.is_empty() {
+        return Ok(());
+    }
     use std::io::{Read, Seek, SeekFrom, Write};
-    let mut file = std::fs::OpenOptions::new().read(true).write(true).open(path).map_err(|error| error.to_string())?;
-    let mut bytes = vec![0; key.len()]; let count = file.read(&mut bytes).map_err(|error| error.to_string())?;
-    for (index, byte) in bytes.iter_mut().take(count).enumerate() { *byte ^= key[index]; }
-    file.seek(SeekFrom::Start(0)).map_err(|error| error.to_string())?;
-    file.write_all(&bytes[..count]).map_err(|error| error.to_string())?;
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|error| error.to_string())?;
+    let mut bytes = vec![0; key.len()];
+    let count = file.read(&mut bytes).map_err(|error| error.to_string())?;
+    for (index, byte) in bytes.iter_mut().take(count).enumerate() {
+        *byte ^= key[index];
+    }
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| error.to_string())?;
+    file.write_all(&bytes[..count])
+        .map_err(|error| error.to_string())?;
     file.flush().map_err(|error| error.to_string())
 }
 
-struct Isaac64 { rand_cnt: usize, seed: [u64; 256], mm: [u64; 256], aa: u64, bb: u64, cc: u64 }
+struct Isaac64 {
+    rand_cnt: usize,
+    seed: [u64; 256],
+    mm: [u64; 256],
+    aa: u64,
+    bb: u64,
+    cc: u64,
+}
 impl Isaac64 {
-    fn new(key: u64) -> Self { let mut ctx = Self { rand_cnt: 255, seed: [0; 256], mm: [0; 256], aa: 0, bb: 0, cc: 0 }; ctx.init(key); ctx }
+    fn new(key: u64) -> Self {
+        let mut ctx = Self {
+            rand_cnt: 255,
+            seed: [0; 256],
+            mm: [0; 256],
+            aa: 0,
+            bb: 0,
+            cc: 0,
+        };
+        ctx.init(key);
+        ctx
+    }
     fn init(&mut self, key: u64) {
         const GOLDEN: u64 = 0x9e3779b97f4a7c13;
-        let (mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h) = (GOLDEN, GOLDEN, GOLDEN, GOLDEN, GOLDEN, GOLDEN, GOLDEN, GOLDEN);
+        let (mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h) = (
+            GOLDEN, GOLDEN, GOLDEN, GOLDEN, GOLDEN, GOLDEN, GOLDEN, GOLDEN,
+        );
         self.seed[0] = key;
-        for _ in 0..4 { isaac_mix(&mut a, &mut b, &mut c, &mut d, &mut e, &mut f, &mut g, &mut h); }
-        for i in (0..256).step_by(8) {
-            a = a.wrapping_add(self.seed[i]); b = b.wrapping_add(self.seed[i+1]); c = c.wrapping_add(self.seed[i+2]); d = d.wrapping_add(self.seed[i+3]);
-            e = e.wrapping_add(self.seed[i+4]); f = f.wrapping_add(self.seed[i+5]); g = g.wrapping_add(self.seed[i+6]); h = h.wrapping_add(self.seed[i+7]);
-            isaac_mix(&mut a, &mut b, &mut c, &mut d, &mut e, &mut f, &mut g, &mut h);
-            self.mm[i] = a; self.mm[i+1] = b; self.mm[i+2] = c; self.mm[i+3] = d; self.mm[i+4] = e; self.mm[i+5] = f; self.mm[i+6] = g; self.mm[i+7] = h;
+        for _ in 0..4 {
+            isaac_mix(
+                &mut a, &mut b, &mut c, &mut d, &mut e, &mut f, &mut g, &mut h,
+            );
         }
         for i in (0..256).step_by(8) {
-            a = a.wrapping_add(self.mm[i]); b = b.wrapping_add(self.mm[i+1]); c = c.wrapping_add(self.mm[i+2]); d = d.wrapping_add(self.mm[i+3]);
-            e = e.wrapping_add(self.mm[i+4]); f = f.wrapping_add(self.mm[i+5]); g = g.wrapping_add(self.mm[i+6]); h = h.wrapping_add(self.mm[i+7]);
-            isaac_mix(&mut a, &mut b, &mut c, &mut d, &mut e, &mut f, &mut g, &mut h);
-            self.mm[i] = a; self.mm[i+1] = b; self.mm[i+2] = c; self.mm[i+3] = d; self.mm[i+4] = e; self.mm[i+5] = f; self.mm[i+6] = g; self.mm[i+7] = h;
+            a = a.wrapping_add(self.seed[i]);
+            b = b.wrapping_add(self.seed[i + 1]);
+            c = c.wrapping_add(self.seed[i + 2]);
+            d = d.wrapping_add(self.seed[i + 3]);
+            e = e.wrapping_add(self.seed[i + 4]);
+            f = f.wrapping_add(self.seed[i + 5]);
+            g = g.wrapping_add(self.seed[i + 6]);
+            h = h.wrapping_add(self.seed[i + 7]);
+            isaac_mix(
+                &mut a, &mut b, &mut c, &mut d, &mut e, &mut f, &mut g, &mut h,
+            );
+            self.mm[i] = a;
+            self.mm[i + 1] = b;
+            self.mm[i + 2] = c;
+            self.mm[i + 3] = d;
+            self.mm[i + 4] = e;
+            self.mm[i + 5] = f;
+            self.mm[i + 6] = g;
+            self.mm[i + 7] = h;
         }
-        self.isaac64(); self.rand_cnt = 255;
+        for i in (0..256).step_by(8) {
+            a = a.wrapping_add(self.mm[i]);
+            b = b.wrapping_add(self.mm[i + 1]);
+            c = c.wrapping_add(self.mm[i + 2]);
+            d = d.wrapping_add(self.mm[i + 3]);
+            e = e.wrapping_add(self.mm[i + 4]);
+            f = f.wrapping_add(self.mm[i + 5]);
+            g = g.wrapping_add(self.mm[i + 6]);
+            h = h.wrapping_add(self.mm[i + 7]);
+            isaac_mix(
+                &mut a, &mut b, &mut c, &mut d, &mut e, &mut f, &mut g, &mut h,
+            );
+            self.mm[i] = a;
+            self.mm[i + 1] = b;
+            self.mm[i + 2] = c;
+            self.mm[i + 3] = d;
+            self.mm[i + 4] = e;
+            self.mm[i + 5] = f;
+            self.mm[i + 6] = g;
+            self.mm[i + 7] = h;
+        }
+        self.isaac64();
+        self.rand_cnt = 255;
     }
     fn next(&mut self) -> u64 {
         let res = self.seed[self.rand_cnt];
-        if self.rand_cnt == 0 { self.isaac64(); self.rand_cnt = 255; } else { self.rand_cnt -= 1; }
+        if self.rand_cnt == 0 {
+            self.isaac64();
+            self.rand_cnt = 255;
+        } else {
+            self.rand_cnt -= 1;
+        }
         res
     }
     fn isaac64(&mut self) {
-		self.cc = self.cc.wrapping_add(1);
-		self.bb = self.bb.wrapping_add(self.cc);
-		let mut a = self.aa;
-		let mut b = self.bb;
+        self.cc = self.cc.wrapping_add(1);
+        self.bb = self.bb.wrapping_add(self.cc);
+        let mut a = self.aa;
+        let mut b = self.bb;
         for i in (0..256).step_by(4) {
-			self.step(&mut a, &mut b, i, |x| !(x ^ (x << 21)));
-			self.step(&mut a, &mut b, i+1, |x| x ^ (x >> 5));
-			self.step(&mut a, &mut b, i+2, |x| x ^ (x << 12));
-			self.step(&mut a, &mut b, i+3, |x| x ^ (x >> 33));
+            self.step(&mut a, &mut b, i, |x| !(x ^ (x << 21)));
+            self.step(&mut a, &mut b, i + 1, |x| x ^ (x >> 5));
+            self.step(&mut a, &mut b, i + 2, |x| x ^ (x << 12));
+            self.step(&mut a, &mut b, i + 3, |x| x ^ (x >> 33));
         }
-		self.bb = b;
-		self.aa = a;
+        self.bb = b;
+        self.aa = a;
     }
-    fn step<F>(&mut self, a: &mut u64, b: &mut u64, i: usize, fn_op: F) where F: Fn(u64) -> u64 {
-        let x = self.mm[i]; *a = fn_op(*a).wrapping_add(self.mm[(i + 128) % 256]);
-        let y = self.mm[(x >> 3) as usize % 256].wrapping_add(*a).wrapping_add(*b);
-        self.mm[i] = y; *b = self.mm[(y >> 11) as usize % 256].wrapping_add(x); self.seed[i] = *b;
+    fn step<F>(&mut self, a: &mut u64, b: &mut u64, i: usize, fn_op: F)
+    where
+        F: Fn(u64) -> u64,
+    {
+        let x = self.mm[i];
+        *a = fn_op(*a).wrapping_add(self.mm[(i + 128) % 256]);
+        let y = self.mm[(x >> 3) as usize % 256]
+            .wrapping_add(*a)
+            .wrapping_add(*b);
+        self.mm[i] = y;
+        *b = self.mm[(y >> 11) as usize % 256].wrapping_add(x);
+        self.seed[i] = *b;
     }
 }
-fn isaac_mix(a: &mut u64, b: &mut u64, c: &mut u64, d: &mut u64, e: &mut u64, f: &mut u64, g: &mut u64, h: &mut u64) {
-	*a = a.wrapping_sub(*e); *f ^= *h >> 9;  *h = h.wrapping_add(*a);
-	*b = b.wrapping_sub(*f); *g ^= *a << 9;  *a = a.wrapping_add(*b);
-	*c = c.wrapping_sub(*g); *h ^= *b >> 23; *b = b.wrapping_add(*c);
-	*d = d.wrapping_sub(*h); *a ^= *c << 15; *c = c.wrapping_add(*d);
-	*e = e.wrapping_sub(*a); *b ^= *d >> 14; *d = d.wrapping_add(*e);
-	*f = f.wrapping_sub(*b); *c ^= *e << 20; *e = e.wrapping_add(*f);
-	*g = g.wrapping_sub(*c); *d ^= *f >> 17; *f = f.wrapping_add(*g);
-	*h = h.wrapping_sub(*d); *e ^= *g << 14; *g = g.wrapping_add(*h);
+fn isaac_mix(
+    a: &mut u64,
+    b: &mut u64,
+    c: &mut u64,
+    d: &mut u64,
+    e: &mut u64,
+    f: &mut u64,
+    g: &mut u64,
+    h: &mut u64,
+) {
+    *a = a.wrapping_sub(*e);
+    *f ^= *h >> 9;
+    *h = h.wrapping_add(*a);
+    *b = b.wrapping_sub(*f);
+    *g ^= *a << 9;
+    *a = a.wrapping_add(*b);
+    *c = c.wrapping_sub(*g);
+    *h ^= *b >> 23;
+    *b = b.wrapping_add(*c);
+    *d = d.wrapping_sub(*h);
+    *a ^= *c << 15;
+    *c = c.wrapping_add(*d);
+    *e = e.wrapping_sub(*a);
+    *b ^= *d >> 14;
+    *d = d.wrapping_add(*e);
+    *f = f.wrapping_sub(*b);
+    *c ^= *e << 20;
+    *e = e.wrapping_add(*f);
+    *g = g.wrapping_sub(*c);
+    *d ^= *f >> 17;
+    *f = f.wrapping_add(*g);
+    *h = h.wrapping_sub(*d);
+    *e ^= *g << 14;
+    *g = g.wrapping_add(*h);
 }
 fn xor_wechat_isaac64_prefix(bytes: &mut [u8], seed: u64) {
-	let mut isaac = Isaac64::new(seed);
-	for chunk in bytes.chunks_mut(8).take(131072 / 8) {
-		let random = isaac.next().to_be_bytes();
-		for (byte, key) in chunk.iter_mut().zip(random.iter()) {
-			*byte ^= key;
-		}
-	}
+    let mut isaac = Isaac64::new(seed);
+    for chunk in bytes.chunks_mut(8).take(131072 / 8) {
+        let random = isaac.next().to_be_bytes();
+        for (byte, key) in chunk.iter_mut().zip(random.iter()) {
+            *byte ^= key;
+        }
+    }
 }
 fn decode_wechat_isaac64(path: &std::path::Path, seed: u64) -> Result<(), String> {
     use std::io::{Read, Seek, SeekFrom, Write};
-    let mut file = std::fs::OpenOptions::new().read(true).write(true).open(path).map_err(|e| e.to_string())?;
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|e| e.to_string())?;
     let metadata = file.metadata().map_err(|e| e.to_string())?;
-    let len = metadata.len() as usize; if len == 0 { return Ok(()); }
+    let len = metadata.len() as usize;
+    if len == 0 {
+        return Ok(());
+    }
     let xor_len = std::cmp::min(131072, len);
     let mut buf = vec![0u8; xor_len];
     file.read_exact(&mut buf).map_err(|e| e.to_string())?;
-	xor_wechat_isaac64_prefix(&mut buf, seed);
+    xor_wechat_isaac64_prefix(&mut buf, seed);
     file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
     file.write_all(&buf).map_err(|e| e.to_string())?;
     file.flush().map_err(|e| e.to_string())
 }
 
-fn update_task_failed(id: String, error_msg: String, state: &Arc<Mutex<AppState>>, app_handle: &tauri::AppHandle) {
+fn update_task_failed(
+    id: String,
+    error_msg: String,
+    state: &Arc<Mutex<AppState>>,
+    app_handle: &tauri::AppHandle,
+) {
     let (updated_task, settings) = {
         let mut state_lock = state.lock().unwrap_or_else(|error| error.into_inner());
         state_lock.cancellations.remove(&id);
@@ -3044,11 +3546,17 @@ fn get_settings(state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Settings {
 }
 
 #[tauri::command]
-fn save_settings(new_settings: Settings, state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Result<Settings, String> {
+fn save_settings(
+    new_settings: Settings,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<Settings, String> {
     let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
     state.settings = new_settings.clone();
-    
-    if let Err(e) = write_atomic(&state.settings_path, &serde_json::to_string_pretty(&state.settings).unwrap()) {
+
+    if let Err(e) = write_atomic(
+        &state.settings_path,
+        &serde_json::to_string_pretty(&state.settings).unwrap(),
+    ) {
         return Err(format!("Failed to save settings: {}", e));
     }
     Ok(new_settings)
@@ -3056,8 +3564,7 @@ fn save_settings(new_settings: Settings, state: tauri::State<'_, Arc<Mutex<AppSt
 
 #[tauri::command]
 fn select_directory() -> Option<String> {
-    let folder = rfd::FileDialog::new()
-        .pick_folder();
+    let folder = rfd::FileDialog::new().pick_folder();
     folder.map(|p| p.to_string_lossy().into_owned())
 }
 
@@ -3065,9 +3572,7 @@ fn select_directory() -> Option<String> {
 fn reveal_in_finder(path: String) -> Result<bool, String> {
     #[cfg(target_os = "macos")]
     {
-        let _ = Command::new("open")
-            .args(&["-R", &path])
-            .spawn();
+        let _ = Command::new("open").args(&["-R", &path]).spawn();
         Ok(true)
     }
     #[cfg(target_os = "windows")]
@@ -3080,9 +3585,7 @@ fn reveal_in_finder(path: String) -> Result<bool, String> {
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         if let Some(parent) = std::path::Path::new(&path).parent() {
-            let _ = Command::new("xdg-open")
-                .arg(parent)
-                .spawn();
+            let _ = Command::new("xdg-open").arg(parent).spawn();
         }
         Ok(true)
     }
@@ -3097,7 +3600,9 @@ fn open_file(path: String) -> Result<bool, String> {
     }
     #[cfg(target_os = "windows")]
     {
-        let _ = Command::new("cmd").args(&["/c", "start", "", &path]).spawn();
+        let _ = Command::new("cmd")
+            .args(&["/c", "start", "", &path])
+            .spawn();
         Ok(true)
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -3114,27 +3619,31 @@ fn get_tasks(state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Vec<DownloadTask>
 }
 
 #[tauri::command]
-fn cancel_task(id: String, state: tauri::State<'_, Arc<Mutex<AppState>>>, app_handle: tauri::AppHandle) -> bool {
+fn cancel_task(
+    id: String,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+    app_handle: tauri::AppHandle,
+) -> bool {
     let mut state_lock = state.lock().unwrap_or_else(|error| error.into_inner());
     if let Some(tx) = state_lock.cancellations.remove(&id) {
         let _ = tx.send(());
     }
-    
+
     if let Some(task) = state_lock.tasks.get_mut(&id) {
         if vec!["downloading", "analyzing", "queued", "merging"].contains(&task.status.as_str()) {
             task.status = "cancelled".to_string();
             task.speed = "0 B/s".to_string();
             task.progress = 0.0;
             task.eta = "--:--".to_string();
-            
+
             if let Some(ref path) = task.output_path {
                 let _ = std::fs::remove_file(path);
             }
-            
+
             let _ = app_handle.emit("task-updated", task.clone());
             save_tasks(&state_lock.tasks, &state_lock.tasks_path);
             drop(state_lock);
-            
+
             process_queue(state.inner().clone(), app_handle);
             return true;
         }
@@ -3143,7 +3652,11 @@ fn cancel_task(id: String, state: tauri::State<'_, Arc<Mutex<AppState>>>, app_ha
 }
 
 #[tauri::command]
-fn delete_task(id: String, state: tauri::State<'_, Arc<Mutex<AppState>>>, app_handle: tauri::AppHandle) -> bool {
+fn delete_task(
+    id: String,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+    app_handle: tauri::AppHandle,
+) -> bool {
     let mut state_lock = state.lock().unwrap_or_else(|error| error.into_inner());
     if let Some(tx) = state_lock.cancellations.remove(&id) {
         let _ = tx.send(());
@@ -3180,14 +3693,22 @@ fn clear_completed(state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Vec<Downloa
             .filter(|task| ["cancelled", "failed"].contains(&task.status.as_str()))
             .cloned()
             .collect();
-        state.tasks.retain(|_, task| !["completed", "cancelled", "failed"].contains(&task.status.as_str()));
+        state.tasks.retain(|_, task| {
+            !["completed", "cancelled", "failed"].contains(&task.status.as_str())
+        });
         save_tasks(&state.tasks, &state.tasks_path);
         removed
     };
     for task in &removed {
         remove_task_partial_files(task);
     }
-    state.lock().unwrap_or_else(|error| error.into_inner()).tasks.values().cloned().collect()
+    state
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .tasks
+        .values()
+        .cloned()
+        .collect()
 }
 
 /// Create and queue a download task. Shared by the UI, the tray menu and
@@ -3236,7 +3757,11 @@ fn enqueue_download(
 }
 
 #[tauri::command]
-fn download_url(url: String, state: tauri::State<'_, Arc<Mutex<AppState>>>, app_handle: tauri::AppHandle) -> DownloadTask {
+fn download_url(
+    url: String,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+    app_handle: tauri::AppHandle,
+) -> DownloadTask {
     enqueue_download(&url, state.inner(), &app_handle)
 }
 
@@ -3316,56 +3841,98 @@ async fn start_manual_extraction(
                     let _ = app_handle.emit("task-updated", existing.clone());
                 }
             }
-            download_direct_stream(id, descriptor, settings, state.inner().clone(), app_handle).await;
+            download_direct_stream(id, descriptor, settings, state.inner().clone(), app_handle)
+                .await;
             Ok(task)
         }
         Err(error) => {
-            update_task_failed(id, format!("Manual extraction failed: {error}"), state.inner(), &app_handle);
+            update_task_failed(
+                id,
+                format!("Manual extraction failed: {error}"),
+                state.inner(),
+                &app_handle,
+            );
             Err(error)
         }
     }
 }
 
 #[tauri::command]
-async fn get_sniffer_state(sniffer_state: tauri::State<'_, Arc<Mutex<sniffer::SnifferState>>>) -> Result<sniffer::SnifferViewState, String> {
+async fn get_sniffer_state(
+    sniffer_state: tauri::State<'_, Arc<Mutex<sniffer::SnifferState>>>,
+) -> Result<sniffer::SnifferViewState, String> {
     let state = sniffer_state.inner().clone();
     // view() checks system routes with netstat. Keep that subprocess and any
     // wait for crash recovery away from the window's event loop.
     tauri::async_runtime::spawn_blocking(move || {
-        state.lock().unwrap_or_else(|error| error.into_inner()).view()
-    }).await.map_err(|error| format!("Could not load resource capture state: {error}"))
+        state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .view()
+    })
+    .await
+    .map_err(|error| format!("Could not load resource capture state: {error}"))
 }
 
 #[tauri::command]
-fn start_sniffer(sniffer_state: tauri::State<'_, Arc<Mutex<sniffer::SnifferState>>>, state: tauri::State<'_, Arc<Mutex<AppState>>>, app_handle: tauri::AppHandle) -> Result<sniffer::SnifferViewState, String> {
-    let settings = state.lock().unwrap_or_else(|error| error.into_inner()).settings.clone();
-    let upstream = if settings.proxy_enabled { Some(settings.proxy_url) } else { None };
+fn start_sniffer(
+    sniffer_state: tauri::State<'_, Arc<Mutex<sniffer::SnifferState>>>,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+    app_handle: tauri::AppHandle,
+) -> Result<sniffer::SnifferViewState, String> {
+    let settings = state
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .settings
+        .clone();
+    let upstream = if settings.proxy_enabled {
+        Some(settings.proxy_url)
+    } else {
+        None
+    };
     sniffer::start(app_handle, sniffer_state.inner().clone(), upstream)
 }
 
 #[tauri::command]
-fn stop_sniffer(sniffer_state: tauri::State<'_, Arc<Mutex<sniffer::SnifferState>>>, app_handle: tauri::AppHandle) -> Result<sniffer::SnifferViewState, String> {
+fn stop_sniffer(
+    sniffer_state: tauri::State<'_, Arc<Mutex<sniffer::SnifferState>>>,
+    app_handle: tauri::AppHandle,
+) -> Result<sniffer::SnifferViewState, String> {
     sniffer::stop(&app_handle, sniffer_state.inner())
 }
 
 #[tauri::command]
-fn clear_sniffer_captures(sniffer_state: tauri::State<'_, Arc<Mutex<sniffer::SnifferState>>>, app_handle: tauri::AppHandle) -> Result<sniffer::SnifferViewState, String> {
+fn clear_sniffer_captures(
+    sniffer_state: tauri::State<'_, Arc<Mutex<sniffer::SnifferState>>>,
+    app_handle: tauri::AppHandle,
+) -> Result<sniffer::SnifferViewState, String> {
     sniffer::clear(&app_handle, sniffer_state.inner())
 }
 
 #[tauri::command]
-fn install_sniffer_certificate(sniffer_state: tauri::State<'_, Arc<Mutex<sniffer::SnifferState>>>, app_handle: tauri::AppHandle) -> Result<sniffer::SnifferViewState, String> {
+fn install_sniffer_certificate(
+    sniffer_state: tauri::State<'_, Arc<Mutex<sniffer::SnifferState>>>,
+    app_handle: tauri::AppHandle,
+) -> Result<sniffer::SnifferViewState, String> {
     sniffer::install_certificate(&app_handle, sniffer_state.inner())
 }
 
 #[tauri::command]
-fn enable_sniffer_system_proxy(sniffer_state: tauri::State<'_, Arc<Mutex<sniffer::SnifferState>>>, app_handle: tauri::AppHandle) -> Result<sniffer::SnifferViewState, String> {
+fn enable_sniffer_system_proxy(
+    sniffer_state: tauri::State<'_, Arc<Mutex<sniffer::SnifferState>>>,
+    app_handle: tauri::AppHandle,
+) -> Result<sniffer::SnifferViewState, String> {
     sniffer::enable_system_proxy(&app_handle, sniffer_state.inner())
 }
 
 #[tauri::command]
-fn restore_sniffer_system_proxy(sniffer_state: tauri::State<'_, Arc<Mutex<sniffer::SnifferState>>>, app_handle: tauri::AppHandle) -> Result<sniffer::SnifferViewState, String> {
-    let mut guard = sniffer_state.lock().map_err(|_| "Sniffer state is unavailable")?;
+fn restore_sniffer_system_proxy(
+    sniffer_state: tauri::State<'_, Arc<Mutex<sniffer::SnifferState>>>,
+    app_handle: tauri::AppHandle,
+) -> Result<sniffer::SnifferViewState, String> {
+    let mut guard = sniffer_state
+        .lock()
+        .map_err(|_| "Sniffer state is unavailable")?;
     sniffer::restore_system_proxy(&mut guard)?;
     let view = guard.view();
     let _ = app_handle.emit("sniffer-updated", &view);
@@ -3373,12 +3940,46 @@ fn restore_sniffer_system_proxy(sniffer_state: tauri::State<'_, Arc<Mutex<sniffe
 }
 
 #[tauri::command]
-fn download_captured_resource(resource_id: String, sniffer_state: tauri::State<'_, Arc<Mutex<sniffer::SnifferState>>>, state: tauri::State<'_, Arc<Mutex<AppState>>>, app_handle: tauri::AppHandle) -> Result<DownloadTask, String> {
+fn download_captured_resource(
+    resource_id: String,
+    sniffer_state: tauri::State<'_, Arc<Mutex<sniffer::SnifferState>>>,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+    app_handle: tauri::AppHandle,
+) -> Result<DownloadTask, String> {
     let descriptor = sniffer::request_descriptor(sniffer_state.inner(), &resource_id)?;
-    let id = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos().to_string();
-    let task = DownloadTask { id:id.clone(), url:format!("capture://{resource_id}"), title:descriptor.filename.clone(), status:"queued".into(), progress:0.0, speed:"0 B/s".into(), downloaded_bytes:0, total_bytes:0, eta:"--:--".into(), error:None, output_path:None, kind:"file".into(), engine:String::new(), items_total:0, items_done:0, playlist_index:None, playlist_count:None, playlist_parent_id:None };
-    let mut lock = state.lock().unwrap_or_else(|error| error.into_inner()); lock.captured_downloads.insert(id.clone(), descriptor); lock.tasks.insert(id, task.clone()); save_tasks(&lock.tasks, &lock.tasks_path); drop(lock);
-    let _ = app_handle.emit("task-updated", task.clone()); process_queue(state.inner().clone(), app_handle); Ok(task)
+    let id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+        .to_string();
+    let task = DownloadTask {
+        id: id.clone(),
+        url: format!("capture://{resource_id}"),
+        title: descriptor.filename.clone(),
+        status: "queued".into(),
+        progress: 0.0,
+        speed: "0 B/s".into(),
+        downloaded_bytes: 0,
+        total_bytes: 0,
+        eta: "--:--".into(),
+        error: None,
+        output_path: None,
+        kind: "file".into(),
+        engine: String::new(),
+        items_total: 0,
+        items_done: 0,
+        playlist_index: None,
+        playlist_count: None,
+        playlist_parent_id: None,
+    };
+    let mut lock = state.lock().unwrap_or_else(|error| error.into_inner());
+    lock.captured_downloads.insert(id.clone(), descriptor);
+    lock.tasks.insert(id, task.clone());
+    save_tasks(&lock.tasks, &lock.tasks_path);
+    drop(lock);
+    let _ = app_handle.emit("task-updated", task.clone());
+    process_queue(state.inner().clone(), app_handle);
+    Ok(task)
 }
 
 // -----------------------------------------------------------
@@ -3388,7 +3989,11 @@ fn download_captured_resource(resource_id: String, sniffer_state: tauri::State<'
 /// Answer a pending playlist picker. An empty selection downloads every
 /// episode; otherwise only the listed 1-based indices are queued.
 #[tauri::command]
-fn resolve_playlist_choice(task_id: String, indices: Vec<u32>, state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Result<u32, String> {
+fn resolve_playlist_choice(
+    task_id: String,
+    indices: Vec<u32>,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<u32, String> {
     let sender = {
         let mut state_lock = state.lock().unwrap_or_else(|error| error.into_inner());
         state_lock
@@ -3429,7 +4034,10 @@ struct EngineInfo {
 /// report which copy is in play.
 fn bundled_ytdlp_path(app_handle: &tauri::AppHandle) -> Option<PathBuf> {
     [
-        app_handle.path().resolve("binaries/yt-dlp", BaseDirectory::Resource).ok(),
+        app_handle
+            .path()
+            .resolve("binaries/yt-dlp", BaseDirectory::Resource)
+            .ok(),
         Some(PathBuf::from("src-tauri/binaries/yt-dlp")),
         Some(PathBuf::from("/opt/homebrew/bin/yt-dlp")),
         Some(PathBuf::from("/usr/local/bin/yt-dlp")),
@@ -3439,7 +4047,11 @@ fn bundled_ytdlp_path(app_handle: &tauri::AppHandle) -> Option<PathBuf> {
     .find(|path| path.exists())
 }
 
-async fn engine_info(app_handle: &tauri::AppHandle, settings: &Settings, last_error: Option<String>) -> EngineInfo {
+async fn engine_info(
+    app_handle: &tauri::AppHandle,
+    settings: &Settings,
+    last_error: Option<String>,
+) -> EngineInfo {
     let updated = app_handle
         .path()
         .app_data_dir()
@@ -3481,8 +4093,15 @@ async fn engine_info(app_handle: &tauri::AppHandle, settings: &Settings, last_er
 }
 
 #[tauri::command]
-async fn get_engine_info(app_handle: tauri::AppHandle, state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Result<EngineInfo, String> {
-    let settings = state.lock().unwrap_or_else(|error| error.into_inner()).settings.clone();
+async fn get_engine_info(
+    app_handle: tauri::AppHandle,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<EngineInfo, String> {
+    let settings = state
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .settings
+        .clone();
     Ok(engine_info(&app_handle, &settings, None).await)
 }
 
@@ -3514,7 +4133,8 @@ async fn update_ytdlp_engine(
     let just_updated = !up_to_date;
     if just_updated {
         let installed =
-            engine_update::download_version(&app_data_dir, latest.trim(), settings.proxy_url()).await?;
+            engine_update::download_version(&app_data_dir, latest.trim(), settings.proxy_url())
+                .await?;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -3579,12 +4199,10 @@ fn build_tray(app_handle: &tauri::AppHandle) -> tauri::Result<()> {
         .items(&[&show_item, &clipboard_item, &separator, &quit_item])
         .build()?;
 
-    let _tray = TrayIconBuilder::new()        .icon(
-            app_handle
-                .default_window_icon()
-                .cloned()
-                .ok_or_else(|| std::io::Error::other("Cobalt has no window icon to reuse for the tray icon"))?,
-        )
+    let _tray = TrayIconBuilder::new()
+        .icon(app_handle.default_window_icon().cloned().ok_or_else(|| {
+            std::io::Error::other("Cobalt has no window icon to reuse for the tray icon")
+        })?)
         // The app icon is a full-colour logo, not a monochrome template, so it
         // must not be marked as one.
         .tooltip("Cobalt")
@@ -3602,7 +4220,8 @@ fn build_tray(app_handle: &tauri::AppHandle) -> tauri::Result<()> {
                 if let Ok(mut clipboard) = arboard::Clipboard::new() {
                     if let Ok(text) = clipboard.get_text() {
                         if let Some(url) = first_http_url(&text) {
-                            let app_state = app_handle.state::<Arc<Mutex<AppState>>>().inner().clone();
+                            let app_state =
+                                app_handle.state::<Arc<Mutex<AppState>>>().inner().clone();
                             let _ = enqueue_download(&url, &app_state, app_handle);
                             return;
                         }
@@ -3641,7 +4260,11 @@ fn first_http_url(text: &str) -> Option<String> {
     text.split_whitespace()
         .map(|token| token.trim_matches(|c: char| c.is_whitespace() || "\"'<>,;".contains(c)))
         .find(|token| token.starts_with("http://") || token.starts_with("https://"))
-        .map(|token| token.trim_end_matches(['.', ')', ']', '"', '\'']).to_string())
+        .map(|token| {
+            token
+                .trim_end_matches(['.', ')', ']', '"', '\''])
+                .to_string()
+        })
         .filter(|token| !token.is_empty())
 }
 
@@ -3779,18 +4402,24 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_deep_link::init())
         .setup(|app| {
-            let app_data_dir = app.path().app_data_dir().unwrap_or_else(|_| std::env::current_dir().unwrap());
+            let app_data_dir = app
+                .path()
+                .app_data_dir()
+                .unwrap_or_else(|_| std::env::current_dir().unwrap());
             std::fs::create_dir_all(&app_data_dir).ok();
             let settings_path = app_data_dir.join("settings.json");
             let tasks_path = app_data_dir.join("tasks.json");
-            
+
             let mut settings = if settings_path.exists() {
                 let content = std::fs::read_to_string(&settings_path).unwrap_or_default();
                 match serde_json::from_str::<Settings>(&content) {
                     Ok(mut loaded) => {
                         // A hand-edited file can carry any videoQuality; normalise it so the
                         // value we later interpolate into the yt-dlp selector stays whitelisted.
-                        if !matches!(loaded.video_quality.as_str(), "max" | "1080" | "720" | "480" | "360") {
+                        if !matches!(
+                            loaded.video_quality.as_str(),
+                            "max" | "1080" | "720" | "480" | "360"
+                        ) {
                             loaded.video_quality = "720".to_string();
                         }
                         loaded
@@ -3799,23 +4428,34 @@ pub fn run() {
                         let backup = settings_path.with_extension("corrupt.json");
                         eprintln!(
                             "Failed to parse {} ({}); the previous contents were kept at {}",
-                            settings_path.display(), error, backup.display()
+                            settings_path.display(),
+                            error,
+                            backup.display()
                         );
                         let _ = std::fs::write(&backup, &content);
-                        let download_dir = app.path().download_dir().unwrap_or_else(|_| std::env::current_dir().unwrap());
+                        let download_dir = app
+                            .path()
+                            .download_dir()
+                            .unwrap_or_else(|_| std::env::current_dir().unwrap());
                         Settings::default_with_download_dir(download_dir)
                     }
                 }
             } else {
-                let download_dir = app.path().download_dir().unwrap_or_else(|_| std::env::current_dir().unwrap());
+                let download_dir = app
+                    .path()
+                    .download_dir()
+                    .unwrap_or_else(|_| std::env::current_dir().unwrap());
                 Settings::default_with_download_dir(download_dir)
             };
-            
+
             let migrated_api_url = migrate_legacy_api_url(&mut settings);
 
             // Save initial defaults and migrate the previous built-in API endpoint.
             if !settings_path.exists() || migrated_api_url {
-                let _ = write_atomic(&settings_path, &serde_json::to_string_pretty(&settings).unwrap());
+                let _ = write_atomic(
+                    &settings_path,
+                    &serde_json::to_string_pretty(&settings).unwrap(),
+                );
             }
 
             // Load persisted tasks
@@ -3828,7 +4468,9 @@ pub fn run() {
                         let backup = tasks_path.with_extension("corrupt.json");
                         eprintln!(
                             "Failed to parse {} ({}); the previous contents were kept at {}",
-                            tasks_path.display(), error, backup.display()
+                            tasks_path.display(),
+                            error,
+                            backup.display()
                         );
                         let _ = std::fs::write(&backup, &content);
                         HashMap::new()
@@ -3840,7 +4482,9 @@ pub fn run() {
 
             // Reset stuck tasks to failed status on startup since the app restarted
             for task in tasks.values_mut() {
-                if vec!["downloading", "analyzing", "queued", "merging"].contains(&task.status.as_str()) {
+                if vec!["downloading", "analyzing", "queued", "merging"]
+                    .contains(&task.status.as_str())
+                {
                     task.status = "failed".to_string();
                     task.error = Some("App restarted during download".to_string());
                     task.speed = "0 B/s".to_string();
@@ -3858,20 +4502,29 @@ pub fn run() {
                 playlist_decisions: HashMap::new(),
                 active_stems: HashSet::new(),
             }));
-            
+
             app.manage(app_state.clone());
-            let sniffer_state = Arc::new(Mutex::new(sniffer::SnifferState::new(app_data_dir.join("resource-sniffer"))));
+            let sniffer_state = Arc::new(Mutex::new(sniffer::SnifferState::new(
+                app_data_dir.join("resource-sniffer"),
+            )));
             app.manage(sniffer_state.clone());
             // Restore after a crash without delaying window creation. The
             // capture-state query waits on this worker, independently of the
             // settings and task queries, so link downloads remain responsive.
             let recovery_handle = app.handle().clone();
             tauri::async_runtime::spawn_blocking(move || {
-                let mut state = sniffer_state.lock().unwrap_or_else(|error| error.into_inner());
+                let mut state = sniffer_state
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
                 if state.data_dir.join("sniffer-proxy-session.json").exists() {
                     state.message = match sniffer::restore_system_proxy(&mut state) {
-                        Ok(()) => Some("Restored network proxy settings from the previous capture session.".into()),
-                        Err(error) => Some(format!("Cobalt could not restore the previous proxy automatically: {error}")),
+                        Ok(()) => Some(
+                            "Restored network proxy settings from the previous capture session."
+                                .into(),
+                        ),
+                        Err(error) => Some(format!(
+                            "Cobalt could not restore the previous proxy automatically: {error}"
+                        )),
                     };
                     let _ = recovery_handle.emit("sniffer-updated", state.view());
                 }
@@ -3880,7 +4533,7 @@ pub fn run() {
             build_tray(app.handle())?;
             register_deep_link(app.handle());
             spawn_engine_auto_update(app.handle(), &app_state);
-            
+
             // Spawn background clipboard monitor
             let handle = app.handle().clone();
             let state_clone = app_state.clone();
@@ -3888,20 +4541,25 @@ pub fn run() {
                 let mut last_clipboard = String::new();
                 loop {
                     tokio::time::sleep(tokio::time::Duration::from_millis(1200)).await;
-                    
+
                     let monitoring = {
-                        let state = state_clone.lock().unwrap_or_else(|error| error.into_inner());
+                        let state = state_clone
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner());
                         state.settings.clipboard_monitoring
                     };
-                    
+
                     if !monitoring {
                         continue;
                     }
-                    
+
                     if let Ok(mut clipboard) = arboard::Clipboard::new() {
                         if let Ok(text) = clipboard.get_text() {
                             let trimmed = text.trim().to_string();
-                            if !trimmed.is_empty() && trimmed != last_clipboard && trimmed.starts_with("http") {
+                            if !trimmed.is_empty()
+                                && trimmed != last_clipboard
+                                && trimmed.starts_with("http")
+                            {
                                 last_clipboard = trimmed.clone();
                                 let _ = handle.emit("clipboard-detected", trimmed);
                             }
@@ -3909,7 +4567,7 @@ pub fn run() {
                     }
                 }
             });
-            
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -3945,9 +4603,13 @@ pub fn run() {
             // stops the sidecar; the same file also acts as a crash-recovery
             // marker on the next launch.
             if let tauri::RunEvent::Exit = event {
-                if let Some(sniffer_state) = app_handle.try_state::<Arc<Mutex<sniffer::SnifferState>>>() {
+                if let Some(sniffer_state) =
+                    app_handle.try_state::<Arc<Mutex<sniffer::SnifferState>>>()
+                {
                     if let Ok(mut state) = sniffer_state.lock() {
-                        if state.proxy_active || state.data_dir.join("sniffer-proxy-session.json").exists() {
+                        if state.proxy_active
+                            || state.data_dir.join("sniffer-proxy-session.json").exists()
+                        {
                             let _ = sniffer::restore_system_proxy(&mut state);
                         }
                         if let Some(mut child) = state.child.take() {
@@ -3962,10 +4624,15 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{api_request_url, decode_wechat_file, deep_link_target_url, extractor_display_name, first_http_url, generic_video_id, is_ytdlp_probe_blocked, migrate_legacy_api_url, remove_task_partial_files, sponsorblock_args, xor_wechat_isaac64_prefix, AppState, DownloadTask, Isaac64, Settings};
+    use super::{
+        api_request_url, decode_wechat_file, deep_link_target_url, extractor_display_name,
+        first_http_url, generic_video_id, is_ytdlp_probe_blocked, migrate_legacy_api_url,
+        remove_task_partial_files, sponsorblock_args, xor_wechat_isaac64_prefix, AppState,
+        DownloadTask, Isaac64, Settings,
+    };
     use std::collections::{HashMap, HashSet};
-    use std::path::PathBuf;
     use std::io::Write;
+    use std::path::PathBuf;
 
     fn test_state() -> std::sync::Arc<std::sync::Mutex<AppState>> {
         std::sync::Arc::new(std::sync::Mutex::new(AppState {
@@ -4026,7 +4693,7 @@ mod tests {
 
         super::release_ytdlp_stem(&state, &dir, &first);
         // A finished file also keeps the name taken.
-        let _ = std::fs::write(dir.join("youtube_abc.mp4"), b"x").unwrap();
+        std::fs::write(dir.join("youtube_abc.mp4"), b"x").unwrap();
         let re_claimed = super::claim_ytdlp_stem(&state, &dir, "youtube_abc");
         assert_eq!(re_claimed, "youtube_abc (3)");
 
@@ -4036,11 +4703,14 @@ mod tests {
     #[test]
     fn partials_survive_a_cancel_but_not_a_delete() {
         let dir = scratch_dir("partials");
-        let cancelled = test_task("cancelled", Some(&dir.join("youtube_abc.mp4").to_string_lossy().into_owned()));
+        let cancelled = test_task(
+            "cancelled",
+            Some(&dir.join("youtube_abc.mp4").to_string_lossy().into_owned()),
+        );
         // Progressive partial, DASH fragment partial and a subtitle sidecar.
-        let _ = std::fs::write(dir.join("youtube_abc.mp4.part"), b"0123456789").unwrap();
-        let _ = std::fs::write(dir.join("youtube_abc.f137.mp4.part"), b"0123456789").unwrap();
-        let _ = std::fs::write(dir.join("youtube_abc.en.srt"), b"1").unwrap();
+        std::fs::write(dir.join("youtube_abc.mp4.part"), b"0123456789").unwrap();
+        std::fs::write(dir.join("youtube_abc.f137.mp4.part"), b"0123456789").unwrap();
+        std::fs::write(dir.join("youtube_abc.en.srt"), b"1").unwrap();
 
         remove_task_partial_files(&cancelled);
         assert!(!dir.join("youtube_abc.mp4.part").exists());
@@ -4048,8 +4718,8 @@ mod tests {
         assert!(!dir.join("youtube_abc.en.srt").exists());
 
         // A completed task keeps everything it produced.
-        let _ = std::fs::write(dir.join("youtube_abc.mp4"), b"done").unwrap();
-        let _ = std::fs::write(dir.join("youtube_abc.en.srt"), b"1").unwrap();
+        std::fs::write(dir.join("youtube_abc.mp4"), b"done").unwrap();
+        std::fs::write(dir.join("youtube_abc.en.srt"), b"1").unwrap();
         remove_task_partial_files(&test_task(
             "completed",
             Some(&dir.join("youtube_abc.mp4").to_string_lossy().into_owned()),
@@ -4072,9 +4742,13 @@ mod tests {
         super::write_resume_marker(&dir, stem, &fingerprint);
         assert!(super::resume_marker_matches(&dir, stem, &fingerprint));
         // A different quality/format must not resume the old bytes.
-        assert!(!super::resume_marker_matches(&dir, stem, "v1|other|video|mp4|720"));
+        assert!(!super::resume_marker_matches(
+            &dir,
+            stem,
+            "v1|other|video|mp4|720"
+        ));
 
-        let _ = std::fs::write(dir.join(format!("{}.mp4.part", stem)), b"x").unwrap();
+        std::fs::write(dir.join(format!("{}.mp4.part", stem)), b"x").unwrap();
         super::remove_ytdlp_partial_files(&dir, stem);
         assert!(!dir.join(format!("{}.mp4.part", stem)).exists());
         // The marker itself belongs to the stem's leftovers and goes with it.
@@ -4090,9 +4764,15 @@ mod tests {
             deep_link_target_url("cobalt://download?url=https%3A%2F%2Fexample.com%2Fa"),
             Some("https://example.com/a".to_string())
         );
-        assert_eq!(deep_link_target_url("https://example.com/a"), Some("https://example.com/a".to_string()));
+        assert_eq!(
+            deep_link_target_url("https://example.com/a"),
+            Some("https://example.com/a".to_string())
+        );
         assert_eq!(deep_link_target_url("cobalt://download"), None);
-        assert_eq!(deep_link_target_url("cobalt://download?url=ftp://example.com"), None);
+        assert_eq!(
+            deep_link_target_url("cobalt://download?url=ftp://example.com"),
+            None
+        );
 
         assert_eq!(
             first_http_url("  See https://example.com/a, and https://example.com/b "),
@@ -4124,46 +4804,89 @@ mod tests {
         let mut settings = Settings::default_with_download_dir(PathBuf::from("/tmp"));
         settings.api_url = "http://47.241.10.142/cobalt-api/".to_string();
 
-        assert_eq!(api_request_url(&settings), "http://47.241.10.142/cobalt-api/");
+        assert_eq!(
+            api_request_url(&settings),
+            "http://47.241.10.142/cobalt-api/"
+        );
     }
 
     #[test]
     fn generic_probe_blocklist_keeps_dedicated_paths_first() {
         // Dedicated local paths: never probe (handled before remote).
-        assert!(is_ytdlp_probe_blocked("https://www.youtube.com/watch?v=aqz-KE-bpKQ"));
-        assert!(is_ytdlp_probe_blocked("https://www.bilibili.com/video/BV1xx411c7mD"));
-        assert!(is_ytdlp_probe_blocked("https://www.dailymotion.com/video/x8abc12"));
-        assert!(is_ytdlp_probe_blocked("https://www.xinpianchang.com/a13775532"));
+        assert!(is_ytdlp_probe_blocked(
+            "https://www.youtube.com/watch?v=aqz-KE-bpKQ"
+        ));
+        assert!(is_ytdlp_probe_blocked(
+            "https://www.bilibili.com/video/BV1xx411c7mD"
+        ));
+        assert!(is_ytdlp_probe_blocked(
+            "https://www.dailymotion.com/video/x8abc12"
+        ));
+        assert!(is_ytdlp_probe_blocked(
+            "https://www.xinpianchang.com/a13775532"
+        ));
         // Login-walled / app-only: probing wastes 45s and can't succeed.
-        assert!(is_ytdlp_probe_blocked("https://www.douyin.com/video/7481234567890123456"));
-        assert!(is_ytdlp_probe_blocked("https://www.tiktok.com/@user/video/7481234567890123456"));
-        assert!(is_ytdlp_probe_blocked("https://www.xiaohongshu.com/explore/abc123"));
-        assert!(is_ytdlp_probe_blocked("https://weibo.com/1234567890/AbC123XyZ"));
+        assert!(is_ytdlp_probe_blocked(
+            "https://www.douyin.com/video/7481234567890123456"
+        ));
+        assert!(is_ytdlp_probe_blocked(
+            "https://www.tiktok.com/@user/video/7481234567890123456"
+        ));
+        assert!(is_ytdlp_probe_blocked(
+            "https://www.xiaohongshu.com/explore/abc123"
+        ));
+        assert!(is_ytdlp_probe_blocked(
+            "https://weibo.com/1234567890/AbC123XyZ"
+        ));
         // Remote-service-first (better picker UX): don't preempt.
-        assert!(is_ytdlp_probe_blocked("https://www.instagram.com/reel/AbC123/"));
-        assert!(is_ytdlp_probe_blocked("https://x.com/user/status/123456789"));
-        assert!(is_ytdlp_probe_blocked("https://www.pinterest.com/pin/123456789/"));
+        assert!(is_ytdlp_probe_blocked(
+            "https://www.instagram.com/reel/AbC123/"
+        ));
+        assert!(is_ytdlp_probe_blocked(
+            "https://x.com/user/status/123456789"
+        ));
+        assert!(is_ytdlp_probe_blocked(
+            "https://www.pinterest.com/pin/123456789/"
+        ));
         // WeChat ecosystem: needs the MITM sniffer.
-        assert!(is_ytdlp_probe_blocked("https://channels.weixin.qq.com/pages/feed"));
+        assert!(is_ytdlp_probe_blocked(
+            "https://channels.weixin.qq.com/pages/feed"
+        ));
         // gallery-dl image hosts: never probe with yt-dlp.
-        assert!(is_ytdlp_probe_blocked("https://www.pixiv.net/artworks/123456789"));
-        assert!(is_ytdlp_probe_blocked("https://danbooru.donmai.us/posts/1234567"));
+        assert!(is_ytdlp_probe_blocked(
+            "https://www.pixiv.net/artworks/123456789"
+        ));
+        assert!(is_ytdlp_probe_blocked(
+            "https://danbooru.donmai.us/posts/1234567"
+        ));
         assert!(is_ytdlp_probe_blocked("https://imgur.com/a/abcd123"));
         assert!(is_ytdlp_probe_blocked("https://www.reddit.com/r/cats/top/"));
-        assert!(is_ytdlp_probe_blocked("https://someuser.tumblr.com/tagged/cat"));
+        assert!(is_ytdlp_probe_blocked(
+            "https://someuser.tumblr.com/tagged/cat"
+        ));
         // But single Reddit / Tumblr posts still fall through to yt-dlp after a
         // remote failure (only bulk forms are owned by gallery-dl).
-        assert!(!is_ytdlp_probe_blocked("https://www.reddit.com/r/cats/comments/abc123/x/"));
-        assert!(!is_ytdlp_probe_blocked("https://someuser.tumblr.com/post/123/x"));
+        assert!(!is_ytdlp_probe_blocked(
+            "https://www.reddit.com/r/cats/comments/abc123/x/"
+        ));
+        assert!(!is_ytdlp_probe_blocked(
+            "https://someuser.tumblr.com/post/123/x"
+        ));
         // Generic long-tail video sites: probe them.
         assert!(!is_ytdlp_probe_blocked("https://vimeo.com/123456789"));
-        assert!(!is_ytdlp_probe_blocked("https://www.rutube.ru/video/abc123/"));
+        assert!(!is_ytdlp_probe_blocked(
+            "https://www.rutube.ru/video/abc123/"
+        ));
         assert!(!is_ytdlp_probe_blocked("https://www.acfun.cn/v/ac12345678"));
-        assert!(!is_ytdlp_probe_blocked("https://www.ixigua.com/7481234567890123456"));
+        assert!(!is_ytdlp_probe_blocked(
+            "https://www.ixigua.com/7481234567890123456"
+        ));
         // Subdomains of blocked hosts stay blocked; lookalikes don't.
         assert!(is_ytdlp_probe_blocked("https://m.weibo.com/u/1234567890"));
         assert!(!is_ytdlp_probe_blocked("https://notweibo.com/video/123"));
-        assert!(!is_ytdlp_probe_blocked("https://weibo.example.com/video/123"));
+        assert!(!is_ytdlp_probe_blocked(
+            "https://weibo.example.com/video/123"
+        ));
         // Garbage input: block (probe would fail anyway).
         assert!(is_ytdlp_probe_blocked("not a url"));
     }
@@ -4190,16 +4913,29 @@ mod tests {
         assert!(sponsorblock_args(false, "remove").is_empty());
         assert!(sponsorblock_args(false, "mark").is_empty());
         // Default/unknown mode → remove.
-        assert_eq!(sponsorblock_args(true, "remove"), vec!["--sponsorblock-remove", "all"]);
-        assert_eq!(sponsorblock_args(true, ""), vec!["--sponsorblock-remove", "all"]);
-        assert_eq!(sponsorblock_args(true, "bogus"), vec!["--sponsorblock-remove", "all"]);
+        assert_eq!(
+            sponsorblock_args(true, "remove"),
+            vec!["--sponsorblock-remove", "all"]
+        );
+        assert_eq!(
+            sponsorblock_args(true, ""),
+            vec!["--sponsorblock-remove", "all"]
+        );
+        assert_eq!(
+            sponsorblock_args(true, "bogus"),
+            vec!["--sponsorblock-remove", "all"]
+        );
         // Mark mode → chapter markers only.
-        assert_eq!(sponsorblock_args(true, "mark"), vec!["--sponsorblock-mark", "all"]);
+        assert_eq!(
+            sponsorblock_args(true, "mark"),
+            vec!["--sponsorblock-mark", "all"]
+        );
     }
 
     #[test]
     fn decrypts_only_the_wechat_key_prefix() {
-        let path = std::env::temp_dir().join(format!("cobalt-wechat-decrypt-{}.bin", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("cobalt-wechat-decrypt-{}.bin", std::process::id()));
         let mut file = std::fs::File::create(&path).unwrap();
         file.write_all(&[0x11, 0x22, 0x33, 0x44]).unwrap();
         drop(file);
@@ -4208,23 +4944,23 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
-	#[test]
-	fn isaac64_matches_the_wechat_reference_vector() {
-		let mut isaac = Isaac64::new(1_234_567_890_123_456_789);
-		assert_eq!(isaac.next(), 0x981c44954c02d3c6);
-		assert_eq!(isaac.next(), 0x2fd66a014dfdf392);
-		assert_eq!(isaac.next(), 0x85b4e3e282339bff);
-		assert_eq!(isaac.next(), 0x6115553361443053);
-	}
+    #[test]
+    fn isaac64_matches_the_wechat_reference_vector() {
+        let mut isaac = Isaac64::new(1_234_567_890_123_456_789);
+        assert_eq!(isaac.next(), 0x981c44954c02d3c6);
+        assert_eq!(isaac.next(), 0x2fd66a014dfdf392);
+        assert_eq!(isaac.next(), 0x85b4e3e282339bff);
+        assert_eq!(isaac.next(), 0x6115553361443053);
+    }
 
-	#[test]
-	fn wechat_prefix_cipher_round_trips() {
-		let original: Vec<u8> = (0..140_000).map(|index| (index % 251) as u8).collect();
-		let mut encrypted = original.clone();
-		xor_wechat_isaac64_prefix(&mut encrypted, 42);
-		assert_ne!(&encrypted[..131072], &original[..131072]);
-		assert_eq!(&encrypted[131072..], &original[131072..]);
-		xor_wechat_isaac64_prefix(&mut encrypted, 42);
-		assert_eq!(encrypted, original);
-	}
+    #[test]
+    fn wechat_prefix_cipher_round_trips() {
+        let original: Vec<u8> = (0..140_000).map(|index| (index % 251) as u8).collect();
+        let mut encrypted = original.clone();
+        xor_wechat_isaac64_prefix(&mut encrypted, 42);
+        assert_ne!(&encrypted[..131072], &original[..131072]);
+        assert_eq!(&encrypted[131072..], &original[131072..]);
+        xor_wechat_isaac64_prefix(&mut encrypted, 42);
+        assert_eq!(encrypted, original);
+    }
 }

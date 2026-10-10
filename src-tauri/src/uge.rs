@@ -23,8 +23,8 @@ const UGE_TIMEOUT: Duration = Duration::from_secs(180);
 /// raw segments (`.ts`) are intentionally excluded: the direct-stream
 /// downloader fetches a single URL, so a manifest would just save its text.
 const PROGRESSIVE_EXT: &[&str] = &[
-    "mp4", "m4v", "webm", "mkv", "mov", "flv", "f4v", "3gp",
-    "mp3", "m4a", "m4b", "aac", "ogg", "oga", "opus", "wav", "flac",
+    "mp4", "m4v", "webm", "mkv", "mov", "flv", "f4v", "3gp", "mp3", "m4a", "m4b", "aac", "ogg",
+    "oga", "opus", "wav", "flac",
 ];
 
 #[derive(Debug, Clone)]
@@ -53,7 +53,6 @@ fn extension_from_url(url: &str) -> Option<String> {
         None
     }
 }
-
 
 /// Build a safe, readable filename from the page title + media URL.
 pub fn safe_uge_filename(title: &str, url: &str) -> String {
@@ -95,7 +94,11 @@ pub fn parse_callback_url(callback: &Url) -> Result<ResolvedUge, String> {
                 .filter(|value| value.starts_with("http://") || value.starts_with("https://"))
                 .ok_or_else(|| "Manual extraction returned no media URL".to_string())?;
             let filename = safe_uge_filename(title.as_deref().unwrap_or(""), &media);
-            Ok(ResolvedUge { url: media, filename, expected_bytes: 0 })
+            Ok(ResolvedUge {
+                url: media,
+                filename,
+                expected_bytes: 0,
+            })
         }
         (UGE_SCHEME, Some("error")) => {
             let message = callback
@@ -177,7 +180,7 @@ const UGE_SCRIPT: &str = r##"
     render();
   };
 
-  const report = (kind, params) => {
+  let report = (kind, params) => {
     const query = new URLSearchParams(params).toString();
     window.location.replace('cobalt-uge://' + kind + '/?' + query);
   };
@@ -361,4 +364,3 @@ mod tests {
         assert!(parse_callback_url(&bad_scheme).is_err());
     }
 }
-

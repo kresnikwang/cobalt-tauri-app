@@ -74,7 +74,9 @@ pub fn is_xinpianchang_url(url: &str) -> bool {
 
 pub fn article_id(url: &str) -> Option<String> {
     let parsed = Url::parse(url).ok()?;
-    let mut segments = parsed.path_segments()?.filter(|segment| !segment.is_empty());
+    let mut segments = parsed
+        .path_segments()?
+        .filter(|segment| !segment.is_empty());
     let candidate = segments.next()?;
     if segments.next().is_some()
         || candidate.len() < 2

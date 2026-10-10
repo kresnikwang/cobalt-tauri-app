@@ -1359,8 +1359,10 @@
   /* Window Header */
   .window-header {
     flex: 0 0 auto;
-    height: 60px;
-    padding: 0 var(--page-gutter);
+    min-height: 56px;
+    padding-top: 12px; /* Margin for Traffic Lights on macOS */
+    padding-left: var(--page-gutter);
+    padding-right: var(--page-gutter);
     box-sizing: border-box;
     display: flex;
     align-items: center;
@@ -1368,9 +1370,9 @@
     border-bottom: 1px solid var(--border-color);
   }
 
-  /* Transparent native titlebars already reserve a strip for window controls. */
+  /* Keep the wordmark clear of the macOS traffic-light buttons. */
   :global(html.native-mac) .window-header {
-    height: 52px;
+    padding-left: 80px;
   }
 
   .header-title {

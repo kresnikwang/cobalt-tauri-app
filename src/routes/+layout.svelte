@@ -2,8 +2,8 @@
   import '../app.css';
   let { children } = $props();
 
-  // The transparent macOS titlebar already sits above the webview, so use a
-  // compact app header while keeping the workspace's shared left edge.
+  // `titleBarStyle: "Overlay"` draws the webview full-size (behind the macOS
+  // traffic lights), so the app renders its own header and reserves room.
   if (typeof window !== 'undefined') {
     const isTauri = '__TAURI_INTERNALS__' in window || '__TAURI__' in window;
     const isMac = /mac/i.test(navigator.platform || navigator.userAgent || '');

@@ -50,7 +50,7 @@ const IMAGE_HOST_SUFFIXES: &[&str] = &[
     "deviantart.com",
     "sta.sh",
     // booru family ("等 booru 系").
-    "donmai.us",       // danbooru
+    "donmai.us", // danbooru
     "gelbooru.com",
     "safebooru.org",
     "yande.re",
@@ -95,28 +95,28 @@ const COLLECTION_MARKERS: &[&str] = &[
     "/galleries",
     "/album",
     "/albums",
-    "/a/",          // imgur album
-    "/t/",          // imgur tag
+    "/a/", // imgur album
+    "/t/", // imgur tag
     "/board",
     "/boards",
     "/pool",
     "/pools",
     "/user/",
     "/users/",
-    "/u/",          // ArtStation user id, booru users
+    "/u/", // ArtStation user id, booru users
     "/artist",
     "/artists",
     "/profile",
-    "/member/",     // Niconico Seiga member
+    "/member/", // Niconico Seiga member
     "/clip/",
     "/folder",
     "/favourites",
     "/favorites",
-    "/sets/",       // Flickr albums
+    "/sets/", // Flickr albums
     "/groups/",
     "/photostream",
     "/people/",
-    "/creator/",    // pixiv Fanbox creator
+    "/creator/", // pixiv Fanbox creator
     "/tag/",
     "/tags/",
     "/series",
@@ -138,7 +138,9 @@ fn host_matches(host: &str, suffixes: &[&str]) -> bool {
 /// Non-empty `tags=` (booru tag search) or an explicit pool listing.
 fn query_is_listing(query: &str) -> bool {
     for pair in query.split('&') {
-        let Some((key, value)) = pair.split_once('=') else { continue };
+        let Some((key, value)) = pair.split_once('=') else {
+            continue;
+        };
         match key {
             // A real tag search (empty tags means the site's front-page listing).
             "tags" => {
@@ -172,7 +174,9 @@ fn image_path_is_collection(host: &str, path: &str, query: &str) -> bool {
             }
         }
     }
-    COLLECTION_MARKERS.iter().any(|marker| path.contains(marker))
+    COLLECTION_MARKERS
+        .iter()
+        .any(|marker| path.contains(marker))
 }
 
 /// Path segments, lower-cased, empties removed.
@@ -225,8 +229,17 @@ fn bulk_only_is_collection(host: &str, path: &str) -> bool {
     }
     if host_matches(host, &["twitter.com", "x.com"]) {
         const RESERVED: &[&str] = &[
-            "home", "explore", "messages", "notifications", "settings", "i", "intent",
-            "share", "login", "signup", "hashtag",
+            "home",
+            "explore",
+            "messages",
+            "notifications",
+            "settings",
+            "i",
+            "intent",
+            "share",
+            "login",
+            "signup",
+            "hashtag",
         ];
         if first == "search" || first == "hashtag" || segs.iter().any(|s| *s == "events") {
             return true;
@@ -237,7 +250,10 @@ fn bulk_only_is_collection(host: &str, path: &str) -> bool {
         }
         if segs.len() >= 2 && !RESERVED.contains(&first) {
             return segs[1..].iter().all(|s| {
-                matches!(*s, "media" | "with_replies" | "likes" | "followers" | "following")
+                matches!(
+                    *s,
+                    "media" | "with_replies" | "likes" | "followers" | "following"
+                )
             });
         }
         return false;
@@ -248,7 +264,10 @@ fn bulk_only_is_collection(host: &str, path: &str) -> bool {
         }
         // /{user}/ (profile) or /{user}/{board}/.
         return !segs.is_empty()
-            && !matches!(first, "business" | "ideas" | "categories" | "today" | "topics");
+            && !matches!(
+                first,
+                "business" | "ideas" | "categories" | "today" | "topics"
+            );
     }
     if host_matches(host, &["reddit.com"]) {
         if first == "search" {
@@ -383,14 +402,23 @@ mod tests {
             classify("https://gelbooru.com/index.php?page=post&s=view&id=1234567"),
             GalleryRoute::Direct
         );
-        assert_eq!(classify("https://yande.re/post/show/123456"), GalleryRoute::Direct);
-        assert_eq!(classify("https://i.imgur.com/abcd123.png"), GalleryRoute::Direct);
+        assert_eq!(
+            classify("https://yande.re/post/show/123456"),
+            GalleryRoute::Direct
+        );
+        assert_eq!(
+            classify("https://i.imgur.com/abcd123.png"),
+            GalleryRoute::Direct
+        );
         assert_eq!(classify("https://imgur.com/abcd123"), GalleryRoute::Direct);
         assert_eq!(
             classify("https://www.flickr.com/photos/someuser/53123456789/"),
             GalleryRoute::Direct
         );
-        assert_eq!(classify("https://nijie.info/view.php?id=123456"), GalleryRoute::Direct);
+        assert_eq!(
+            classify("https://nijie.info/view.php?id=123456"),
+            GalleryRoute::Direct
+        );
         assert_eq!(
             classify("https://seiga.nicovideo.jp/seiga/im12345678"),
             GalleryRoute::Direct
@@ -424,9 +452,18 @@ mod tests {
             classify("https://gelbooru.com/index.php?page=post&s=list&tags=cat"),
             GalleryRoute::BulkCollection
         );
-        assert_eq!(classify("https://yande.re/post?tags=long_hair"), GalleryRoute::BulkCollection);
-        assert_eq!(classify("https://imgur.com/a/abcd123"), GalleryRoute::BulkCollection);
-        assert_eq!(classify("https://imgur.com/t/cat"), GalleryRoute::BulkCollection);
+        assert_eq!(
+            classify("https://yande.re/post?tags=long_hair"),
+            GalleryRoute::BulkCollection
+        );
+        assert_eq!(
+            classify("https://imgur.com/a/abcd123"),
+            GalleryRoute::BulkCollection
+        );
+        assert_eq!(
+            classify("https://imgur.com/t/cat"),
+            GalleryRoute::BulkCollection
+        );
         assert_eq!(
             classify("https://www.flickr.com/photos/someuser/"),
             GalleryRoute::BulkCollection
@@ -435,7 +472,10 @@ mod tests {
             classify("https://www.flickr.com/photos/someuser/sets/721576/"),
             GalleryRoute::BulkCollection
         );
-        assert_eq!(classify("https://nijie.info/users/123456"), GalleryRoute::BulkCollection);
+        assert_eq!(
+            classify("https://nijie.info/users/123456"),
+            GalleryRoute::BulkCollection
+        );
         assert_eq!(
             classify("https://seiga.nicovideo.jp/member/illust/12345"),
             GalleryRoute::BulkCollection
@@ -444,14 +484,26 @@ mod tests {
 
     #[test]
     fn bulk_only_single_posts_stay_with_remote() {
-        assert_eq!(classify("https://www.instagram.com/p/AbC123XYZ/"), GalleryRoute::None);
-        assert_eq!(classify("https://www.instagram.com/reel/AbC123XYZ/"), GalleryRoute::None);
-        assert_eq!(classify("https://x.com/someuser/status/123456789"), GalleryRoute::None);
+        assert_eq!(
+            classify("https://www.instagram.com/p/AbC123XYZ/"),
+            GalleryRoute::None
+        );
+        assert_eq!(
+            classify("https://www.instagram.com/reel/AbC123XYZ/"),
+            GalleryRoute::None
+        );
+        assert_eq!(
+            classify("https://x.com/someuser/status/123456789"),
+            GalleryRoute::None
+        );
         assert_eq!(
             classify("https://twitter.com/someuser/status/123456789/photo/1"),
             GalleryRoute::None
         );
-        assert_eq!(classify("https://www.pinterest.com/pin/123456789/"), GalleryRoute::None);
+        assert_eq!(
+            classify("https://www.pinterest.com/pin/123456789/"),
+            GalleryRoute::None
+        );
         assert_eq!(
             classify("https://www.reddit.com/r/cats/comments/abc123/my_post/"),
             GalleryRoute::None
@@ -472,9 +524,18 @@ mod tests {
 
     #[test]
     fn bulk_only_profiles_and_boards_are_owned() {
-        assert_eq!(classify("https://www.instagram.com/someuser/"), GalleryRoute::BulkCollection);
-        assert_eq!(classify("https://x.com/someuser/media"), GalleryRoute::BulkCollection);
-        assert_eq!(classify("https://x.com/someuser"), GalleryRoute::BulkCollection);
+        assert_eq!(
+            classify("https://www.instagram.com/someuser/"),
+            GalleryRoute::BulkCollection
+        );
+        assert_eq!(
+            classify("https://x.com/someuser/media"),
+            GalleryRoute::BulkCollection
+        );
+        assert_eq!(
+            classify("https://x.com/someuser"),
+            GalleryRoute::BulkCollection
+        );
         assert_eq!(
             classify("https://twitter.com/search?q=cat&src=typed_query"),
             GalleryRoute::BulkCollection
@@ -487,10 +548,22 @@ mod tests {
             classify("https://www.pinterest.com/someuser/my-board/"),
             GalleryRoute::BulkCollection
         );
-        assert_eq!(classify("https://www.reddit.com/r/cats/"), GalleryRoute::BulkCollection);
-        assert_eq!(classify("https://www.reddit.com/r/cats/top/?t=week"), GalleryRoute::BulkCollection);
-        assert_eq!(classify("https://www.reddit.com/user/someuser/"), GalleryRoute::BulkCollection);
-        assert_eq!(classify("https://someuser.tumblr.com/"), GalleryRoute::BulkCollection);
+        assert_eq!(
+            classify("https://www.reddit.com/r/cats/"),
+            GalleryRoute::BulkCollection
+        );
+        assert_eq!(
+            classify("https://www.reddit.com/r/cats/top/?t=week"),
+            GalleryRoute::BulkCollection
+        );
+        assert_eq!(
+            classify("https://www.reddit.com/user/someuser/"),
+            GalleryRoute::BulkCollection
+        );
+        assert_eq!(
+            classify("https://someuser.tumblr.com/"),
+            GalleryRoute::BulkCollection
+        );
         assert_eq!(
             classify("https://someuser.tumblr.com/tagged/cat"),
             GalleryRoute::BulkCollection
@@ -504,16 +577,40 @@ mod tests {
     #[test]
     fn unknown_and_lookalike_hosts_are_never_owned() {
         assert_eq!(classify("https://vimeo.com/123456789"), GalleryRoute::None);
-        assert_eq!(classify("https://www.youtube.com/watch?v=abc"), GalleryRoute::None);
-        assert_eq!(classify("https://notpixiv.net/artworks/1"), GalleryRoute::None);
-        assert_eq!(classify("https://pixiv.evil.com/artworks/1"), GalleryRoute::None);
-        assert_eq!(classify("https://danbooru.example.com/posts/1"), GalleryRoute::None);
+        assert_eq!(
+            classify("https://www.youtube.com/watch?v=abc"),
+            GalleryRoute::None
+        );
+        assert_eq!(
+            classify("https://notpixiv.net/artworks/1"),
+            GalleryRoute::None
+        );
+        assert_eq!(
+            classify("https://pixiv.evil.com/artworks/1"),
+            GalleryRoute::None
+        );
+        assert_eq!(
+            classify("https://danbooru.example.com/posts/1"),
+            GalleryRoute::None
+        );
         assert_eq!(classify("https://myimgur.com/a/1"), GalleryRoute::None);
-        assert_eq!(classify("https://reddit.example.com/r/cats"), GalleryRoute::None);
-        assert_eq!(classify("https://www.tumblr.com/dashboard"), GalleryRoute::None);
-        assert_eq!(classify("https://www.instagram.com/explore/"), GalleryRoute::None);
+        assert_eq!(
+            classify("https://reddit.example.com/r/cats"),
+            GalleryRoute::None
+        );
+        assert_eq!(
+            classify("https://www.tumblr.com/dashboard"),
+            GalleryRoute::None
+        );
+        assert_eq!(
+            classify("https://www.instagram.com/explore/"),
+            GalleryRoute::None
+        );
         // A direct image on an unknown host must NOT blind-run gallery-dl.
-        assert_eq!(classify("https://example.com/photo.jpg"), GalleryRoute::None);
+        assert_eq!(
+            classify("https://example.com/photo.jpg"),
+            GalleryRoute::None
+        );
         // Garbage input.
         assert_eq!(classify("not a url"), GalleryRoute::None);
         assert_eq!(classify(""), GalleryRoute::None);
@@ -530,9 +627,13 @@ mod tests {
     fn capable_host_matches_single_posts_too() {
         // Bulk-only single posts classify as None but the host is still capable.
         assert!(is_gallery_capable_host("https://www.instagram.com/p/AbC/"));
-        assert!(is_gallery_capable_host("https://www.reddit.com/r/cats/comments/abc/x/"));
+        assert!(is_gallery_capable_host(
+            "https://www.reddit.com/r/cats/comments/abc/x/"
+        ));
         assert!(is_gallery_capable_host("https://x.com/u/status/1"));
-        assert!(is_gallery_capable_host("https://danbooru.donmai.us/posts/1"));
+        assert!(is_gallery_capable_host(
+            "https://danbooru.donmai.us/posts/1"
+        ));
         assert!(!is_gallery_capable_host("https://vimeo.com/1"));
         assert!(!is_gallery_capable_host("https://reddit.example.com/r/x"));
         assert!(!is_gallery_capable_host("not a url"));
