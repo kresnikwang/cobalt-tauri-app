@@ -2821,7 +2821,12 @@ async fn try_local_gallery_download(
         args
     };
 
-    let cookie_attempts = configured_cookie_attempts(settings, false)?;
+    // Login-walled gallery hosts (IG / X / Pinterest / Reddit / Tumblr / Weibo)
+    // return nothing to an anonymous `-j` enumeration, so the browser-cookie
+    // attempt must come first there — otherwise the anonymous round runs to its
+    // 180s timeout before the logged-in profile finally sees the media (the same
+    // "stuck at 0%" symptom YouTube had). Other image hosts keep anonymous-first.
+    let cookie_attempts = configured_cookie_attempts(settings, gallerydl::requires_login_cookie(url))?;
 
     // Phase 1: enumerate with `-j`; try cookie sources until items are found.
     let mut items_total: usize = 0;

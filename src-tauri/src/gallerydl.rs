@@ -338,6 +338,38 @@ pub fn is_gallery_capable_host(url: &str) -> bool {
     host_matches(&host, IMAGE_HOST_SUFFIXES) || host_matches(&host, BULK_ONLY_HOST_SUFFIXES)
 }
 
+/// Gallery hosts that are effectively **login-walled**: anonymous enumeration
+/// returns nothing (or a redirect to the login page) instead of media. Trying
+/// them anonymously first wastes a full enumeration round (and its timeout)
+/// before the browser-cookie attempt finally sees the content — the same
+/// "stuck at 0%" symptom YouTube had. Prefer the logged-in browser profile
+/// first on these hosts, then fall back to anonymous.
+const LOGIN_WALLED_SUFFIXES: &[&str] = &[
+    "instagram.com",
+    "twitter.com",
+    "x.com",
+    "pinterest.com",
+    "reddit.com",
+    "tumblr.com",
+    "weibo.com",
+    "weibo.cn",
+];
+
+/// True when a gallery-dl URL is on a host that generally requires a logged-in
+/// browser session, so the browser-cookie attempt should be tried before the
+/// anonymous one. Pure and host-only: the per-URL single/collection split does
+/// not change the login requirement.
+pub fn requires_login_cookie(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    let Some(raw_host) = parsed.host_str() else {
+        return false;
+    };
+    let host = normalize_host(raw_host);
+    host_matches(&host, LOGIN_WALLED_SUFFIXES)
+}
+
 /// Count the media entries in `gallery-dl -j` (dump-json) output.
 ///
 /// Current gallery-dl emits one **pretty-printed top-level JSON array** whose
@@ -637,6 +669,35 @@ mod tests {
         assert!(!is_gallery_capable_host("https://vimeo.com/1"));
         assert!(!is_gallery_capable_host("https://reddit.example.com/r/x"));
         assert!(!is_gallery_capable_host("not a url"));
+    }
+
+    #[test]
+    fn login_walled_hosts_prefer_browser_cookie() {
+        // Login-walled social/portfolio hosts: browser cookie first.
+        for url in [
+            "https://www.instagram.com/someuser/",
+            "https://twitter.com/someuser/media",
+            "https://x.com/someuser/media",
+            "https://www.pinterest.com/someuser/board/",
+            "https://www.reddit.com/r/cats/",
+            "https://someblog.tumblr.com/archive",
+            "https://weibo.com/1234567890/profile",
+        ] {
+            assert!(requires_login_cookie(url), "expected login-walled: {url}");
+        }
+
+        // Anonymous-friendly image hosts keep anonymous-first.
+        for url in [
+            "https://www.pixiv.net/users/1",
+            "https://danbooru.donmai.us/posts?tags=cat",
+            "https://imgur.com/a/abc",
+        ] {
+            assert!(!requires_login_cookie(url), "expected anonymous-first: {url}");
+        }
+
+        // A lookalike host must not match, and a bad URL must be safe.
+        assert!(!requires_login_cookie("https://notinstagram.com/x"));
+        assert!(!requires_login_cookie("not a url"));
     }
 
     #[test]
