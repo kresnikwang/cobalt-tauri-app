@@ -400,9 +400,68 @@ pub fn parse_callback_url(callback: &Url) -> Result<ResolvedUge, String> {
     }
 }
 
+fn uge_catalog(locale: &str) -> &'static str {
+    match locale.trim() {
+        "zh" | "zh-CN" | "zh-Hans" | "zh-cn" => include_str!("../../src/lib/i18n/zh.json"),
+        "ru" | "ru-RU" => include_str!("../../src/lib/i18n/ru.json"),
+        _ => include_str!("../../src/lib/i18n/en.json"),
+    }
+}
+
+fn uge_string(catalog: &serde_json::Value, fallback: &serde_json::Value, key: &str) -> String {
+    catalog
+        .get(key)
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+        .or_else(|| fallback.get(key).and_then(|value| value.as_str()))
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Overlay copy for the extraction webview, taken from the app i18n catalogs.
+/// Unknown locales fall back to English. `zh-CN` is accepted as `zh`.
+pub fn uge_overlay_messages(locale: &str) -> serde_json::Value {
+    let english: serde_json::Value =
+        serde_json::from_str(include_str!("../../src/lib/i18n/en.json"))
+            .unwrap_or(serde_json::json!({}));
+    let local: serde_json::Value =
+        serde_json::from_str(uge_catalog(locale)).unwrap_or_else(|_| english.clone());
+    let pick = |key: &str| uge_string(&local, &english, key);
+    serde_json::json!({
+        "title": pick("uge.title"),
+        "empty": pick("uge.empty"),
+        "mse": pick("uge.mse"),
+        "cancelled": pick("uge.cancelled"),
+        "window": pick("uge.window"),
+        "kinds": {
+            "video": pick("uge.kind.video"),
+            "audio": pick("uge.kind.audio"),
+            "manifest": pick("uge.kind.manifest"),
+            "segment": pick("uge.kind.segment"),
+            "hint": pick("uge.kind.hint"),
+        },
+        "vias": {
+            "player": pick("uge.via.player"),
+            "body": pick("uge.via.body"),
+            "resource": pick("uge.via.resource"),
+            "network": pick("uge.via.network"),
+        }
+    })
+}
+
+pub fn uge_initialization_script(locale: &str) -> String {
+    let messages = uge_overlay_messages(locale);
+    format!("window.__cobaltUgeI18n = {messages};\n{UGE_SCRIPT}")
+}
+
 /// Open a real webview at `url`, inject the media sniffer, and wait for the
-/// user to pick a stream (or cancel / time out).
-pub async fn start_uge(app_handle: &AppHandle, url: &str) -> Result<ResolvedUge, String> {
+/// user to pick a stream (or cancel / time out). `locale` selects the overlay
+/// strings (`en`, `zh` / `zh-CN`, `ru`).
+pub async fn start_uge(
+    app_handle: &AppHandle,
+    url: &str,
+    locale: &str,
+) -> Result<ResolvedUge, String> {
     let parsed = Url::parse(url).map_err(|error| format!("Invalid URL: {error}"))?;
 
     // A previous run may still hold the label; close it so the rebuild succeeds.
@@ -410,12 +469,18 @@ pub async fn start_uge(app_handle: &AppHandle, url: &str) -> Result<ResolvedUge,
         let _ = existing.close();
     }
 
+    let messages = uge_overlay_messages(locale);
+    let window_title = messages
+        .get("window")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("Cobalt · Manual extraction");
     let (navigation_tx, mut navigation_rx) = tokio::sync::mpsc::unbounded_channel::<Url>();
     let window = WebviewWindowBuilder::new(app_handle, "uge", WebviewUrl::External(parsed))
-        .title("Cobalt · Manual extraction")
+        .title(window_title)
         .inner_size(1000.0, 760.0)
         .user_agent(UGE_USER_AGENT)
-        .initialization_script(UGE_SCRIPT)
+        .initialization_script(uge_initialization_script(locale))
         .on_navigation(move |navigation_url| {
             if navigation_url.scheme() == UGE_SCHEME {
                 let _ = navigation_tx.send(navigation_url.clone());
@@ -442,6 +507,14 @@ const UGE_SCRIPT: &str = r##"
 (() => {
   if (window.__cobaltUGE) return;
   window.__cobaltUGE = true;
+  const I18N = Object.assign({
+    title: "Cobalt · detected media",
+    empty: "No media yet — try playing the video.",
+    mse: "This player keeps the stream inside the browser (MediaSource/blob), so there is no file URL yet. Press play — a playlist will show up here if the page requests one.",
+    cancelled: "Cancelled",
+    kinds: { video: "video", audio: "audio", manifest: "manifest", segment: "segment", hint: "hint" },
+    vias: { player: "player", body: "body", resource: "resource", network: "network" }
+  }, window.__cobaltUgeI18n || {});
 
   // Terminator includes "/" so `video.mp4/` is still a media URL.
   const PROGRESSIVE = /\.(mp4|m4v|webm|mkv|mk3d|mks|mov|flv|f4v|3gp|3g2|avi|wmv|mpg|mpeg|m2ts|mts|ogv)(\?|#|\/|$)/i;
@@ -836,12 +909,14 @@ const UGE_SCRIPT: &str = r##"
       '.none{color:#9a9aa2;padding:6px 2px}' +
       '</style>' +
       '<div class="panel">' +
-      '<div class="h"><span>Cobalt · detected media</span><button id="__cobalt_uge_close">✕</button></div>' +
+      '<div class="h"><span id="__cobalt_uge_title"></span><button id="__cobalt_uge_close">✕</button></div>' +
       '<div id="__cobalt_uge_list"></div>' +
       '</div>';
     document.documentElement.appendChild(host);
+    const title = shadow.getElementById('__cobalt_uge_title');
+    if (title) title.textContent = I18N.title || '';
     shadow.getElementById('__cobalt_uge_close').onclick = function () {
-      report('error', { message: 'Cancelled' });
+      report('error', { message: I18N.cancelled || 'Cancelled' });
     };
     return shadow;
   };
@@ -864,11 +939,10 @@ const UGE_SCRIPT: &str = r##"
     if (!items.length) {
       const blobCount = BLOB_ELEMENTS.size || 0;
       const mseCount = BLOB_MIMES.length || 0;
-      if (blobCount > 0 || mseCount > 0) {
-        list.innerHTML = '<div class="none">This player keeps the stream inside the browser (MediaSource/blob), so there is no file URL yet. Press play — a playlist will show up here if the page requests one.</div>';
-      } else {
-        list.innerHTML = '<div class="none">No media yet — try playing the video.</div>';
-      }
+      const note = document.createElement('div');
+      note.className = 'none';
+      note.textContent = (blobCount > 0 || mseCount > 0) ? (I18N.mse || '') : (I18N.empty || '');
+      list.replaceChildren(note);
       return;
     }
     // Best stream first so the user usually only needs the top entry.
@@ -887,7 +961,9 @@ const UGE_SCRIPT: &str = r##"
       if (label.indexOf('/') !== -1) label = label.split('/')[1];
       label = String(label).split(';')[0];
       const kind = it.kind || 'video';
-      m.textContent = kind + ' · ' + label + ' · ' + it.via;
+      const kindLabel = (I18N.kinds && I18N.kinds[kind]) || kind;
+      const viaLabel = (I18N.vias && I18N.vias[it.via]) || it.via;
+      m.textContent = kindLabel + ' · ' + label + ' · ' + viaLabel;
       div.appendChild(u);
       div.appendChild(m);
       div.onclick = function () {
@@ -1184,6 +1260,36 @@ mod tests {
         assert_eq!(
             parse_callback_url(&page).unwrap_err(),
             "Manual extraction returned a non-media URL"
+        );
+    }
+
+    #[test]
+    fn overlay_strings_follow_the_app_locale() {
+        assert!(UGE_SCRIPT.contains("I18N.empty"));
+        assert!(UGE_SCRIPT.contains("I18N.mse"));
+        assert!(UGE_SCRIPT.contains("I18N.title"));
+        assert!(!UGE_SCRIPT.contains("No media yet — try playing the video.</div>"));
+
+        let english = super::uge_initialization_script("en");
+        assert!(english.contains("window.__cobaltUgeI18n"));
+        assert!(english.contains("No media yet"));
+        assert!(english.contains("Manual extraction"));
+
+        let chinese = super::uge_overlay_messages("zh-CN");
+        assert_eq!(
+            chinese.get("empty").and_then(|value| value.as_str()),
+            Some("还没有检测到媒体，试着播放视频。")
+        );
+        let russian = super::uge_overlay_messages("ru");
+        assert!(russian
+            .get("title")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .contains("найденные"));
+        // An unknown locale stays on the English catalog.
+        assert_eq!(
+            super::uge_overlay_messages("de").get("empty"),
+            super::uge_overlay_messages("en").get("empty")
         );
     }
 }

@@ -87,6 +87,23 @@ pub struct Settings {
     /// intact and only adds SponsorBlock chapter markers.
     #[serde(default = "default_sponsorblock_mode")]
     pub sponsorblock_mode: String,
+    /// Where yt-dlp and gallery-dl read cookies from.
+    /// `"auto"` walks the local browsers (the historical default).
+    /// `"none"` sends no cookies. `"browser"` uses only `cookie_browser`.
+    /// `"file"` uses a Netscape cookies.txt at `cookie_file`.
+    #[serde(default = "default_cookie_mode")]
+    pub cookie_mode: String,
+    /// yt-dlp browser spec when `cookie_mode` is `"browser"`,
+    /// e.g. `chrome:Default`, `safari`, `firefox:abcd.default-release`.
+    #[serde(default = "default_cookie_browser")]
+    pub cookie_browser: String,
+    /// Absolute path of a Netscape cookies.txt when `cookie_mode` is `"file"`.
+    #[serde(default)]
+    pub cookie_file: String,
+    /// Proxy URL the user chose to keep using after we warned that the local
+    /// port was closed. Empty means the warning has not been dismissed.
+    #[serde(default)]
+    pub proxy_warning_ack: String,
 }
 
 fn default_true() -> bool {
@@ -103,6 +120,14 @@ fn default_subtitle_langs() -> String {
 
 fn default_sponsorblock_mode() -> String {
     "remove".to_string()
+}
+
+fn default_cookie_mode() -> String {
+    "auto".to_string()
+}
+
+fn default_cookie_browser() -> String {
+    "chrome".to_string()
 }
 
 impl Settings {
@@ -132,6 +157,10 @@ impl Settings {
             ytdlp_checked_at: None,
             sponsorblock_enabled: false,
             sponsorblock_mode: default_sponsorblock_mode(),
+            cookie_mode: default_cookie_mode(),
+            cookie_browser: default_cookie_browser(),
+            cookie_file: String::new(),
+            proxy_warning_ack: String::new(),
         }
     }
 
@@ -241,6 +270,9 @@ pub struct AppState {
     /// enabled, corrupt a shared `.part`), so a claimed stem is excluded from
     /// `unique_ytdlp_stem` until its owner finishes.
     pub active_stems: HashSet<String>,
+    /// Downloads paused until the user disables an unreachable local proxy or
+    /// chooses to keep it. One answer releases every waiter.
+    pub proxy_waiters: Vec<tokio::sync::oneshot::Sender<()>>,
 }
 
 #[derive(Debug, Clone)]
@@ -1510,6 +1542,320 @@ fn chrome_cookie_sources() -> Vec<String> {
     sources
 }
 
+/// Browsers yt-dlp's `--cookies-from-browser` understands. The profile half,
+/// when present, is a single path segment (`Default`, `Profile 1`, a Firefox
+/// profile directory). Anything else is rejected so a hand-edited settings
+/// file cannot smuggle extra arguments.
+const COOKIE_BROWSERS: &[&str] = &[
+    "chrome", "chromium", "brave", "edge", "firefox", "safari", "vivaldi", "opera", "whale",
+];
+
+fn normalize_cookie_browser(spec: &str) -> Option<String> {
+    let spec = spec.trim();
+    if spec.is_empty() || spec.len() > 80 || spec.contains(['\n', '\r', '\0']) {
+        return None;
+    }
+    let (browser, profile) = match spec.split_once(':') {
+        Some((browser, profile)) => (browser, Some(profile)),
+        None => (spec, None),
+    };
+    let browser = browser.trim().to_ascii_lowercase();
+    if !COOKIE_BROWSERS.contains(&browser.as_str()) {
+        return None;
+    }
+    let Some(profile) = profile else {
+        return Some(browser);
+    };
+    let profile = profile.trim();
+    if profile.is_empty() || profile.len() > 64 || profile.starts_with('-') {
+        return None;
+    }
+    if !profile
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '_' | '-' | '.'))
+    {
+        return None;
+    }
+    Some(format!("{browser}:{profile}"))
+}
+
+/// Netscape cookies.txt: the header the export tools write, or at least one
+/// tab-separated cookie row. HTML pages and empty files are rejected.
+fn netscape_cookie_file_ok(path: &str) -> bool {
+    let path = path.trim();
+    if path.is_empty() || path.contains(['\n', '\r', '\0']) {
+        return false;
+    }
+    let meta = match std::fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(_) => return false,
+    };
+    if !meta.is_file() || meta.len() == 0 || meta.len() > 20 * 1024 * 1024 {
+        return false;
+    }
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(_) => return false,
+    };
+    let reader = std::io::BufReader::new(file);
+    use std::io::BufRead;
+    for (index, line) in reader.lines().enumerate() {
+        if index > 40 {
+            break;
+        }
+        let Ok(line) = line else {
+            return false;
+        };
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with('#') {
+            let lower = trimmed.to_ascii_lowercase();
+            if lower.contains("netscape http cookie file") || lower.contains("http cookie file") {
+                return true;
+            }
+            continue;
+        }
+        if trimmed.split('\t').count() >= 7 {
+            return true;
+        }
+    }
+    false
+}
+
+/// One cookie source passed to yt-dlp or gallery-dl.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EngineCookies {
+    None,
+    Browser(String),
+    File(String),
+}
+
+fn auto_cookie_attempts(browser_before_anonymous: bool) -> Vec<EngineCookies> {
+    let browsers = chrome_cookie_sources()
+        .into_iter()
+        .chain(["safari".to_string(), "firefox".to_string()])
+        .map(EngineCookies::Browser);
+    if browser_before_anonymous {
+        browsers
+            .chain(std::iter::once(EngineCookies::None))
+            .collect()
+    } else {
+        std::iter::once(EngineCookies::None)
+            .chain(browsers)
+            .collect()
+    }
+}
+
+/// Cookie attempts for a download.
+///
+/// `"auto"` keeps the historical ladder (anonymous first, except Bilibili,
+/// which prefers a logged-in browser). An explicit browser or cookies.txt is
+/// used alone — a failed Chrome read must not silently walk into Safari.
+fn configured_cookie_attempts(
+    settings: &Settings,
+    browser_before_anonymous: bool,
+) -> Result<Vec<EngineCookies>, String> {
+    match settings.cookie_mode.trim() {
+        "none" => Ok(vec![EngineCookies::None]),
+        "file" => {
+            let path = settings.cookie_file.trim();
+            if !netscape_cookie_file_ok(path) {
+                return Err("Cookie file is missing or is not a Netscape cookies.txt".to_string());
+            }
+            Ok(vec![EngineCookies::File(path.to_string())])
+        }
+        "browser" => {
+            let spec = normalize_cookie_browser(&settings.cookie_browser)
+                .ok_or_else(|| "Choose a supported browser profile for cookies".to_string())?;
+            Ok(vec![EngineCookies::Browser(spec)])
+        }
+        _ => Ok(auto_cookie_attempts(browser_before_anonymous)),
+    }
+}
+
+fn apply_ytdlp_cookies(cmd: &mut TokioCommand, cookies: &EngineCookies) {
+    match cookies {
+        EngineCookies::None => {}
+        EngineCookies::Browser(spec) => {
+            cmd.arg("--cookies-from-browser").arg(spec);
+        }
+        EngineCookies::File(path) => {
+            cmd.arg("--cookies").arg(path);
+        }
+    }
+}
+
+fn push_gallery_cookies(args: &mut Vec<String>, cookies: &EngineCookies) {
+    match cookies {
+        EngineCookies::None => {}
+        EngineCookies::Browser(spec) => {
+            args.push("--cookies-from-browser".to_string());
+            args.push(spec.clone());
+        }
+        EngineCookies::File(path) => {
+            args.push("--cookies".to_string());
+            args.push(path.clone());
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct CookieProfileOption {
+    browser: String,
+    spec: String,
+    label: String,
+}
+
+/// Browser profiles the settings UI can offer. `home` is injected so tests
+/// don't have to mutate the process environment.
+fn list_cookie_profile_options(home: &Path) -> Vec<CookieProfileOption> {
+    let mut options = Vec::new();
+    for (browser, label) in [
+        ("chrome", "Chrome"),
+        ("safari", "Safari"),
+        ("firefox", "Firefox"),
+        ("brave", "Brave"),
+        ("edge", "Edge"),
+    ] {
+        options.push(CookieProfileOption {
+            browser: browser.to_string(),
+            spec: browser.to_string(),
+            label: format!("{label} ({browser})"),
+        });
+    }
+    let roots = [
+        (
+            "chrome",
+            "Chrome",
+            home.join("Library/Application Support/Google/Chrome"),
+        ),
+        ("chrome", "Chrome", home.join(".config/google-chrome")),
+        (
+            "brave",
+            "Brave",
+            home.join("Library/Application Support/BraveSoftware/Brave-Browser"),
+        ),
+        (
+            "brave",
+            "Brave",
+            home.join(".config/BraveSoftware/Brave-Browser"),
+        ),
+        (
+            "edge",
+            "Edge",
+            home.join("Library/Application Support/Microsoft Edge"),
+        ),
+        ("edge", "Edge", home.join(".config/microsoft-edge")),
+        (
+            "chromium",
+            "Chromium",
+            home.join("Library/Application Support/Chromium"),
+        ),
+        ("chromium", "Chromium", home.join(".config/chromium")),
+        (
+            "firefox",
+            "Firefox",
+            home.join("Library/Application Support/Firefox/Profiles"),
+        ),
+        ("firefox", "Firefox", home.join(".mozilla/firefox")),
+    ];
+    for (browser, label, root) in roots {
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            continue;
+        };
+        let mut found: Vec<CookieProfileOption> = entries
+            .flatten()
+            .filter_map(|entry| {
+                let file_type = entry.file_type().ok()?;
+                if !file_type.is_dir() {
+                    return None;
+                }
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let interesting = if browser == "firefox" {
+                    name.contains('.') && !name.starts_with('.')
+                } else {
+                    name == "Default" || name.starts_with("Profile ")
+                };
+                if !interesting {
+                    return None;
+                }
+                let spec = format!("{browser}:{name}");
+                normalize_cookie_browser(&spec)?;
+                Some(CookieProfileOption {
+                    browser: browser.to_string(),
+                    spec,
+                    label: format!("{label} · {name}"),
+                })
+            })
+            .collect();
+        found.sort_by(|left, right| left.label.cmp(&right.label));
+        options.extend(found);
+    }
+    options
+}
+
+fn normalize_proxy_url(url: &str) -> String {
+    url.trim().trim_end_matches('/').to_string()
+}
+
+/// Loopback proxy address, or `None` when the URL is not a local proxy we
+/// can probe with a TCP connect (remote proxies are left to the download).
+fn loopback_proxy_socket(proxy_url: &str) -> Option<std::net::SocketAddr> {
+    let trimmed = proxy_url.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let with_scheme = if trimmed.contains("://") {
+        trimmed.to_string()
+    } else {
+        format!("http://{trimmed}")
+    };
+    let parsed = reqwest::Url::parse(&with_scheme).ok()?;
+    let host = parsed
+        .host_str()?
+        .trim_matches(['[', ']'])
+        .to_ascii_lowercase();
+    if !matches!(host.as_str(), "127.0.0.1" | "localhost" | "::1") {
+        return None;
+    }
+    let port = parsed.port_or_known_default()?;
+    let ip = if host == "::1" {
+        std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+    } else {
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+    };
+    Some(std::net::SocketAddr::new(ip, port))
+}
+
+/// `Some(true/false)` for a loopback proxy; `None` when this URL is not a
+/// local port we should nag about.
+fn local_proxy_is_reachable(proxy_url: &str) -> Option<bool> {
+    let addr = loopback_proxy_socket(proxy_url)?;
+    Some(std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(400)).is_ok())
+}
+
+/// True when downloads would be sent at a closed local proxy and the user
+/// has not already chosen to keep that proxy.
+fn proxy_needs_prompt(settings: &Settings) -> bool {
+    if !settings.proxy_enabled {
+        return false;
+    }
+    let url = normalize_proxy_url(&settings.proxy_url);
+    if url.is_empty() || normalize_proxy_url(&settings.proxy_warning_ack) == url {
+        return false;
+    }
+    matches!(local_proxy_is_reachable(&url), Some(false))
+}
+
+/// Playlist picker runs once per collection. Episodes created by that picker
+/// already carry `playlist_index` and must download directly.
+fn should_offer_playlist(settings: &Settings, playlist_index: Option<u32>) -> bool {
+    settings.playlist_prompt && playlist_index.is_none()
+}
+
 fn ytdlp_audio_format(settings: &Settings) -> String {
     match settings.audio_format.as_str() {
         "mp3" | "ogg" | "wav" | "opus" | "m4a" => settings.audio_format.clone(),
@@ -1699,7 +2045,17 @@ async fn try_local_ytdlp_download(
     generic_probe: Option<YtdlpProbe>,
     referer: Option<&str>,
 ) -> Result<bool, String> {
-    if !is_local_ytdlp_url(url) && generic_probe.is_none() {
+    let playlist_item = {
+        let state_lock = state.lock().unwrap_or_else(|error| error.into_inner());
+        state_lock
+            .tasks
+            .get(&id)
+            .and_then(|task| task.playlist_index)
+            .is_some()
+    };
+    // A generic playlist episode was already split out by the picker. It has
+    // no single-video probe, but yt-dlp can still fetch it with --playlist-items.
+    if !is_local_ytdlp_url(url) && generic_probe.is_none() && !playlist_item {
         return Ok(false);
     }
 
@@ -1811,29 +2167,10 @@ async fn try_local_ytdlp_download(
         remove_ytdlp_partial_files(&save_path, &output_stem);
     }
     write_resume_marker(&save_path, &output_stem, &fingerprint);
-    let cookie_attempts: Vec<Option<String>> = if is_youtube {
-        let mut sources = vec![None];
-        sources.extend(chrome_cookie_sources().into_iter().map(Some));
-        sources.extend([Some("safari".to_string()), Some("firefox".to_string())]);
-        sources
-    } else if is_bilibili {
-        let mut sources: Vec<Option<String>> =
-            chrome_cookie_sources().into_iter().map(Some).collect();
-        sources.extend([
-            Some("safari".to_string()),
-            Some("firefox".to_string()),
-            None,
-        ]);
-        sources
-    } else {
-        let mut sources = vec![None];
-        sources.extend(chrome_cookie_sources().into_iter().map(Some));
-        sources.extend([Some("safari".to_string()), Some("firefox".to_string())]);
-        sources
-    };
+    let cookie_attempts = configured_cookie_attempts(&settings, is_bilibili)?;
     let mut last_error = String::from("Local yt-dlp download failed");
 
-    for browser in cookie_attempts {
+    for cookies in cookie_attempts {
         // Intermediates from an earlier attempt are stale, but a `.part` file is
         // exactly what resume is for — keep it.
         remove_ytdlp_intermediates(&save_path, &output_stem);
@@ -1967,9 +2304,7 @@ async fn try_local_ytdlp_download(
                 .arg(format!("node:{}", node_path.to_string_lossy()));
         }
 
-        if let Some(browser) = browser.as_deref() {
-            cmd.arg("--cookies-from-browser").arg(browser);
-        }
+        apply_ytdlp_cookies(&mut cmd, &cookies);
 
         if let Some(proxy) = settings.proxy_url() {
             cmd.env("HTTP_PROXY", proxy);
@@ -2404,17 +2739,14 @@ async fn try_local_gallery_download(
         None
     };
 
-    // Fixed invocation: <python> -I -m gallery_dl [--proxy P] [--cookies-from-browser B] <phase args> URL
-    let build_args = |cookie: Option<&str>, phase: &[&str]| -> Vec<String> {
+    // Fixed invocation: <python> -I -m gallery_dl [--proxy P] [--cookies ...] <phase args> URL
+    let build_args = |cookies: &EngineCookies, phase: &[&str]| -> Vec<String> {
         let mut args = vec!["-I".to_string(), "-m".to_string(), "gallery_dl".to_string()];
         if let Some(proxy) = proxy_arg.as_deref() {
             args.push("--proxy".to_string());
             args.push(proxy.to_string());
         }
-        if let Some(browser) = cookie {
-            args.push("--cookies-from-browser".to_string());
-            args.push(browser.to_string());
-        }
+        push_gallery_cookies(&mut args, cookies);
         for arg in phase {
             args.push((*arg).to_string());
         }
@@ -2422,18 +2754,15 @@ async fn try_local_gallery_download(
         args
     };
 
-    let mut cookie_attempts: Vec<Option<String>> = vec![None];
-    cookie_attempts.extend(chrome_cookie_sources().into_iter().map(Some));
-    cookie_attempts.push(Some("safari".to_string()));
-    cookie_attempts.push(Some("firefox".to_string()));
+    let cookie_attempts = configured_cookie_attempts(settings, false)?;
 
     // Phase 1: enumerate with `-j`; try cookie sources until items are found.
     let mut items_total: usize = 0;
-    let mut chosen_cookie: Option<String> = None;
+    let mut chosen_cookie = EngineCookies::None;
     let mut enum_error = "gallery-dl found no items at this URL".to_string();
 
     for cookie in &cookie_attempts {
-        let args = build_args(cookie.as_deref(), &["-j"]);
+        let args = build_args(cookie, &["-j"]);
         let mut cmd = TokioCommand::new(&python_bin);
         cmd.env_remove("PYTHONHOME")
             .env_remove("PYTHONPATH")
@@ -2514,7 +2843,7 @@ async fn try_local_gallery_download(
     }
 
     let phase_args: Vec<&str> = vec!["-d", &folder_str];
-    let args = build_args(chosen_cookie.as_deref(), &phase_args);
+    let args = build_args(&chosen_cookie, &phase_args);
     let mut cmd = TokioCommand::new(&python_bin);
     cmd.env_remove("PYTHONHOME")
         .env_remove("PYTHONPATH")
@@ -2761,16 +3090,77 @@ fn process_queue(state: Arc<Mutex<AppState>>, app_handle: tauri::AppHandle) {
     process_queue(state, app_handle);
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProxyPromptEvent {
+    url: String,
+}
+
+/// If the configured proxy is a closed loopback port, wait until the user
+/// turns it off or explicitly keeps it. Cancelled tasks leave the queue.
+async fn ensure_proxy_choice(
+    id: String,
+    state: &Arc<Mutex<AppState>>,
+    app_handle: &tauri::AppHandle,
+) -> Result<Settings, ()> {
+    loop {
+        let settings = {
+            let state_lock = state.lock().unwrap_or_else(|error| error.into_inner());
+            let status = state_lock.tasks.get(&id).map(|task| task.status.clone());
+            if status.as_deref() == Some("cancelled") || status.is_none() {
+                return Err(());
+            }
+            state_lock.settings.clone()
+        };
+        if !proxy_needs_prompt(&settings) {
+            return Ok(settings);
+        }
+
+        {
+            let mut state_lock = state.lock().unwrap_or_else(|error| error.into_inner());
+            if let Some(task) = state_lock.tasks.get_mut(&id) {
+                task.speed = "Waiting for proxy".to_string();
+                let _ = app_handle.emit("task-updated", task.clone());
+            }
+        }
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel::<()>();
+        {
+            let mut state_lock = state.lock().unwrap_or_else(|error| error.into_inner());
+            state_lock.proxy_waiters.push(tx);
+            state_lock.cancellations.insert(id.clone(), cancel_tx);
+        }
+        let _ = app_handle.emit(
+            "proxy-unreachable",
+            ProxyPromptEvent {
+                url: settings.proxy_url.clone(),
+            },
+        );
+
+        tokio::select! {
+            _ = &mut cancel_rx => return Err(()),
+            answer = rx => {
+                {
+                    let mut state_lock = state.lock().unwrap_or_else(|error| error.into_inner());
+                    state_lock.cancellations.remove(&id);
+                }
+                if answer.is_err() {
+                    return Err(());
+                }
+            }
+        }
+    }
+}
+
 async fn run_download_task(id: String, state: Arc<Mutex<AppState>>, app_handle: tauri::AppHandle) {
-    let (url_to_download, settings) = {
+    let url_to_download = {
         let state_lock = state.lock().unwrap_or_else(|error| error.into_inner());
-        let url = state_lock
+        state_lock
             .tasks
             .get(&id)
             .map(|task| task.url.clone())
-            .unwrap_or_default();
-        let settings = state_lock.settings.clone();
-        (url, settings)
+            .unwrap_or_default()
     };
 
     if url_to_download.is_empty() {
@@ -2784,6 +3174,13 @@ async fn run_download_task(id: String, state: Arc<Mutex<AppState>>, app_handle: 
         );
         return;
     }
+
+    // A closed local proxy (the default Clash port, with nothing listening)
+    // would fail every request. Ask once, and let the user turn it off.
+    let settings = match ensure_proxy_choice(id.clone(), &state, &app_handle).await {
+        Ok(settings) => settings,
+        Err(()) => return,
+    };
 
     let captured_descriptor = {
         state
@@ -2897,8 +3294,16 @@ async fn run_download_task(id: String, state: Arc<Mutex<AppState>>, app_handle: 
         };
 
         // Playlists / collections / multi-part videos: ask which episodes to
-        // keep instead of silently downloading only the first one.
-        if settings.playlist_prompt {
+        // keep instead of silently downloading only the first one. Episodes
+        // the picker already created carry playlist_index and skip this.
+        let existing_index = {
+            let state_lock = state.lock().unwrap_or_else(|error| error.into_inner());
+            state_lock
+                .tasks
+                .get(&id)
+                .and_then(|task| task.playlist_index)
+        };
+        if should_offer_playlist(&settings, existing_index) {
             if let Some(ytdlp_path) = resolve_ytdlp_path(&app_handle) {
                 let node_path = resolve_node_path(&app_handle);
                 if let Some(probe) = probe_ytdlp_playlist(
@@ -2950,6 +3355,54 @@ async fn run_download_task(id: String, state: Arc<Mutex<AppState>>, app_handle: 
                     );
                     return;
                 }
+            }
+        }
+    }
+
+    // Episodes picked from a generic playlist (Vimeo, and any other yt-dlp
+    // extractor) already carry their index. The remote service does not
+    // understand `--playlist-items`, so those tasks stay on local yt-dlp.
+    let generic_episode = {
+        let state_lock = state.lock().unwrap_or_else(|error| error.into_inner());
+        state_lock
+            .tasks
+            .get(&id)
+            .and_then(|task| task.playlist_index)
+            .is_some()
+    };
+    if generic_episode && !is_ytdlp_probe_blocked(&url_to_download) {
+        match try_local_ytdlp_download(
+            id.clone(),
+            &url_to_download,
+            &settings,
+            &state,
+            &app_handle,
+            None,
+            None,
+        )
+        .await
+        {
+            Ok(true) => {
+                process_queue(state, app_handle);
+                return;
+            }
+            Ok(false) => {
+                update_task_failed(
+                    id,
+                    "Local yt-dlp could not download this playlist episode".to_string(),
+                    &state,
+                    &app_handle,
+                );
+                return;
+            }
+            Err(error) => {
+                update_task_failed(
+                    id,
+                    format!("Local yt-dlp download failed: {error}"),
+                    &state,
+                    &app_handle,
+                );
+                return;
             }
         }
     }
@@ -3089,6 +3542,33 @@ async fn run_download_task(id: String, state: Arc<Mutex<AppState>>, app_handle: 
                     None
                 };
                 let node_path = resolve_node_path(&app_handle);
+                // Same episode picker YouTube/Bilibili/Dailymotion already use.
+                // `--no-playlist` on the single-video probe would otherwise keep
+                // only the first item of a Vimeo showcase (or any other list).
+                let existing_index = {
+                    let state_lock = state.lock().unwrap_or_else(|error| error.into_inner());
+                    state_lock
+                        .tasks
+                        .get(&id)
+                        .and_then(|task| task.playlist_index)
+                };
+                if should_offer_playlist(&settings, existing_index) {
+                    if let Some(playlist_probe) = probe_ytdlp_playlist(
+                        &ytdlp_path,
+                        node_path.as_deref(),
+                        &url_to_download,
+                        proxy,
+                    )
+                    .await
+                    {
+                        println!(
+                            "Generic yt-dlp: '{}' expands to {} episodes; asking which to keep",
+                            playlist_probe.title, playlist_probe.count
+                        );
+                        resolve_playlist_selection(id, playlist_probe, &state, &app_handle).await;
+                        return;
+                    }
+                }
                 if let Some(probe) = probe_ytdlp_url(
                     &ytdlp_path,
                     node_path.as_deref(),
@@ -3795,10 +4275,30 @@ fn get_settings(state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Settings {
 
 #[tauri::command]
 fn save_settings(
-    new_settings: Settings,
+    mut new_settings: Settings,
     state: tauri::State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<Settings, String> {
     let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
+    let previous = state.settings.clone();
+    new_settings.cookie_mode = match new_settings.cookie_mode.trim() {
+        "none" | "browser" | "file" => new_settings.cookie_mode.trim().to_string(),
+        _ => "auto".to_string(),
+    };
+    if new_settings.cookie_mode == "browser" {
+        if let Some(spec) = normalize_cookie_browser(&new_settings.cookie_browser) {
+            new_settings.cookie_browser = spec;
+        }
+    }
+    let url_changed =
+        normalize_proxy_url(&previous.proxy_url) != normalize_proxy_url(&new_settings.proxy_url);
+    let reenabled = !previous.proxy_enabled && new_settings.proxy_enabled;
+    if url_changed || reenabled {
+        if normalize_proxy_url(&new_settings.proxy_warning_ack)
+            != normalize_proxy_url(&new_settings.proxy_url)
+        {
+            new_settings.proxy_warning_ack.clear();
+        }
+    }
     state.settings = new_settings.clone();
 
     if let Err(e) = write_atomic(
@@ -3808,6 +4308,80 @@ fn save_settings(
         return Err(format!("Failed to save settings: {}", e));
     }
     Ok(new_settings)
+}
+
+#[tauri::command]
+fn list_cookie_profiles() -> Vec<CookieProfileOption> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default();
+    list_cookie_profile_options(&home)
+}
+
+#[tauri::command]
+fn select_cookie_file() -> Option<String> {
+    rfd::FileDialog::new()
+        .add_filter("Netscape cookies", &["txt"])
+        .pick_file()
+        .map(|path| path.to_string_lossy().into_owned())
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProxyCheck {
+    needs_prompt: bool,
+    url: String,
+}
+
+#[tauri::command]
+fn check_local_proxy(state: tauri::State<'_, Arc<Mutex<AppState>>>) -> ProxyCheck {
+    let settings = state
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .settings
+        .clone();
+    ProxyCheck {
+        needs_prompt: proxy_needs_prompt(&settings),
+        url: settings.proxy_url.clone(),
+    }
+}
+
+/// `"disable"` turns the proxy off. `"keep"` remembers this URL so a closed
+/// port is not asked about again until the address changes or the proxy is
+/// switched back on.
+#[tauri::command]
+fn resolve_proxy_prompt(
+    action: String,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<Settings, String> {
+    let disable = match action.trim() {
+        "disable" => true,
+        "keep" => false,
+        _ => return Err("Unknown proxy action".to_string()),
+    };
+    let (settings, waiters) = {
+        let mut state_lock = state.lock().unwrap_or_else(|error| error.into_inner());
+        if disable {
+            state_lock.settings.proxy_enabled = false;
+            state_lock.settings.proxy_warning_ack.clear();
+        } else {
+            state_lock.settings.proxy_warning_ack =
+                normalize_proxy_url(&state_lock.settings.proxy_url);
+        }
+        if let Err(error) = write_atomic(
+            &state_lock.settings_path,
+            &serde_json::to_string_pretty(&state_lock.settings).unwrap(),
+        ) {
+            return Err(format!("Failed to save settings: {error}"));
+        }
+        let settings = state_lock.settings.clone();
+        let waiters = std::mem::take(&mut state_lock.proxy_waiters);
+        (settings, waiters)
+    };
+    for waiter in waiters {
+        let _ = waiter.send(());
+    }
+    Ok(settings)
 }
 
 #[tauri::command]
@@ -4019,6 +4593,7 @@ fn download_url(
 #[tauri::command]
 async fn start_manual_extraction(
     url: String,
+    locale: Option<String>,
     state: tauri::State<'_, Arc<Mutex<AppState>>>,
     app_handle: tauri::AppHandle,
 ) -> Result<DownloadTask, String> {
@@ -4065,7 +4640,7 @@ async fn start_manual_extraction(
         lock.settings.clone()
     };
 
-    match uge::start_uge(&app_handle, &page_url).await {
+    match uge::start_uge(&app_handle, &page_url, locale.as_deref().unwrap_or("en")).await {
         Ok(resolved) => {
             // HLS/DASH/HDS manifests are not single files — the direct-stream
             // fetcher would just save their text. Route them to yt-dlp, which
@@ -4810,6 +5385,7 @@ pub fn run() {
                 captured_downloads: HashMap::new(),
                 playlist_decisions: HashMap::new(),
                 active_stems: HashSet::new(),
+                proxy_waiters: Vec::new(),
             }));
 
             app.manage(app_state.clone());
@@ -4882,6 +5458,10 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_settings,
             save_settings,
+            list_cookie_profiles,
+            select_cookie_file,
+            check_local_proxy,
+            resolve_proxy_prompt,
             select_directory,
             reveal_in_finder,
             open_file,
@@ -4954,6 +5534,7 @@ mod tests {
             captured_downloads: HashMap::new(),
             playlist_decisions: HashMap::new(),
             active_stems: HashSet::new(),
+            proxy_waiters: Vec::new(),
         }))
     }
 
@@ -5394,5 +5975,153 @@ mod tests {
         assert_eq!(&encrypted[131072..], &original[131072..]);
         xor_wechat_isaac64_prefix(&mut encrypted, 42);
         assert_eq!(encrypted, original);
+    }
+
+    #[test]
+    fn cookie_mode_auto_keeps_the_browser_ladder() {
+        let settings = Settings::default_with_download_dir(PathBuf::from("/tmp"));
+        let anonymous_first = super::configured_cookie_attempts(&settings, false).unwrap();
+        assert_eq!(anonymous_first.first(), Some(&super::EngineCookies::None));
+        assert!(anonymous_first.iter().any(|item| matches!(
+            item,
+            super::EngineCookies::Browser(spec) if spec == "safari"
+        )));
+        let logged_in_first = super::configured_cookie_attempts(&settings, true).unwrap();
+        assert_ne!(logged_in_first.first(), Some(&super::EngineCookies::None));
+        assert_eq!(logged_in_first.last(), Some(&super::EngineCookies::None));
+    }
+
+    #[test]
+    fn explicit_browser_and_cookie_file_do_not_walk_the_ladder() {
+        let mut settings = Settings::default_with_download_dir(PathBuf::from("/tmp"));
+        settings.cookie_mode = "browser".to_string();
+        settings.cookie_browser = "chrome:Profile 2".to_string();
+        let attempts = super::configured_cookie_attempts(&settings, true).unwrap();
+        assert_eq!(
+            attempts,
+            vec![super::EngineCookies::Browser(
+                "chrome:Profile 2".to_string()
+            )]
+        );
+
+        settings.cookie_browser = "chrome:../../etc/passwd".to_string();
+        assert!(super::configured_cookie_attempts(&settings, false).is_err());
+        assert!(super::normalize_cookie_browser("chrome").is_some());
+        assert!(super::normalize_cookie_browser("firefox:abcd.default-release").is_some());
+        assert!(super::normalize_cookie_browser("-chrome").is_none());
+        assert!(super::normalize_cookie_browser("chrome:\nDefault").is_none());
+        assert!(super::normalize_cookie_browser("not-a-browser").is_none());
+
+        settings.cookie_mode = "none".to_string();
+        assert_eq!(
+            super::configured_cookie_attempts(&settings, true).unwrap(),
+            vec![super::EngineCookies::None]
+        );
+
+        let dir = scratch_dir("cookies");
+        let good = dir.join("cookies.txt");
+        std::fs::write(
+            &good,
+            "# Netscape HTTP Cookie File\n.example.com\tTRUE\t/\tFALSE\t0\tsid\tabc\n",
+        )
+        .unwrap();
+        settings.cookie_mode = "file".to_string();
+        settings.cookie_file = good.to_string_lossy().into_owned();
+        assert_eq!(
+            super::configured_cookie_attempts(&settings, false).unwrap(),
+            vec![super::EngineCookies::File(settings.cookie_file.clone())]
+        );
+
+        let html = dir.join("page.html");
+        std::fs::write(&html, "<html>not cookies</html>").unwrap();
+        settings.cookie_file = html.to_string_lossy().into_owned();
+        assert!(super::configured_cookie_attempts(&settings, false).is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn old_settings_json_defaults_cookie_mode_to_auto() {
+        let parsed: Settings = serde_json::from_str(
+            r#"{"savePath":"/tmp","apiUrl":"http://example","downloadMode":"video","videoQuality":"720","audioFormat":"best","clipboardMonitoring":true,"maxParallelDownloads":3,"proxyEnabled":true,"proxyUrl":"http://127.0.0.1:7897"}"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.cookie_mode, "auto");
+        assert!(parsed.proxy_warning_ack.is_empty());
+        assert!(parsed.cookie_file.is_empty());
+    }
+
+    #[test]
+    fn cookie_profile_scan_reads_chrome_and_firefox_dirs() {
+        let home = scratch_dir("cookie-profiles");
+        let chrome = home.join("Library/Application Support/Google/Chrome");
+        std::fs::create_dir_all(chrome.join("Default")).unwrap();
+        std::fs::create_dir_all(chrome.join("Profile 1")).unwrap();
+        std::fs::create_dir_all(chrome.join("Guest Profile")).unwrap();
+        let firefox = home.join(".mozilla/firefox");
+        std::fs::create_dir_all(firefox.join("abcd1234.default-release")).unwrap();
+        std::fs::create_dir_all(firefox.join("Crash Reports")).unwrap();
+
+        let options = super::list_cookie_profile_options(&home);
+        let specs: Vec<&str> = options.iter().map(|option| option.spec.as_str()).collect();
+        assert!(specs.contains(&"chrome"));
+        assert!(specs.contains(&"chrome:Default"));
+        assert!(specs.contains(&"chrome:Profile 1"));
+        assert!(!specs.iter().any(|spec| spec.contains("Guest")));
+        assert!(specs.contains(&"firefox:abcd1234.default-release"));
+        assert!(!specs.iter().any(|spec| spec.contains("Crash")));
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn closed_loopback_proxy_asks_once_remote_proxy_does_not() {
+        let mut settings = Settings::default_with_download_dir(PathBuf::from("/tmp"));
+        settings.proxy_enabled = true;
+        settings.proxy_url = "http://127.0.0.1:1".to_string();
+        assert_eq!(
+            super::loopback_proxy_socket(&settings.proxy_url),
+            Some(std::net::SocketAddr::from(([127, 0, 0, 1], 1)))
+        );
+        assert_eq!(
+            super::local_proxy_is_reachable(&settings.proxy_url),
+            Some(false)
+        );
+        assert!(super::proxy_needs_prompt(&settings));
+
+        settings.proxy_warning_ack = "http://127.0.0.1:1".to_string();
+        assert!(!super::proxy_needs_prompt(&settings));
+
+        settings.proxy_warning_ack.clear();
+        settings.proxy_enabled = false;
+        assert!(!super::proxy_needs_prompt(&settings));
+
+        settings.proxy_enabled = true;
+        settings.proxy_url = "http://10.0.0.8:7897".to_string();
+        assert!(super::loopback_proxy_socket(&settings.proxy_url).is_none());
+        assert!(!super::proxy_needs_prompt(&settings));
+    }
+
+    #[test]
+    fn open_loopback_port_does_not_prompt() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut settings = Settings::default_with_download_dir(PathBuf::from("/tmp"));
+        settings.proxy_enabled = true;
+        settings.proxy_url = format!("http://127.0.0.1:{port}");
+        assert_eq!(
+            super::local_proxy_is_reachable(&settings.proxy_url),
+            Some(true)
+        );
+        assert!(!super::proxy_needs_prompt(&settings));
+        drop(listener);
+    }
+
+    #[test]
+    fn playlist_prompt_is_skipped_for_an_already_chosen_episode() {
+        let settings = Settings::default_with_download_dir(PathBuf::from("/tmp"));
+        assert!(super::should_offer_playlist(&settings, None));
+        assert!(!super::should_offer_playlist(&settings, Some(3)));
+        let mut quiet = settings.clone();
+        quiet.playlist_prompt = false;
+        assert!(!super::should_offer_playlist(&quiet, None));
     }
 }
