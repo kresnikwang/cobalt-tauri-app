@@ -72,7 +72,11 @@
     sponsorblockMode: 'remove',
     playlistPrompt: true,
     notifyOnFinish: true,
-    ytdlpAutoUpdate: true
+    ytdlpAutoUpdate: true,
+    cookieMode: 'auto',
+    cookieBrowser: 'chrome',
+    cookieFile: '',
+    proxyWarningAck: ''
   });
   // Guards against writing the placeholder defaults above back to disk if the user
   // touches a setting before the backend has answered.
@@ -92,6 +96,9 @@
 
   // Playlist picker: one pending request (task id + episode list) at a time.
   let playlistRequest = $state<any>(null);
+  let proxyPrompt = $state<{ url: string } | null>(null);
+  let proxyPromptBusy = $state(false);
+  let cookieProfiles = $state<{ browser: string; spec: string; label: string }[]>([]);
   let playlistSelection = $state<number[]>([]);
   let playlistBusy = $state(false);
   let playlistError = $state('');
@@ -197,6 +204,10 @@
           listen('playlist-choice', (event) => {
             openPlaylistRequest(event.payload as any);
           }),
+          listen('proxy-unreachable', (event) => {
+            const payload = event.payload as { url?: string };
+            if (payload?.url) proxyPrompt = { url: payload.url };
+          }),
           listen('engine-updated', () => {
             // A background engine update landed: show the new version.
             refreshEngine();
@@ -222,7 +233,16 @@
       // Load independently: proxy recovery must not delay settings or history.
       // Engine inspection is deferred until Preferences is opened.
       await Promise.all([
-        invoke<typeof settings>('get_settings').then(value => { if (disposed) return; settings = value; settingsReady = true; })
+        invoke<typeof settings>('get_settings').then(async value => {
+          if (disposed) return;
+          settings = value;
+          settingsReady = true;
+          try {
+            cookieProfiles = await invoke('list_cookie_profiles');
+            const proxy = await invoke<{ needsPrompt: boolean; url: string }>('check_local_proxy');
+            if (!disposed && proxy?.needsPrompt && proxy.url) proxyPrompt = { url: proxy.url };
+          } catch { /* profile list is optional */ }
+        })
           .catch(error => { if (!disposed) bootError = bootError || `Failed to load settings: ${error}`; }),
         invoke<any[]>('get_tasks').then(value => { if (disposed) return; tasks = value; })
           .catch(error => { if (!disposed) bootError = bootError || `Failed to load tasks: ${error}`; }),
@@ -382,7 +402,7 @@
     extracting = true;
     actionError = '';
     try {
-      await invoke('start_manual_extraction', { url: cleanUrl });
+      await invoke('start_manual_extraction', { url: cleanUrl, locale: getLocale() });
     } catch (error) {
       actionError = String(error);
     } finally {
@@ -454,6 +474,28 @@
     } catch (error) {
       actionError = String(error);
     }
+  }
+
+  async function answerProxyPrompt(action: 'disable' | 'keep') {
+    if (proxyPromptBusy) return;
+    proxyPromptBusy = true;
+    try {
+      const updated = await invoke<typeof settings>('resolve_proxy_prompt', { action });
+      settings = updated;
+      proxyPrompt = null;
+    } catch (error) {
+      actionError = String(error);
+    } finally {
+      proxyPromptBusy = false;
+    }
+  }
+
+  async function pickCookieFile() {
+    const selected = await invoke<string | null>('select_cookie_file');
+    if (!selected) return;
+    settings.cookieMode = 'file';
+    settings.cookieFile = selected;
+    await saveSettings();
   }
 
   async function saveSettings() {
@@ -1188,6 +1230,48 @@
             <span class="setting-hint">{t('settings.api.note')}</span>
           </div>
 
+          <!-- Cookies -->
+          <div class="setting-divider"></div>
+          <div class="setting-section-title">{t('settings.cookies')}</div>
+
+          <div class="setting-item">
+            <label for="cookie-mode">{t('settings.cookies')}</label>
+            <select id="cookie-mode" bind:value={settings.cookieMode} onchange={saveSettings} class="settings-select">
+              <option value="auto">{t('settings.cookies.auto')}</option>
+              <option value="none">{t('settings.cookies.none')}</option>
+              <option value="browser">{t('settings.cookies.browser')}</option>
+              <option value="file">{t('settings.cookies.file')}</option>
+            </select>
+            <span class="setting-hint">{t('settings.cookies.note')}</span>
+          </div>
+
+          {#if settings.cookieMode === 'browser'}
+            <div class="setting-item">
+              <label for="cookie-browser">{t('settings.cookies.profile')}</label>
+              <select id="cookie-browser" bind:value={settings.cookieBrowser} onchange={saveSettings} class="settings-select">
+                {#each cookieProfiles as profile (profile.spec)}
+                  <option value={profile.spec}>{profile.label}</option>
+                {/each}
+                {#if settings.cookieBrowser && !cookieProfiles.some(profile => profile.spec === settings.cookieBrowser)}
+                  <option value={settings.cookieBrowser}>{settings.cookieBrowser}</option>
+                {/if}
+              </select>
+            </div>
+          {/if}
+
+          {#if settings.cookieMode === 'file'}
+            <div class="setting-item">
+              <label for="cookie-file">{t('settings.cookies.file')}</label>
+              <div class="path-selector">
+                <input type="text" id="cookie-file" bind:value={settings.cookieFile} onchange={saveSettings} class="path-input" />
+                <button class="btn-select-dir" onclick={pickCookieFile} title={t('settings.cookies.browse')} aria-label={t('settings.cookies.browse')}>
+                  <IconFolder size={16} />
+                </button>
+              </div>
+              <span class="setting-hint">{t('settings.cookies.file_hint')}</span>
+            </div>
+          {/if}
+
           <!-- Proxy Settings -->
           <div class="setting-divider"></div>
           <div class="setting-section-title">{t('settings.proxy')}</div>
@@ -1208,6 +1292,27 @@
 
         <div class="settings-footer">
           <p class="settings-app-version">{t('settings.version', { version: appVersion || '–' })}</p>
+        </div>
+      </div>
+    </div>
+  {/if}
+
+  {#if proxyPrompt}
+    <div class="settings-backdrop" transition:fade={{ duration: 160 }}>
+      <div
+        class="settings-panel glass playlist-panel"
+        role="dialog"
+        aria-modal="true"
+        aria-label={t('proxy.prompt.title')}
+        tabindex="-1"
+      >
+        <div class="settings-header">
+          <h3>{t('proxy.prompt.title')}</h3>
+        </div>
+        <p class="setting-hint proxy-prompt-body">{t('proxy.prompt.body', { url: proxyPrompt.url })}</p>
+        <div class="playlist-actions">
+          <button class="toast-btn secondary" onclick={() => answerProxyPrompt('keep')} disabled={proxyPromptBusy}>{t('proxy.prompt.keep')}</button>
+          <button class="toast-btn primary" onclick={() => answerProxyPrompt('disable')} disabled={proxyPromptBusy}>{t('proxy.prompt.disable')}</button>
         </div>
       </div>
     </div>
@@ -2446,6 +2551,11 @@
     font-family: 'SF Mono', 'Menlo', 'Monaco', monospace;
     font-size: 11px;
     color: var(--text-muted);
+  }
+
+  .proxy-prompt-body {
+    margin: 0 0 8px;
+    line-height: 1.45;
   }
 
   .playlist-actions {
