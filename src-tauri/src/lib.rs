@@ -319,6 +319,13 @@ fn is_local_ytdlp_url(url: &str) -> bool {
     is_youtube_url(url) || is_bilibili_url(url) || is_dailymotion_url(url)
 }
 
+/// Desktop Safari UA handed to yt-dlp's `--user-agent`, the UGE extraction
+/// webview and direct media downloads. A default Python/Tauri UA is a common
+/// bot signal that makes extractors return degraded or empty format lists, so
+/// a real browser UA measurably improves site compatibility. Kept in one place
+/// so every surface stays in sync.
+pub const DESKTOP_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.6 Safari/605.1.15";
+
 /// Sites where a blind `yt-dlp --dump-json` probe is unsafe or pointless:
 /// login-walled apps, live-only pages, or hosts we already handle elsewhere
 /// (sniffer / dedicated extractors / remote service first).
@@ -466,6 +473,12 @@ async fn probe_ytdlp_url(
         .arg(url)
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    // A real browser UA helps generic hosts serve their metadata. Left off for
+    // YouTube, whose extractor pairs a specific client UA internally —
+    // overriding it here can collapse stream quality.
+    if !is_youtube_url(url) {
+        cmd.arg("--user-agent").arg(DESKTOP_UA);
+    }
     if let Some(node) = node_path {
         cmd.arg("--js-runtimes")
             .arg(format!("node:{}", node.to_string_lossy()));
@@ -487,10 +500,28 @@ async fn probe_ytdlp_url(
     if json.get("entries").is_some() {
         return None;
     }
+    // A direct media file / manifest URL (e.g. an .m3u8 picked out of a page)
+    // resolves through the `generic` extractor — yt-dlp still downloads it
+    // fine, so accept that here. Page URLs handled by `generic` are still
+    // rejected below because they carry no playable formats.
     let extractor = json
         .get("extractor")
         .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty() && *s != "generic")?;
+        .filter(|s| !s.is_empty())?;
+    if extractor == "generic" {
+        let has_formats = json
+            .get("formats")
+            .and_then(|v| v.as_array())
+            .map(|formats| !formats.is_empty())
+            .unwrap_or(false);
+        let direct_url = json.get("url").and_then(|v| v.as_str()).unwrap_or("");
+        // Manifest playlists (HLS/DASH) and direct files both work; a bare
+        // page scraped by `generic` has neither.
+        let is_manifest = uge::is_manifest_url(url);
+        if !(has_formats || is_manifest || uge::extension_is_direct_media(direct_url)) {
+            return None;
+        }
+    }
     let title = json
         .get("title")
         .and_then(|v| v.as_str())
@@ -529,6 +560,12 @@ async fn probe_ytdlp_playlist(
         .arg(url)
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    // A real browser UA helps Bilibili/Dailymotion and generic hosts serve
+    // their metadata. Left off for YouTube, whose extractor pairs a specific
+    // client UA internally — overriding it here can collapse stream quality.
+    if !is_youtube_url(url) {
+        cmd.arg("--user-agent").arg(DESKTOP_UA);
+    }
     if let Some(node) = node_path {
         cmd.arg("--js-runtimes")
             .arg(format!("node:{}", node.to_string_lossy()));
@@ -1665,6 +1702,12 @@ async fn try_local_ytdlp_download(
             // Use yt-dlp defaults (android_vr etc.) so adaptive 720p–4K streams are available.
             // Forcing mweb/web without PO tokens often collapses to progressive ~360p only.
             cmd.arg("--remote-components").arg("ejs:github");
+        } else {
+            // Bilibili / Dailymotion / generic extractors: a real browser UA is
+            // the single biggest lever for avoiding degraded format lists or
+            // bot-wall errors. YouTube is excluded above because its extractor
+            // manages the client UA itself.
+            cmd.arg("--user-agent").arg(DESKTOP_UA);
         }
 
         if settings.download_mode == "video" {
@@ -2620,7 +2663,7 @@ async fn run_download_task(id: String, state: Arc<Mutex<AppState>>, app_handle: 
                 ("Origin".into(), "https://www.xinpianchang.com".into()),
                 ("Range".into(), "bytes=0-".into()),
                 ("Accept".into(), "video/webm,video/ogg,video/*;q=0.9,*/*;q=0.8".into()),
-                ("User-Agent".into(), "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.6 Safari/605.1.15".into()),
+                ("User-Agent".into(), DESKTOP_UA.into()),
             ]),
             filename: resolved.filename,
             expected_bytes: resolved.expected_bytes,
@@ -3819,14 +3862,63 @@ async fn start_manual_extraction(
 
     match uge::start_uge(&app_handle, &page_url).await {
         Ok(resolved) => {
+            // HLS/DASH manifests are not single files — the direct-stream
+            // fetcher would just save their text. Route them to yt-dlp,
+            // which demuxes to a playable container.
+            if uge::is_manifest_url(&resolved.url) {
+                if let Some(ytdlp_path) = resolve_ytdlp_path(&app_handle) {
+                    let node_path = resolve_node_path(&app_handle);
+                    let proxy = if settings.proxy_enabled {
+                        Some(settings.proxy_url.as_str())
+                    } else {
+                        None
+                    };
+                    if let Some(probe) =
+                        probe_ytdlp_url(&ytdlp_path, node_path.as_deref(), &resolved.url, proxy)
+                            .await
+                    {
+                        match try_local_ytdlp_download(
+                            id.clone(),
+                            &resolved.url,
+                            &settings,
+                            state.inner(),
+                            &app_handle,
+                            Some(probe),
+                        )
+                        .await
+                        {
+                            Ok(true) => {
+                                process_queue(state.inner().clone(), app_handle.clone());
+                                return Ok(task);
+                            }
+                            Ok(false) => {}
+                            Err(error) => {
+                                update_task_failed(
+                                    id,
+                                    format!("Manual extraction failed: {error}"),
+                                    state.inner(),
+                                    &app_handle,
+                                );
+                                return Err(error);
+                            }
+                        }
+                    }
+                }
+                // No usable yt-dlp (or it can't parse the manifest): surface a
+                // clear error instead of saving manifest text as ".mp4".
+                let message =
+                    "Manual extraction found a stream manifest, but local yt-dlp could not handle it"
+                        .to_string();
+                update_task_failed(id, message.clone(), state.inner(), &app_handle);
+                return Err(message);
+            }
             let descriptor = DirectMediaDescriptor {
                 url: resolved.url,
                 headers: HashMap::from([
                     ("Referer".to_string(), page_url.clone()),
                     ("Range".to_string(), "bytes=0-".to_string()),
                     ("Accept".to_string(), "*/*".to_string()),
-                    ("User-Agent".to_string(),
-                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.6 Safari/605.1.15".to_string()),
+                    ("User-Agent".to_string(), DESKTOP_UA.to_string()),
                 ]),
                 filename: resolved.filename,
                 expected_bytes: resolved.expected_bytes,
