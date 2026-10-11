@@ -13,6 +13,7 @@ use tokio::process::Command as TokioCommand;
 mod engine_update;
 mod gallerydl;
 mod playlist;
+mod proxy_suggest;
 mod sniffer;
 mod uge;
 mod xinpianchang;
@@ -104,6 +105,10 @@ pub struct Settings {
     /// port was closed. Empty means the warning has not been dismissed.
     #[serde(default)]
     pub proxy_warning_ack: String,
+    /// `current|suggested` pair already answered on the post-failure switch
+    /// prompt. A new suggestion (or a new configured URL) asks again.
+    #[serde(default)]
+    pub proxy_switch_ack: String,
 }
 
 fn default_true() -> bool {
@@ -161,6 +166,7 @@ impl Settings {
             cookie_browser: default_cookie_browser(),
             cookie_file: String::new(),
             proxy_warning_ack: String::new(),
+            proxy_switch_ack: String::new(),
         }
     }
 
@@ -1850,6 +1856,56 @@ fn proxy_needs_prompt(settings: &Settings) -> bool {
     matches!(local_proxy_is_reachable(&url), Some(false))
 }
 
+/// Post-failure prompt. The pre-download "keep it on" acknowledgement does
+/// not suppress this: choosing to continue is exactly when a dead local proxy
+/// still fails the download. Only a connection-class error qualifies.
+fn should_offer_proxy_switch(settings: &Settings, error: &str, suggested: &str) -> bool {
+    if !settings.proxy_enabled || settings.proxy_url.trim().is_empty() {
+        return false;
+    }
+    if !proxy_suggest::is_proxy_connection_failure(error) {
+        return false;
+    }
+    if local_proxy_is_reachable(&settings.proxy_url) != Some(false) {
+        return false;
+    }
+    if !suggested.is_empty() && proxy_suggest::same_proxy(&settings.proxy_url, suggested) {
+        return false;
+    }
+    settings.proxy_switch_ack != proxy_suggest::proxy_switch_ack_key(&settings.proxy_url, suggested)
+}
+
+fn apply_proxy_switch(
+    settings: &mut Settings,
+    action: &str,
+    suggested: &str,
+) -> Result<(), String> {
+    match action.trim() {
+        "disable" => {
+            settings.proxy_enabled = false;
+            settings.proxy_warning_ack.clear();
+            settings.proxy_switch_ack.clear();
+        }
+        "keep" | "edit" => {
+            settings.proxy_switch_ack =
+                proxy_suggest::proxy_switch_ack_key(&settings.proxy_url, suggested);
+        }
+        "use" => {
+            let url = proxy_suggest::normalize_switch_target(suggested)
+                .ok_or_else(|| "The detected proxy address is not usable".to_string())?;
+            if proxy_suggest::same_proxy(&settings.proxy_url, &url) {
+                return Err("The detected proxy is the same as the current one".to_string());
+            }
+            settings.proxy_url = url;
+            settings.proxy_enabled = true;
+            settings.proxy_warning_ack.clear();
+            settings.proxy_switch_ack.clear();
+        }
+        _ => return Err("Unknown proxy action".to_string()),
+    }
+    Ok(())
+}
+
 /// Playlist picker runs once per collection. Episodes created by that picker
 /// already carry `playlist_index` and must download directly.
 fn should_offer_playlist(settings: &Settings, playlist_index: Option<u32>) -> bool {
@@ -3096,6 +3152,14 @@ struct ProxyPromptEvent {
     url: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProxySwitchEvent {
+    current: String,
+    suggested: String,
+    source: String,
+}
+
 /// If the configured proxy is a closed loopback port, wait until the user
 /// turns it off or explicitly keeps it. Cancelled tasks leave the queue.
 async fn ensure_proxy_choice(
@@ -4258,10 +4322,58 @@ fn update_task_failed(
             let state_lock = state.lock().unwrap_or_else(|error| error.into_inner());
             save_tasks(&state_lock.tasks, &state_lock.tasks_path);
         }
+        if settings.proxy_enabled {
+            if let Some(error) = task.error.clone() {
+                schedule_proxy_switch_prompt(settings.clone(), error, app_handle.clone());
+            }
+        }
         notify_task_finished(&app_handle, &settings, &task);
     }
 
     process_queue(state.clone(), app_handle.clone());
+}
+
+/// Look for a system / env / common-port proxy without blocking the download
+/// task. The prompt is a suggestion after the failure, not a queue gate.
+fn schedule_proxy_switch_prompt(settings: Settings, error: String, app_handle: tauri::AppHandle) {
+    if !proxy_suggest::is_proxy_connection_failure(&error) {
+        return;
+    }
+    // Remote proxies and a live local port are not this prompt. Checking here
+    // avoids probing other ports after an ordinary site failure.
+    if settings.proxy_url.trim().is_empty()
+        || local_proxy_is_reachable(&settings.proxy_url) != Some(false)
+    {
+        return;
+    }
+    tauri::async_runtime::spawn(async move {
+        let event = match tokio::task::spawn_blocking(move || {
+            let found = proxy_suggest::discover_live_alternate(&settings.proxy_url);
+            let suggested = found
+                .as_ref()
+                .map(|item| item.url.clone())
+                .unwrap_or_default();
+            let source = found
+                .map(|item| item.source.to_string())
+                .unwrap_or_default();
+            if !should_offer_proxy_switch(&settings, &error, &suggested) {
+                return None;
+            }
+            Some(ProxySwitchEvent {
+                current: settings.proxy_url.clone(),
+                suggested,
+                source,
+            })
+        })
+        .await
+        {
+            Ok(event) => event,
+            Err(_) => None,
+        };
+        if let Some(event) = event {
+            let _ = app_handle.emit("proxy-switch", event);
+        }
+    });
 }
 
 // -----------------------------------------------------------
@@ -4298,6 +4410,7 @@ fn save_settings(
         {
             new_settings.proxy_warning_ack.clear();
         }
+        new_settings.proxy_switch_ack.clear();
     }
     state.settings = new_settings.clone();
 
@@ -4368,6 +4481,34 @@ fn resolve_proxy_prompt(
             state_lock.settings.proxy_warning_ack =
                 normalize_proxy_url(&state_lock.settings.proxy_url);
         }
+        if let Err(error) = write_atomic(
+            &state_lock.settings_path,
+            &serde_json::to_string_pretty(&state_lock.settings).unwrap(),
+        ) {
+            return Err(format!("Failed to save settings: {error}"));
+        }
+        let settings = state_lock.settings.clone();
+        let waiters = std::mem::take(&mut state_lock.proxy_waiters);
+        (settings, waiters)
+    };
+    for waiter in waiters {
+        let _ = waiter.send(());
+    }
+    Ok(settings)
+}
+
+/// `"use"` stores `suggested` as the proxy. `"disable"` turns it off.
+/// `"keep"` and `"edit"` remember this current/suggested pair so the same
+/// failure does not ask again. Editing the address itself happens in the UI.
+#[tauri::command]
+fn resolve_proxy_switch(
+    action: String,
+    suggested: String,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<Settings, String> {
+    let (settings, waiters) = {
+        let mut state_lock = state.lock().unwrap_or_else(|error| error.into_inner());
+        apply_proxy_switch(&mut state_lock.settings, &action, &suggested)?;
         if let Err(error) = write_atomic(
             &state_lock.settings_path,
             &serde_json::to_string_pretty(&state_lock.settings).unwrap(),
@@ -5462,6 +5603,7 @@ pub fn run() {
             select_cookie_file,
             check_local_proxy,
             resolve_proxy_prompt,
+            resolve_proxy_switch,
             select_directory,
             reveal_in_finder,
             open_file,
@@ -6047,6 +6189,7 @@ mod tests {
         .unwrap();
         assert_eq!(parsed.cookie_mode, "auto");
         assert!(parsed.proxy_warning_ack.is_empty());
+        assert!(parsed.proxy_switch_ack.is_empty());
         assert!(parsed.cookie_file.is_empty());
     }
 
@@ -6123,5 +6266,121 @@ mod tests {
         let mut quiet = settings.clone();
         quiet.playlist_prompt = false;
         assert!(!super::should_offer_playlist(&quiet, None));
+    }
+
+    fn closed_proxy_settings() -> Settings {
+        let mut settings = Settings::default_with_download_dir(PathBuf::from("/tmp"));
+        settings.proxy_enabled = true;
+        settings.proxy_url = "http://127.0.0.1:1".to_string();
+        settings
+    }
+
+    #[test]
+    fn proxy_switch_follows_a_connection_failure_on_a_closed_local_proxy() {
+        let settings = closed_proxy_settings();
+        let refused = "ERROR: Unable to download webpage: [Errno 61] Connection refused";
+        assert!(super::should_offer_proxy_switch(
+            &settings,
+            refused,
+            "http://127.0.0.1:7890"
+        ));
+        // Continuing past the first prompt does not hide the switch prompt.
+        let mut kept = settings.clone();
+        kept.proxy_warning_ack = "http://127.0.0.1:1".to_string();
+        assert!(super::should_offer_proxy_switch(
+            &kept,
+            refused,
+            "http://127.0.0.1:7890"
+        ));
+
+        kept.proxy_switch_ack =
+            super::proxy_suggest::proxy_switch_ack_key(&kept.proxy_url, "http://127.0.0.1:7890");
+        assert!(!super::should_offer_proxy_switch(
+            &kept,
+            refused,
+            "http://127.0.0.1:7890"
+        ));
+        assert!(super::should_offer_proxy_switch(
+            &kept,
+            refused,
+            "http://127.0.0.1:6152"
+        ));
+        assert!(super::should_offer_proxy_switch(&kept, refused, ""));
+    }
+
+    #[test]
+    fn proxy_switch_ignores_non_connection_failures_and_a_live_proxy() {
+        let settings = closed_proxy_settings();
+        assert!(!super::should_offer_proxy_switch(
+            &settings,
+            "YouTube requires local browser cookies. Please log in to YouTube in Chrome/Safari and try again.",
+            "http://127.0.0.1:7890"
+        ));
+        assert!(!super::should_offer_proxy_switch(
+            &settings,
+            "Disk write error: No space left on device",
+            ""
+        ));
+        assert!(!super::should_offer_proxy_switch(
+            &settings,
+            "Bilibili rejected this request with HTTP 412.",
+            "http://127.0.0.1:7890"
+        ));
+
+        let mut disabled = settings.clone();
+        disabled.proxy_enabled = false;
+        assert!(!super::should_offer_proxy_switch(
+            &disabled,
+            "Connection refused",
+            "http://127.0.0.1:7890"
+        ));
+
+        let mut remote = settings.clone();
+        remote.proxy_url = "http://10.0.0.8:7897".to_string();
+        assert!(!super::should_offer_proxy_switch(
+            &remote,
+            "Connection refused",
+            "http://127.0.0.1:7890"
+        ));
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut live = settings.clone();
+        live.proxy_url = format!("http://127.0.0.1:{port}");
+        assert!(!super::should_offer_proxy_switch(
+            &live,
+            "Connection refused",
+            "http://127.0.0.1:7890"
+        ));
+    }
+
+    #[test]
+    fn proxy_switch_actions_use_disable_or_remember_the_pair() {
+        let mut settings = closed_proxy_settings();
+        super::apply_proxy_switch(&mut settings, "use", "http://127.0.0.1:7890").unwrap();
+        assert!(settings.proxy_enabled);
+        assert_eq!(settings.proxy_url, "http://127.0.0.1:7890");
+        assert!(settings.proxy_warning_ack.is_empty());
+        assert!(settings.proxy_switch_ack.is_empty());
+
+        settings.proxy_url = "http://127.0.0.1:1".to_string();
+        super::apply_proxy_switch(&mut settings, "disable", "").unwrap();
+        assert!(!settings.proxy_enabled);
+
+        settings.proxy_enabled = true;
+        super::apply_proxy_switch(&mut settings, "keep", "socks5://127.0.0.1:1080").unwrap();
+        assert_eq!(
+            settings.proxy_switch_ack,
+            "http://127.0.0.1:1|socks5://127.0.0.1:1080"
+        );
+        assert!(settings.proxy_enabled);
+
+        super::apply_proxy_switch(&mut settings, "edit", "").unwrap();
+        assert_eq!(settings.proxy_switch_ack, "http://127.0.0.1:1|");
+        assert_eq!(settings.proxy_url, "http://127.0.0.1:1");
+
+        assert!(super::apply_proxy_switch(&mut settings, "use", "javascript:alert(1)").is_err());
+        assert!(super::apply_proxy_switch(&mut settings, "dance", "").is_err());
+        assert!(super::apply_proxy_switch(&mut settings, "use", "http://127.0.0.1:1").is_err());
     }
 }
