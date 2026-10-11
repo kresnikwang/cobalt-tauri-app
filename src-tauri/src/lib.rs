@@ -329,14 +329,20 @@ pub const DESKTOP_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Ap
 /// Sites where a blind `yt-dlp --dump-json` probe is unsafe or pointless:
 /// login-walled apps, live-only pages, or hosts we already handle elsewhere
 /// (sniffer / dedicated extractors / remote service first).
+/// `www.example.com` and `cdn.example.com` both belong to `example.com`.
+/// Comparison is case-insensitive; `www.` is stripped before the check so an
+/// exact host still matches when it is written with a www prefix.
+fn host_is_or_under(host: &str, name: &str) -> bool {
+    let host = host.to_ascii_lowercase();
+    let host = host.strip_prefix("www.").unwrap_or(&host);
+    host == name || host.ends_with(&format!(".{name}"))
+}
+
 fn is_ytdlp_probe_blocked(url: &str) -> bool {
     let Ok(parsed) = reqwest::Url::parse(url) else {
         return true;
     };
-    let Some(host) = parsed
-        .host_str()
-        .map(|h| h.trim_start_matches("www.").to_ascii_lowercase())
-    else {
+    let Some(host) = parsed.host_str() else {
         return true;
     };
     // Already covered by dedicated local paths.
@@ -353,40 +359,49 @@ fn is_ytdlp_probe_blocked(url: &str) -> bool {
     if gallerydl::classify(url).owned() {
         return true;
     }
-    const BLOCKED_EXACT: &[&str] = &[
+    // Login-walled or app-only hosts, plus the mobile/share domains that
+    // bypass a check written only against the canonical site. Probing these
+    // spends the yt-dlp timeout and still cannot see the media.
+    const BLOCKED_HOSTS: &[&str] = &[
         // WeChat ecosystem: needs the MITM sniffer, yt-dlp can't see it.
         "channels.weixin.qq.com",
         "mp.weixin.qq.com",
-    ];
-    const BLOCKED_SUFFIX: &[&str] = &[
-        // Login-walled / app-only feeds.
+        // Login-walled / app-only feeds and their share-link hosts.
         "douyin.com",
+        "douyin.cn",
         "iesdouyin.com",
         "douyinvod.com",
         "byteoversea.com",
         "tiktok.com",
+        "tiktokv.com",
+        "musical.ly",
         "kuaishou.com",
+        "kuaishou.cn",
+        "gifshow.com",
+        "chenzhongtech.com",
         "kwai.com",
         "xiaohongshu.com",
         "xhslink.com",
         "weibo.com",
-        "m.weibo.com",
+        "weibo.cn",
         // Instagram/X/Pinterest go through the remote service first (better
         // picker UX for carousels / multi-media posts).
         "instagram.com",
         "ddinstagram.com",
+        "instagr.am",
         "twitter.com",
         "x.com",
         "vxtwitter.com",
         "fixvx.com",
         "pinterest.com",
+        "pin.it",
         "facebook.com",
+        "fb.com",
         "fb.watch",
     ];
-    BLOCKED_EXACT.iter().any(|b| host == *b)
-        || BLOCKED_SUFFIX
-            .iter()
-            .any(|s| host == *s || host.ends_with(&format!(".{s}")))
+    BLOCKED_HOSTS
+        .iter()
+        .any(|name| host_is_or_under(host, name))
 }
 
 /// Friendly display name for a probed extractor, e.g. "Vimeo" for "vimeo".
@@ -454,6 +469,191 @@ struct PlaylistChoiceEvent {
     entries: Vec<playlist::PlaylistEntry>,
 }
 
+/// `--dump-json` of a real playlist has a non-empty `entries` array (or
+/// `_type: playlist`). A single video sometimes carries `"entries": null`;
+/// that must not be treated as "unsupported".
+fn ytdlp_dump_is_playlist(json: &serde_json::Value) -> bool {
+    if json.get("_type").and_then(|value| value.as_str()) == Some("playlist") {
+        return true;
+    }
+    json.get("entries")
+        .and_then(|value| value.as_array())
+        .is_some_and(|entries| !entries.is_empty())
+}
+
+fn ytdlp_format_is_playable(fmt: &serde_json::Value) -> bool {
+    let format_id = fmt
+        .get("format_id")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let format_note = fmt
+        .get("format_note")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if format_id.contains("storyboard") || format_note.contains("storyboard") {
+        return false;
+    }
+    let ext = fmt
+        .get("ext")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    if uge::is_non_media_extension(ext) {
+        return false;
+    }
+    if uge::ext_is_playable_media(ext) {
+        return true;
+    }
+    let protocol = fmt
+        .get("protocol")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    const MEDIA_PROTOCOLS: &[&str] = &[
+        "m3u8",
+        "m3u8_native",
+        "http_dash_segments",
+        "f4m",
+        "ism",
+        "rtmp",
+        "rtsp",
+        "mms",
+    ];
+    if MEDIA_PROTOCOLS
+        .iter()
+        .any(|name| protocol == *name || protocol.starts_with(&format!("{name}_")))
+    {
+        return true;
+    }
+    let manifest_url = fmt
+        .get("manifest_url")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    if uge::is_manifest_url(manifest_url) {
+        return true;
+    }
+    let vcodec = fmt
+        .get("vcodec")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let acodec = fmt
+        .get("acodec")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let has_video = !vcodec.is_empty() && vcodec != "none";
+    let has_audio = !acodec.is_empty() && acodec != "none";
+    let media_url = fmt
+        .get("url")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    if has_video || has_audio {
+        // A generic scrape sometimes labels a thumbnail with a codec.
+        if url_path_extension(media_url).is_some_and(|ext| uge::is_non_media_extension(&ext)) {
+            return false;
+        }
+        return true;
+    }
+    uge::extension_is_direct_media(media_url) || uge::is_manifest_url(media_url)
+}
+
+fn url_path_extension(url: &str) -> Option<String> {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    let path = path.trim_end_matches('/');
+    let last = path.rsplit('/').next()?;
+    let ext = last.rsplit('.').next()?;
+    if ext.len() == last.len() {
+        return None;
+    }
+    Some(ext.to_ascii_lowercase())
+}
+
+/// The `generic` extractor fires for almost any URL. Accept it only when the
+/// dump describes a real stream: a direct file, a manifest, or at least one
+/// playable format. Image-only scrapes and empty page dumps are not downloads.
+fn generic_extraction_is_playable(requested_url: &str, json: &serde_json::Value) -> bool {
+    if uge::extension_is_direct_media(requested_url) || uge::is_manifest_url(requested_url) {
+        return true;
+    }
+    let top_url = json
+        .get("url")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    if uge::extension_is_direct_media(top_url) || uge::is_manifest_url(top_url) {
+        return true;
+    }
+    json.get("formats")
+        .and_then(|value| value.as_array())
+        .is_some_and(|formats| formats.iter().any(ytdlp_format_is_playable))
+}
+
+/// Browser UA for every extractor except YouTube (its client UA is part of
+/// the extractor), plus an optional Referer/Origin for a stream that was
+/// picked out of a page (UGE). Sending the media URL as its own referer is
+/// skipped — that header has to be the page the browser was on.
+fn apply_ytdlp_client_hints(cmd: &mut TokioCommand, url: &str, referer: Option<&str>) {
+    if !is_youtube_url(url) {
+        cmd.arg("--user-agent").arg(DESKTOP_UA);
+    }
+    let Some(referer) = referer.map(str::trim).filter(|value| {
+        (value.starts_with("http://") || value.starts_with("https://")) && *value != url
+    }) else {
+        return;
+    };
+    cmd.arg("--referer").arg(referer);
+    if let Some(origin) = request_origin(referer) {
+        cmd.arg("--add-header").arg(format!("Origin: {origin}"));
+    }
+}
+
+fn request_origin(url: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    let scheme = parsed.scheme();
+    if scheme != "http" && scheme != "https" {
+        return None;
+    }
+    let host = parsed.host_str()?;
+    match parsed.port() {
+        Some(port) => Some(format!("{scheme}://{host}:{port}")),
+        None => Some(format!("{scheme}://{host}")),
+    }
+}
+
+/// HTML / JSON / script responses are pages, not the movie. An image response
+/// saved under a video filename is the same class of mistake.
+fn direct_body_rejection(content_type: &str, filename: &str) -> Option<&'static str> {
+    let mime = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if mime.is_empty() {
+        return None;
+    }
+    if mime.contains("mpegurl") || mime.contains("dash+xml") || mime.contains("sstr+xml") {
+        return None;
+    }
+    if matches!(
+        mime.as_str(),
+        "text/html"
+            | "application/xhtml+xml"
+            | "application/json"
+            | "text/json"
+            | "application/javascript"
+            | "text/javascript"
+    ) {
+        return Some("The link returned a page instead of a media file");
+    }
+    if mime.starts_with("image/") {
+        let ext = filename.rsplit('.').next().unwrap_or("");
+        if uge::ext_is_playable_media(ext) {
+            return Some("The link returned an image instead of a media file");
+        }
+    }
+    None
+}
+
 /// Ask local yt-dlp whether it can handle this URL (`--dump-json`,
 /// no download). Returns the extractor + title on success, `None` when
 /// the site is unsupported. Never fails the task by itself.
@@ -462,6 +662,7 @@ async fn probe_ytdlp_url(
     node_path: Option<&std::path::Path>,
     url: &str,
     proxy_url: Option<&str>,
+    referer: Option<&str>,
 ) -> Option<YtdlpProbe> {
     let mut cmd = TokioCommand::new(ytdlp_path);
     cmd.arg("--no-playlist")
@@ -473,12 +674,7 @@ async fn probe_ytdlp_url(
         .arg(url)
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    // A real browser UA helps generic hosts serve their metadata. Left off for
-    // YouTube, whose extractor pairs a specific client UA internally —
-    // overriding it here can collapse stream quality.
-    if !is_youtube_url(url) {
-        cmd.arg("--user-agent").arg(DESKTOP_UA);
-    }
+    apply_ytdlp_client_hints(&mut cmd, url, referer);
     if let Some(node) = node_path {
         cmd.arg("--js-runtimes")
             .arg(format!("node:{}", node.to_string_lossy()));
@@ -497,30 +693,20 @@ async fn probe_ytdlp_url(
     }
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
     // Playlists expose `entries`; single videos expose `id` + `title`.
-    if json.get("entries").is_some() {
+    // `"entries": null` shows up on ordinary videos and is not a playlist.
+    if ytdlp_dump_is_playlist(&json) {
         return None;
     }
     // A direct media file / manifest URL (e.g. an .m3u8 picked out of a page)
     // resolves through the `generic` extractor — yt-dlp still downloads it
-    // fine, so accept that here. Page URLs handled by `generic` are still
-    // rejected below because they carry no playable formats.
+    // fine, so accept that here. A page `generic` merely scraped into images
+    // or an empty format list is still rejected.
     let extractor = json
         .get("extractor")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())?;
-    if extractor == "generic" {
-        let has_formats = json
-            .get("formats")
-            .and_then(|v| v.as_array())
-            .map(|formats| !formats.is_empty())
-            .unwrap_or(false);
-        let direct_url = json.get("url").and_then(|v| v.as_str()).unwrap_or("");
-        // Manifest playlists (HLS/DASH) and direct files both work; a bare
-        // page scraped by `generic` has neither.
-        let is_manifest = uge::is_manifest_url(url);
-        if !(has_formats || is_manifest || uge::extension_is_direct_media(direct_url)) {
-            return None;
-        }
+    if extractor == "generic" && !generic_extraction_is_playable(url, &json) {
+        return None;
     }
     let title = json
         .get("title")
@@ -563,9 +749,7 @@ async fn probe_ytdlp_playlist(
     // A real browser UA helps Bilibili/Dailymotion and generic hosts serve
     // their metadata. Left off for YouTube, whose extractor pairs a specific
     // client UA internally — overriding it here can collapse stream quality.
-    if !is_youtube_url(url) {
-        cmd.arg("--user-agent").arg(DESKTOP_UA);
-    }
+    apply_ytdlp_client_hints(&mut cmd, url, None);
     if let Some(node) = node_path {
         cmd.arg("--js-runtimes")
             .arg(format!("node:{}", node.to_string_lossy()));
@@ -1513,6 +1697,7 @@ async fn try_local_ytdlp_download(
     state: &Arc<Mutex<AppState>>,
     app_handle: &tauri::AppHandle,
     generic_probe: Option<YtdlpProbe>,
+    referer: Option<&str>,
 ) -> Result<bool, String> {
     if !is_local_ytdlp_url(url) && generic_probe.is_none() {
         return Ok(false);
@@ -1706,8 +1891,9 @@ async fn try_local_ytdlp_download(
             // Bilibili / Dailymotion / generic extractors: a real browser UA is
             // the single biggest lever for avoiding degraded format lists or
             // bot-wall errors. YouTube is excluded above because its extractor
-            // manages the client UA itself.
-            cmd.arg("--user-agent").arg(DESKTOP_UA);
+            // manages the client UA itself. UGE passes the page as Referer so
+            // CDNs that check it still serve the stream.
+            apply_ytdlp_client_hints(&mut cmd, url, referer);
         }
 
         if settings.download_mode == "video" {
@@ -2662,7 +2848,10 @@ async fn run_download_task(id: String, state: Arc<Mutex<AppState>>, app_handle: 
                 ("Referer".into(), url_to_download.clone()),
                 ("Origin".into(), "https://www.xinpianchang.com".into()),
                 ("Range".into(), "bytes=0-".into()),
-                ("Accept".into(), "video/webm,video/ogg,video/*;q=0.9,*/*;q=0.8".into()),
+                (
+                    "Accept".into(),
+                    "video/webm,video/ogg,video/*;q=0.9,*/*;q=0.8".into(),
+                ),
                 ("User-Agent".into(), DESKTOP_UA.into()),
             ]),
             filename: resolved.filename,
@@ -2736,6 +2925,7 @@ async fn run_download_task(id: String, state: Arc<Mutex<AppState>>, app_handle: 
             &settings,
             &state,
             &app_handle,
+            None,
             None,
         )
         .await
@@ -2899,9 +3089,14 @@ async fn run_download_task(id: String, state: Arc<Mutex<AppState>>, app_handle: 
                     None
                 };
                 let node_path = resolve_node_path(&app_handle);
-                if let Some(probe) =
-                    probe_ytdlp_url(&ytdlp_path, node_path.as_deref(), &url_to_download, proxy)
-                        .await
+                if let Some(probe) = probe_ytdlp_url(
+                    &ytdlp_path,
+                    node_path.as_deref(),
+                    &url_to_download,
+                    proxy,
+                    None,
+                )
+                .await
                 {
                     println!(
                         "Remote service failed ({}), local yt-dlp can handle it via extractor '{}'. Retrying locally.",
@@ -2914,6 +3109,7 @@ async fn run_download_task(id: String, state: Arc<Mutex<AppState>>, app_handle: 
                         &state,
                         &app_handle,
                         Some(probe),
+                        None,
                     )
                     .await
                     {
@@ -3254,6 +3450,15 @@ async fn download_direct_stream(
             &state,
             &app_handle,
         );
+        return;
+    }
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    if let Some(message) = direct_body_rejection(content_type, &descriptor.filename) {
+        update_task_failed(id, message.to_string(), &state, &app_handle);
         return;
     }
     let total_bytes = response
@@ -3862,10 +4067,12 @@ async fn start_manual_extraction(
 
     match uge::start_uge(&app_handle, &page_url).await {
         Ok(resolved) => {
-            // HLS/DASH manifests are not single files — the direct-stream
-            // fetcher would just save their text. Route them to yt-dlp,
-            // which demuxes to a playable container.
-            if uge::is_manifest_url(&resolved.url) {
+            // HLS/DASH/HDS manifests are not single files — the direct-stream
+            // fetcher would just save their text. Route them to yt-dlp, which
+            // demuxes to a playable container. The page URL is the Referer
+            // many CDNs require. Fragments stay on the direct downloader with
+            // their real extension; one .ts is already a playable file.
+            if resolved.media_class == uge::UgeMediaClass::Manifest {
                 if let Some(ytdlp_path) = resolve_ytdlp_path(&app_handle) {
                     let node_path = resolve_node_path(&app_handle);
                     let proxy = if settings.proxy_enabled {
@@ -3873,9 +4080,14 @@ async fn start_manual_extraction(
                     } else {
                         None
                     };
-                    if let Some(probe) =
-                        probe_ytdlp_url(&ytdlp_path, node_path.as_deref(), &resolved.url, proxy)
-                            .await
+                    if let Some(probe) = probe_ytdlp_url(
+                        &ytdlp_path,
+                        node_path.as_deref(),
+                        &resolved.url,
+                        proxy,
+                        Some(page_url.as_str()),
+                    )
+                    .await
                     {
                         match try_local_ytdlp_download(
                             id.clone(),
@@ -3884,6 +4096,7 @@ async fn start_manual_extraction(
                             state.inner(),
                             &app_handle,
                             Some(probe),
+                            Some(page_url.as_str()),
                         )
                         .await
                         {
@@ -3912,14 +4125,18 @@ async fn start_manual_extraction(
                 update_task_failed(id, message.clone(), state.inner(), &app_handle);
                 return Err(message);
             }
+            let mut headers = HashMap::from([
+                ("Referer".to_string(), page_url.clone()),
+                ("Range".to_string(), "bytes=0-".to_string()),
+                ("Accept".to_string(), "*/*".to_string()),
+                ("User-Agent".to_string(), DESKTOP_UA.to_string()),
+            ]);
+            if let Some(origin) = request_origin(&page_url) {
+                headers.insert("Origin".to_string(), origin);
+            }
             let descriptor = DirectMediaDescriptor {
                 url: resolved.url,
-                headers: HashMap::from([
-                    ("Referer".to_string(), page_url.clone()),
-                    ("Range".to_string(), "bytes=0-".to_string()),
-                    ("Accept".to_string(), "*/*".to_string()),
-                    ("User-Agent".to_string(), DESKTOP_UA.to_string()),
-                ]),
+                headers,
                 filename: resolved.filename,
                 expected_bytes: resolved.expected_bytes,
                 decode_key: None,
@@ -4717,9 +4934,10 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        api_request_url, decode_wechat_file, deep_link_target_url, extractor_display_name,
-        first_http_url, generic_video_id, is_ytdlp_probe_blocked, migrate_legacy_api_url,
-        remove_task_partial_files, sponsorblock_args, xor_wechat_isaac64_prefix, AppState,
+        api_request_url, decode_wechat_file, deep_link_target_url, direct_body_rejection,
+        extractor_display_name, first_http_url, generic_extraction_is_playable, generic_video_id,
+        is_ytdlp_probe_blocked, migrate_legacy_api_url, remove_task_partial_files, request_origin,
+        sponsorblock_args, xor_wechat_isaac64_prefix, ytdlp_dump_is_playlist, AppState,
         DownloadTask, Isaac64, Settings,
     };
     use std::collections::{HashMap, HashSet};
@@ -4979,8 +5197,130 @@ mod tests {
         assert!(!is_ytdlp_probe_blocked(
             "https://weibo.example.com/video/123"
         ));
+        // Mobile / share hosts of the same apps, including a www prefix on an
+        // exact-match host.
+        assert!(is_ytdlp_probe_blocked(
+            "https://www.channels.weixin.qq.com/pages/feed"
+        ));
+        assert!(is_ytdlp_probe_blocked("https://m.weibo.cn/status/123"));
+        assert!(is_ytdlp_probe_blocked(
+            "https://v.m.chenzhongtech.com/fw/photo/1"
+        ));
+        assert!(is_ytdlp_probe_blocked("https://www.gifshow.com/fw/photo/1"));
+        assert!(is_ytdlp_probe_blocked("https://vm.tiktok.com/ZMabcdef/"));
+        assert!(is_ytdlp_probe_blocked(
+            "https://www.musical.ly/v/1234567890"
+        ));
+        assert!(is_ytdlp_probe_blocked("https://instagr.am/p/AbC123/"));
+        assert!(is_ytdlp_probe_blocked("https://pin.it/abc123"));
+        assert!(!is_ytdlp_probe_blocked(
+            "https://chenzhongtech.example.com/video/1"
+        ));
         // Garbage input: block (probe would fail anyway).
         assert!(is_ytdlp_probe_blocked("not a url"));
+    }
+
+    #[test]
+    fn generic_extractor_accepts_real_streams_and_rejects_scrapes() {
+        let mp4 = serde_json::json!({
+            "formats": [{"url": "https://cdn.example.com/v.mp4", "ext": "mp4", "vcodec": "h264", "acodec": "aac"}]
+        });
+        assert!(generic_extraction_is_playable(
+            "https://example.com/watch/1",
+            &mp4
+        ));
+
+        let images = serde_json::json!({
+            "formats": [{"url": "https://cdn.example.com/thumb.jpg", "ext": "jpg", "vcodec": "none", "acodec": "none"}]
+        });
+        assert!(!generic_extraction_is_playable(
+            "https://example.com/watch/1",
+            &images
+        ));
+
+        let empty = serde_json::json!({"formats": [], "url": "https://example.com/watch/1"});
+        assert!(!generic_extraction_is_playable(
+            "https://example.com/watch/1",
+            &empty
+        ));
+
+        let direct = serde_json::json!({"url": "https://cdn.example.com/a.webm"});
+        assert!(generic_extraction_is_playable(
+            "https://cdn.example.com/a.webm",
+            &direct
+        ));
+
+        let manifest = serde_json::json!({"formats": []});
+        assert!(generic_extraction_is_playable(
+            "https://cdn.example.com/live/index.m3u8?token=1",
+            &manifest
+        ));
+
+        let hls = serde_json::json!({
+            "formats": [{"url": "https://cdn.example.com/live/index.m3u8", "ext": "mp4", "protocol": "m3u8_native", "vcodec": "none", "acodec": "none"}]
+        });
+        assert!(generic_extraction_is_playable(
+            "https://example.com/watch/1",
+            &hls
+        ));
+
+        let storyboard = serde_json::json!({
+            "formats": [{"format_id": "sb0", "ext": "mhtml", "format_note": "storyboard", "vcodec": "none", "acodec": "none"}]
+        });
+        assert!(!generic_extraction_is_playable(
+            "https://example.com/watch/1",
+            &storyboard
+        ));
+
+        let codec_on_jpeg = serde_json::json!({
+            "formats": [{"url": "https://cdn.example.com/poster.jpg", "ext": "unknown", "vcodec": "h264", "acodec": "none"}]
+        });
+        assert!(!generic_extraction_is_playable(
+            "https://example.com/watch/1",
+            &codec_on_jpeg
+        ));
+
+        assert!(!ytdlp_dump_is_playlist(
+            &serde_json::json!({"entries": null, "id": "1"})
+        ));
+        assert!(!ytdlp_dump_is_playlist(&serde_json::json!({"id": "1"})));
+        assert!(ytdlp_dump_is_playlist(
+            &serde_json::json!({"_type": "playlist", "entries": []})
+        ));
+        assert!(ytdlp_dump_is_playlist(
+            &serde_json::json!({"entries": [{"id": "1"}]})
+        ));
+    }
+
+    #[test]
+    fn direct_download_rejects_documents_and_keeps_media() {
+        assert_eq!(
+            direct_body_rejection("text/html; charset=utf-8", "Clip.mp4"),
+            Some("The link returned a page instead of a media file")
+        );
+        assert_eq!(
+            direct_body_rejection("application/json", "Clip.mp4"),
+            Some("The link returned a page instead of a media file")
+        );
+        assert_eq!(
+            direct_body_rejection("image/jpeg", "Clip.mp4"),
+            Some("The link returned an image instead of a media file")
+        );
+        assert_eq!(direct_body_rejection("image/jpeg", "photo.jpg"), None);
+        assert_eq!(direct_body_rejection("video/mp4", "Clip.mp4"), None);
+        assert_eq!(
+            direct_body_rejection("application/vnd.apple.mpegurl", "Live.mp4"),
+            None
+        );
+        assert_eq!(direct_body_rejection("", "Clip.mp4"), None);
+        assert_eq!(
+            request_origin("https://www.example.com/watch/1"),
+            Some("https://www.example.com".to_string())
+        );
+        assert_eq!(
+            request_origin("http://cdn.example.com:8080/a.mp4"),
+            Some("http://cdn.example.com:8080".to_string())
+        );
     }
 
     #[test]
