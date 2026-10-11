@@ -76,7 +76,8 @@
     cookieMode: 'auto',
     cookieBrowser: 'chrome',
     cookieFile: '',
-    proxyWarningAck: ''
+    proxyWarningAck: '',
+    proxySwitchAck: ''
   });
   // Guards against writing the placeholder defaults above back to disk if the user
   // touches a setting before the backend has answered.
@@ -98,6 +99,8 @@
   let playlistRequest = $state<any>(null);
   let proxyPrompt = $state<{ url: string } | null>(null);
   let proxyPromptBusy = $state(false);
+  let proxySwitch = $state<{ current: string; suggested: string; source: string } | null>(null);
+  let proxySwitchBusy = $state(false);
   let cookieProfiles = $state<{ browser: string; spec: string; label: string }[]>([]);
   let playlistSelection = $state<number[]>([]);
   let playlistBusy = $state(false);
@@ -207,6 +210,16 @@
           listen('proxy-unreachable', (event) => {
             const payload = event.payload as { url?: string };
             if (payload?.url) proxyPrompt = { url: payload.url };
+          }),
+          listen('proxy-switch', (event) => {
+            const payload = event.payload as { current?: string; suggested?: string; source?: string };
+            if (payload?.current) {
+              proxySwitch = {
+                current: payload.current,
+                suggested: payload.suggested ?? '',
+                source: payload.source ?? ''
+              };
+            }
           }),
           listen('engine-updated', () => {
             // A background engine update landed: show the new version.
@@ -473,6 +486,32 @@
       }
     } catch (error) {
       actionError = String(error);
+    }
+  }
+
+  function proxySwitchWhere(source: string): string {
+    if (source === 'system' || source === 'env' || source === 'probe') {
+      return t(`proxy.switch.where.${source}`);
+    }
+    return t('proxy.switch.where.fallback');
+  }
+
+  async function answerProxySwitch(action: 'use' | 'disable' | 'keep' | 'edit') {
+    if (proxySwitchBusy || !proxySwitch) return;
+    proxySwitchBusy = true;
+    try {
+      const updated = await invoke<typeof settings>('resolve_proxy_switch', {
+        action,
+        suggested: proxySwitch.suggested
+      });
+      settings = updated;
+      proxySwitch = null;
+      proxyPrompt = null;
+      if (action === 'edit') openSettings();
+    } catch (error) {
+      actionError = String(error);
+    } finally {
+      proxySwitchBusy = false;
     }
   }
 
@@ -1297,7 +1336,38 @@
     </div>
   {/if}
 
-  {#if proxyPrompt}
+  {#if proxySwitch}
+    <div class="settings-backdrop" transition:fade={{ duration: 160 }}>
+      <div
+        class="settings-panel glass playlist-panel"
+        role="dialog"
+        aria-modal="true"
+        aria-label={t('proxy.switch.title')}
+        tabindex="-1"
+      >
+        <div class="settings-header">
+          <h3>{t('proxy.switch.title')}</h3>
+        </div>
+        {#if proxySwitch.suggested}
+          <p class="setting-hint proxy-prompt-body">{t('proxy.switch.body', { current: proxySwitch.current, suggested: proxySwitch.suggested, where: proxySwitchWhere(proxySwitch.source) })}</p>
+          <div class="playlist-actions proxy-switch-actions">
+            <button class="toast-btn secondary" onclick={() => answerProxySwitch('keep')} disabled={proxySwitchBusy}>{t('proxy.switch.keep')}</button>
+            <button class="toast-btn secondary" onclick={() => answerProxySwitch('disable')} disabled={proxySwitchBusy}>{t('proxy.switch.disable')}</button>
+            <button class="toast-btn primary" onclick={() => answerProxySwitch('use')} disabled={proxySwitchBusy}>{t('proxy.switch.use')}</button>
+          </div>
+        {:else}
+          <p class="setting-hint proxy-prompt-body">{t('proxy.switch.none', { current: proxySwitch.current })}</p>
+          <div class="playlist-actions proxy-switch-actions">
+            <button class="toast-btn secondary" onclick={() => answerProxySwitch('keep')} disabled={proxySwitchBusy}>{t('proxy.switch.keep')}</button>
+            <button class="toast-btn secondary" onclick={() => answerProxySwitch('edit')} disabled={proxySwitchBusy}>{t('proxy.switch.edit')}</button>
+            <button class="toast-btn primary" onclick={() => answerProxySwitch('disable')} disabled={proxySwitchBusy}>{t('proxy.switch.disable')}</button>
+          </div>
+        {/if}
+      </div>
+    </div>
+  {/if}
+
+  {#if proxyPrompt && !proxySwitch}
     <div class="settings-backdrop" transition:fade={{ duration: 160 }}>
       <div
         class="settings-panel glass playlist-panel"
@@ -2556,6 +2626,10 @@
   .proxy-prompt-body {
     margin: 0 0 8px;
     line-height: 1.45;
+  }
+
+  .proxy-switch-actions {
+    flex-wrap: wrap;
   }
 
   .playlist-actions {
