@@ -28,49 +28,66 @@ const UGE_TIMEOUT: Duration = Duration::from_secs(180);
 /// UGE webview, direct-stream headers) stays in sync from one constant.
 pub use crate::DESKTOP_UA as UGE_USER_AGENT;
 
-/// Media extensions the picker offers. HLS/DASH manifests (`.m3u8`, `.mpd`) and
-/// raw segments (`.ts` + fMP4/init parts, Annex B, raw AAC) are deliberately
-/// included as well: although the direct-stream downloader fetches a single
-/// URL, surfacing these lets the user hand an m3u8/mpd/ts back to yt-dlp
-/// (which natively demuxes them), which is the only way to recover a stream
-/// the sniffer can otherwise see but not reconstruct. Kept as a Rust constant
-/// so it stays unit-testable in sync with the injected script's own
-/// `PROGRESSIVE`/`AUDIO_RE`/`MANIFEST`/`TS_SEGMENT`/`RAW_SEGMENT` regexes.
-const PROGRESSIVE_EXT: &[&str] = &[
-    "mp4", "m4v", "webm", "mkv", "mk3d", "mks", "mov", "flv", "f4v", "3gp", "3g2", "mp3", "m4a",
-    "m4b", "aac", "ogg", "oga", "opus", "wav", "flac", "weba", "wma", "m3u8", "mpd", "ts", "m4s",
-    "cmfv", "cmfa", "h264", "265", "avc", "hevc", "adts",
-];
-
-/// Directly playable container/audio extensions (a strict subset of
-/// `PROGRESSIVE_EXT`, which additionally lists manifests + raw segments that
-/// only yt-dlp can demux).
+/// Progressive containers and audio the direct downloader can save as-is.
+/// Kept in lockstep with the injected script's `PROGRESSIVE` / `AUDIO_RE`.
 const DIRECT_MEDIA_EXT: &[&str] = &[
-    "mp4", "m4v", "webm", "mkv", "mk3d", "mks", "mov", "flv", "f4v", "3gp", "3g2", "mp3", "m4a",
-    "m4b", "aac", "ogg", "oga", "opus", "wav", "flac", "weba", "wma",
+    "mp4", "m4v", "webm", "mkv", "mk3d", "mks", "mov", "flv", "f4v", "3gp", "3g2", "avi", "wmv",
+    "mpg", "mpeg", "m2ts", "mts", "ogv", "mp3", "m4a", "m4b", "aac", "ogg", "oga", "opus", "wav",
+    "flac", "weba", "wma", "mka",
 ];
 
-/// Manifest container formats that yt-dlp natively demuxes (and therefore
-/// should be routed to it instead of the single-URL direct downloader).
-const MANIFEST_EXT: &[&str] = &["m3u8", "mpd"];
+/// HLS/DASH/HDS/Smooth manifests. yt-dlp demuxes these; the direct downloader
+/// would only save playlist text. Mirrors the script's `MANIFEST` regex.
+const MANIFEST_EXT: &[&str] = &["m3u8", "m3u", "mpd", "f4m", "isml", "ism"];
 
-/// Is this resolved URL an HLS/DASH manifest that needs yt-dlp to demux?
-/// The caller is expected to have resolved `Ok(ResolvedUge)` first; the
-/// caller-visible filename still ends in `.mp4`, only the fetcher differs.
-pub fn is_manifest_url(url: &str) -> bool {
-    extension_from_url(url)
-        .map(|ext| MANIFEST_EXT.contains(&ext.as_str()))
-        .unwrap_or(false)
+/// Raw fragments. A single fragment is not a full presentation, so the picker
+/// caps how many it shows and the direct downloader keeps the real extension
+/// instead of pretending the bytes are an mp4. Mirrors `TS_SEGMENT` / `RAW_SEGMENT`.
+const SEGMENT_EXT: &[&str] = &[
+    "ts", "m4s", "cmfv", "cmfa", "h264", "265", "avc", "hevc", "adts",
+];
+
+/// Extensions that are never the media asset, even if the path contains a
+/// media-ish token (`/media/logo.png`, `thumb.jpg`).
+const NON_MEDIA_EXT: &[&str] = &[
+    "jpg", "jpeg", "png", "gif", "webp", "avif", "bmp", "svg", "ico", "css", "js", "mjs", "html",
+    "htm", "json", "txt", "pdf", "zip", "gz", "wasm", "woff", "woff2", "ttf", "map", "php", "asp",
+    "aspx", "jsp", "mhtml",
+];
+
+/// What the picker resolved, and which fetcher should take it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UgeMediaClass {
+    /// Progressive container or audio file.
+    Direct,
+    /// Manifest that has to be demuxed by yt-dlp.
+    Manifest,
+    /// One transport / fMP4 fragment. Saved with its own extension.
+    Segment,
 }
 
-/// Is this a direct playable media URL (progressive container or audio),
-/// as opposed to a manifest/segment that only yt-dlp can demux? Used by the
-/// generic-extractor fallback so a bare page scraped by `generic` (no formats,
-/// no media extension) is still rejected.
+/// Is this resolved URL an HLS/DASH/HDS/Smooth manifest that needs yt-dlp?
+pub fn is_manifest_url(url: &str) -> bool {
+    classify_uge_url(url) == Some(UgeMediaClass::Manifest)
+}
+
+/// Is this a direct playable media URL (progressive container or audio)?
+/// Manifests, fragments, and extension-less pages are not. Used by the
+/// generic-extractor fallback so a bare page scraped by `generic` is rejected
+/// unless yt-dlp actually found a playable format.
 pub fn extension_is_direct_media(url: &str) -> bool {
-    extension_from_url(url)
-        .map(|ext| DIRECT_MEDIA_EXT.contains(&ext.as_str()))
-        .unwrap_or(false)
+    media_extension(url).is_some_and(|ext| is_direct_ext(&ext))
+}
+
+/// File extension yt-dlp (or the direct downloader) can treat as audio/video,
+/// including manifests and raw fragments. Images and documents are not.
+pub fn ext_is_playable_media(ext: &str) -> bool {
+    let ext = normalize_ext(ext);
+    is_direct_ext(&ext) || is_manifest_ext(&ext) || is_segment_ext(&ext)
+}
+
+pub fn is_non_media_extension(ext: &str) -> bool {
+    is_non_media_ext(&normalize_ext(ext))
 }
 
 #[derive(Debug, Clone)]
@@ -78,6 +95,13 @@ pub struct ResolvedUge {
     pub url: String,
     pub filename: String,
     pub expected_bytes: u64,
+    pub media_class: UgeMediaClass,
+}
+
+/// Manifests are not single files. Everything else the picker offers can be
+/// fetched directly (segments keep their real extension).
+pub fn needs_ytdlp_demux(resolved: &ResolvedUge) -> bool {
+    resolved.media_class == UgeMediaClass::Manifest
 }
 
 /// Manual extraction only makes sense for a real web page.
@@ -85,14 +109,31 @@ pub fn is_candidate(url: &str) -> bool {
     matches!(Url::parse(url).map(|parsed| parsed.scheme().to_owned()), Ok(scheme) if scheme == "http" || scheme == "https")
 }
 
-/// Best-effort container extension from a media URL's path (ignoring query).
-fn extension_from_url(url: &str) -> Option<String> {
-    let path = url.split(['?', '#']).next().unwrap_or(url);
-    let last = path.rsplit('/').next()?;
-    if !last.contains('.') {
+fn normalize_ext(ext: &str) -> String {
+    ext.trim().trim_start_matches('.').to_ascii_lowercase()
+}
+
+fn is_direct_ext(ext: &str) -> bool {
+    DIRECT_MEDIA_EXT.contains(&ext)
+}
+
+fn is_manifest_ext(ext: &str) -> bool {
+    MANIFEST_EXT.contains(&ext)
+}
+
+fn is_segment_ext(ext: &str) -> bool {
+    SEGMENT_EXT.contains(&ext)
+}
+
+fn is_non_media_ext(ext: &str) -> bool {
+    NON_MEDIA_EXT.contains(&ext)
+}
+
+fn ext_token(filename: &str) -> Option<String> {
+    if !filename.contains('.') {
         return None;
     }
-    let ext = last.rsplit('.').next()?;
+    let ext = filename.rsplit('.').next()?;
     if (2..=5).contains(&ext.len()) && ext.chars().all(|c| c.is_ascii_alphanumeric()) {
         Some(ext.to_ascii_lowercase())
     } else {
@@ -100,28 +141,202 @@ fn extension_from_url(url: &str) -> Option<String> {
     }
 }
 
-/// Does a URL carry a media file extension the picker should surface? Mirrors
-/// the injected script's `isMedia()` URL branch (progressive **and** HLS/DASH
-/// manifests + raw `.ts`/`.m4s`/`.aac` segments) so the Rust-side filename
-/// logic and the JS sniffer agree on what counts as media. Unit-tested to
-/// keep them in sync.
+/// Best-effort container extension from a media URL's path (ignoring query
+/// and a trailing slash, so `video.mp4/` still counts).
+fn extension_from_url(url: &str) -> Option<String> {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    let path = path.trim_end_matches('/');
+    let last = path.rsplit('/').next()?;
+    ext_token(last)
+}
+
+/// Extension declared by a query value (`file=clip.mp4`, `format=m3u8`,
+/// `mime=video/mp4`) when the path itself has none.
+fn extension_from_query(url: &str) -> Option<String> {
+    let parsed = Url::parse(url).ok()?;
+    for (key, value) in parsed.query_pairs() {
+        let key = key.to_ascii_lowercase();
+        if matches!(
+            key.as_str(),
+            "format" | "ext" | "container" | "mime" | "type"
+        ) {
+            if let Some(ext) = ext_from_format_token(&value) {
+                return Some(ext);
+            }
+        }
+        if let Some(ext) = extension_from_url(&value) {
+            if is_direct_ext(&ext) || is_manifest_ext(&ext) || is_segment_ext(&ext) {
+                return Some(ext);
+            }
+        }
+    }
+    None
+}
+
+fn ext_from_format_token(value: &str) -> Option<String> {
+    let token = value.split(';').next()?.trim().to_ascii_lowercase();
+    let token = token.split('/').next_back()?.trim();
+    if token.is_empty() {
+        return None;
+    }
+    if token.contains("mpegurl") || token == "hls" || token == "m3u8" || token == "x-mpegurl" {
+        return Some("m3u8".to_string());
+    }
+    if token == "m3u" {
+        return Some("m3u".to_string());
+    }
+    if token.contains("dash") || token == "mpd" {
+        return Some("mpd".to_string());
+    }
+    if token == "f4m" || token == "hds" {
+        return Some("f4m".to_string());
+    }
+    if is_direct_ext(token) || is_manifest_ext(token) || is_segment_ext(token) {
+        return Some(token.to_string());
+    }
+    None
+}
+
+/// Path extension when it is one we know, otherwise a media extension carried
+/// in the query string. A known non-media path extension wins so
+/// `logo.jpg?format=mp4` stays a jpeg.
+fn media_extension(url: &str) -> Option<String> {
+    if let Some(ext) = extension_from_url(url) {
+        if is_non_media_ext(&ext)
+            || is_direct_ext(&ext)
+            || is_manifest_ext(&ext)
+            || is_segment_ext(&ext)
+        {
+            return Some(ext);
+        }
+    }
+    extension_from_query(url)
+}
+
+fn class_from_ext(ext: &str) -> Option<UgeMediaClass> {
+    if is_manifest_ext(ext) {
+        Some(UgeMediaClass::Manifest)
+    } else if is_segment_ext(ext) {
+        Some(UgeMediaClass::Segment)
+    } else if is_direct_ext(ext) {
+        Some(UgeMediaClass::Direct)
+    } else {
+        None
+    }
+}
+
+/// Extension-less URLs that still name a manifest or a direct stream.
+/// Deliberately narrower than "anything with /video/ or /media/ in the path",
+/// which matches thumbnails and article pages.
+fn hint_class(url: &str) -> Option<UgeMediaClass> {
+    let lower = url.to_ascii_lowercase();
+    if lower.contains("format=m3u8")
+        || lower.contains("format=m3u")
+        || lower.contains("format=hls")
+        || lower.contains("format=mpd")
+        || lower.contains("format=dash")
+        || lower.contains("mpegurl")
+        || lower.contains(".m3u8")
+        || lower.contains(".m3u")
+        || lower.contains(".mpd")
+        || lower.contains(".f4m")
+        || lower.contains(".isml")
+    {
+        return Some(UgeMediaClass::Manifest);
+    }
+    if lower.contains("videoplayback")
+        || lower.contains("mime=video")
+        || lower.contains("mime=audio")
+        || lower.contains("format=mp4")
+        || lower.contains("format=webm")
+        || lower.contains("format=mkv")
+    {
+        return Some(UgeMediaClass::Direct);
+    }
+    None
+}
+
+/// URL-only classification. Matches the injected script's extension and
+/// strong-hint branches (content-type is applied separately at callback time).
+pub fn classify_uge_url(url: &str) -> Option<UgeMediaClass> {
+    if let Some(ext) = media_extension(url) {
+        if is_non_media_ext(&ext) {
+            return None;
+        }
+        if let Some(class) = class_from_ext(&ext) {
+            return Some(class);
+        }
+    }
+    hint_class(url)
+}
+
+fn class_from_mime(mime: &str) -> Option<UgeMediaClass> {
+    let mime = mime.split(';').next()?.trim().to_ascii_lowercase();
+    if mime.is_empty()
+        || mime.starts_with("text/")
+        || mime.starts_with("image/")
+        || mime.contains("html")
+        || mime == "application/json"
+        || mime == "text/json"
+        || mime.contains("javascript")
+    {
+        return None;
+    }
+    if mime.contains("mpegurl")
+        || mime.contains("dash+xml")
+        || mime.contains("sstr+xml")
+        || mime == "application/f4m+xml"
+    {
+        return Some(UgeMediaClass::Manifest);
+    }
+    if mime == "video/mp2t" {
+        return Some(UgeMediaClass::Segment);
+    }
+    if mime.starts_with("video/") || mime.starts_with("audio/") {
+        return Some(UgeMediaClass::Direct);
+    }
+    None
+}
+
+/// Does a URL carry a media file extension (or a strong stream hint) the
+/// picker should surface? Content-type matches are decided in
+/// `parse_callback_url`, which also receives the mime the sniffer observed.
 pub fn is_uge_media_url(url: &str) -> bool {
-    extension_from_url(url)
-        .map(|ext| PROGRESSIVE_EXT.contains(&ext.as_str()))
-        .unwrap_or(false)
+    classify_uge_url(url).is_some()
+}
+
+fn callback_media_class(url: &str, mime: &str) -> Option<UgeMediaClass> {
+    if let Some(ext) = media_extension(url) {
+        if is_non_media_ext(&ext) {
+            return None;
+        }
+        if let Some(class) = class_from_ext(&ext) {
+            return Some(class);
+        }
+    }
+    if let Some(class) = hint_class(url) {
+        return Some(class);
+    }
+    // Extension-less CDN URLs are real streams when the response said so.
+    // A document mime never promotes a page into a download.
+    class_from_mime(mime)
 }
 
 /// Build a safe, readable filename from the page title + media URL.
 ///
-/// The container extension is taken from the URL only when it is a real
-/// *container* (mp4/mkv/…). HLS/DASH manifests (`.m3u8`/`.mpd`) and raw
-/// segments (`.ts`) are **not** playable containers on their own — they are
-/// handed to yt-dlp, which demuxes them — so those resolve to an `mp4` target
-/// rather than saving manifest text.
+/// Direct containers and raw fragments keep their own suffix. Manifests are
+/// demuxed by yt-dlp, so the placeholder name is `.mp4` rather than `.m3u8`
+/// (the direct downloader never saves the playlist body).
 pub fn safe_uge_filename(title: &str, url: &str) -> String {
-    let ext = extension_from_url(url)
-        .filter(|ext| DIRECT_MEDIA_EXT.contains(&ext.as_str()))
-        .unwrap_or_else(|| "mp4".to_string());
+    let ext = match classify_uge_url(url) {
+        Some(UgeMediaClass::Direct) => media_extension(url)
+            .filter(|ext| is_direct_ext(ext))
+            .unwrap_or_else(|| "mp4".to_string()),
+        Some(UgeMediaClass::Segment) => media_extension(url)
+            .filter(|ext| is_segment_ext(ext))
+            .unwrap_or_else(|| "ts".to_string()),
+        Some(UgeMediaClass::Manifest) | None => "mp4".to_string(),
+    };
     let cleaned: String = title
         .chars()
         .map(|c| match c {
@@ -146,10 +361,12 @@ pub fn parse_callback_url(callback: &Url) -> Result<ResolvedUge, String> {
         (UGE_SCHEME, Some("resolved")) => {
             let mut media = None;
             let mut title = None;
+            let mut mime = None;
             for (key, value) in callback.query_pairs() {
                 match key.as_ref() {
                     "url" => media = Some(value.into_owned()),
                     "title" => title = Some(value.into_owned()),
+                    "mime" => mime = Some(value.into_owned()),
                     _ => {}
                 }
             }
@@ -158,15 +375,17 @@ pub fn parse_callback_url(callback: &Url) -> Result<ResolvedUge, String> {
                 .ok_or_else(|| "Manual extraction returned no media URL".to_string())?;
             // The picker only offers sniffed media URLs, but a hand-crafted
             // callback (or a future panel bug) could hand back a bare page —
-            // fail loudly instead of downloading HTML as ".mp4".
-            if !is_uge_media_url(&media) {
-                return Err("Manual extraction returned a non-media URL".to_string());
-            }
+            // fail loudly instead of downloading HTML as ".mp4". An
+            // extension-less URL is accepted only when the sniffer observed a
+            // real media content-type (passed back as `mime`).
+            let media_class = callback_media_class(&media, mime.as_deref().unwrap_or(""))
+                .ok_or_else(|| "Manual extraction returned a non-media URL".to_string())?;
             let filename = safe_uge_filename(title.as_deref().unwrap_or(""), &media);
             Ok(ResolvedUge {
                 url: media,
                 filename,
                 expected_bytes: 0,
+                media_class,
             })
         }
         (UGE_SCHEME, Some("error")) => {
@@ -224,18 +443,19 @@ const UGE_SCRIPT: &str = r##"
   if (window.__cobaltUGE) return;
   window.__cobaltUGE = true;
 
-  const PROGRESSIVE = /\.(mp4|m4v|webm|mkv|mk3d|mks|mov|flv|f4v|3gp|3g2)(\?|#|$)/i;
-  const AUDIO_RE = /\.(mp3|m4a|m4b|aac|ogg|oga|opus|wav|flac|weba|wma)(\?|#|$)/i;
-  const MANIFEST = /\.(m3u8|mpd)(\?|#|$)/i;
-  // A raw transport-stream segment is almost never the playable asset, but
-  // surfacing it gives yt-dlp (which demuxes it) a chance when nothing else
-  // is visible. Require a ?/#/$ terminator so query keys like `?ts=123`
-  // don't false-positive.
-  const TS_SEGMENT = /\.ts(\?|#|$)/i;
-  // Supplementary raw formats worth a second-class slot: raw H.264 Annex B,
-  // fragmented MP4 init/segment parts, and raw AAC/ADTS.
-  const RAW_SEGMENT = /\.(m4s|cmfv|cmfa|h264|265|avc|hevc|aac|adts)(\?|#|$)/i;
-  const GENERIC_MEDIA_HINT = /\b(m3u8|mpd|mime=video|mime=audio|videoplayback|\/video\/|\/audio\/|\/media\/|get_video|get_audio|playurl|play_url|stream)/i;
+  // Terminator includes "/" so `video.mp4/` is still a media URL.
+  const PROGRESSIVE = /\.(mp4|m4v|webm|mkv|mk3d|mks|mov|flv|f4v|3gp|3g2|avi|wmv|mpg|mpeg|m2ts|mts|ogv)(\?|#|\/|$)/i;
+  const AUDIO_RE = /\.(mp3|m4a|m4b|aac|ogg|oga|opus|wav|flac|weba|wma|mka)(\?|#|\/|$)/i;
+  const MANIFEST = /\.(m3u8|m3u|mpd|f4m|isml|ism)(\?|#|\/|$)/i;
+  // A raw transport-stream segment is almost never the playable asset.
+  // Require a ?/#//$ terminator so query keys like `?ts=123` don't match.
+  const TS_SEGMENT = /\.ts(\?|#|\/|$)/i;
+  // fMP4 parts and raw elementary streams. `.aac` is audio (AUDIO_RE), not a fragment.
+  const RAW_SEGMENT = /\.(m4s|cmfv|cmfa|h264|265|avc|hevc|adts)(\?|#|\/|$)/i;
+  // Strong stream tokens only. `/media/`, `/video/` and a bare `stream` match
+  // thumbnails and article pages, so they are not hints.
+  const STRONG_HINT = /(?:\.m3u8\b|\.m3u\b|\.mpd\b|\.f4m\b|mpegurl|videoplayback|mime=video|mime=audio|(?:^|[?&#])format=(?:m3u8|m3u|mpd|mp4|webm|mkv|hls|dash)\b)/i;
+  const NON_MEDIA = /\.(jpg|jpeg|png|gif|webp|avif|bmp|svg|ico|css|js|mjs|html|htm|json|txt|pdf|zip|gz|wasm|woff2?|ttf|map|php|asp|aspx|jsp|mhtml)(\?|#|\/|$)/i;
   const ABSOLUTE = /^https?:/i;
   const found = new Map();
   // Browsers hide the real stream behind blob:/MediaSource URLs; remembering
@@ -245,136 +465,205 @@ const UGE_SCRIPT: &str = r##"
 
   const isManifestType = (type) => {
     if (!type) return false;
-    return /mpegurl|dash\+xml/i.test(String(type));
+    return /mpegurl|dash\+xml|sstr\+xml|f4m\+xml/i.test(String(type));
   };
 
+  const pathOnly = (url) => String(url || '').split('?')[0].split('#')[0].replace(/\/+$/, '');
   const resolveUrl = (base, u) => {
-    if (!u) return '';
-    u = String(u).trim();
-    if (ABSOLUTE.test(u)) return u;
-    try { return new URL(u, base).href; } catch (e) { return ''; }
+    if (u == null) return '';
+    u = String(u).trim().replace(/\\\//g, '/');
+    if (!u || /^(data|blob):/i.test(u)) return '';
+    try { return new URL(u, base || location.href).href; } catch (e) { return ''; }
   };
   const guessType = (url) => {
-    const clean = url.split('?')[0].split('#')[0];
+    const clean = pathOnly(url);
     const m = clean.match(/\.([a-z0-9]{2,5})$/i);
     return m ? m[1].toLowerCase() : 'media';
   };
   const isMedia = (url, type) => {
     if (!url || !ABSOLUTE.test(url)) return false;
-    if (isManifestType(type)) return true;             // HLS/DASH manifest
+    const path = pathOnly(url);
+    if (NON_MEDIA.test(path)) return false;
+    if (isManifestType(type)) return true;
+    if (PROGRESSIVE.test(path) || AUDIO_RE.test(path) || MANIFEST.test(path) || TS_SEGMENT.test(path) || RAW_SEGMENT.test(path)) return true;
     if (type) {
       const t = String(type).toLowerCase();
-      if (/^(video|audio)\//.test(t)) return true;     // any real media mime
+      if (/^(video|audio)\//.test(t)) return true;
     }
-    const clean = url.split('?')[0].split('#')[0];
-    return PROGRESSIVE.test(clean) || AUDIO_RE.test(clean) || MANIFEST.test(clean) || TS_SEGMENT.test(clean) || RAW_SEGMENT.test(clean);
+    return STRONG_HINT.test(url);
   };
 
   // Higher-priority provenance wins so a URL first seen as a bare network fetch
   // gets upgraded when the player actually plays it or a manifest references it.
   const viaRank = { player: 3, body: 2, resource: 1, network: 1 };
   const kindOf = (url, type) => {
-    if (isManifestType(type) || MANIFEST.test(url)) return 'manifest';
-    if (AUDIO_RE.test(url)) return 'audio';
-    if (TS_SEGMENT.test(url) || RAW_SEGMENT.test(url)) return 'segment';
+    const path = pathOnly(url);
+    if (isManifestType(type) || MANIFEST.test(path) || /format=m3u8|format=mpd|format=hls|format=dash|mpegurl/i.test(url)) return 'manifest';
+    if (AUDIO_RE.test(path) || (type && /^audio\//i.test(String(type)))) return 'audio';
+    if (TS_SEGMENT.test(path) || RAW_SEGMENT.test(path) || (type && /mp2t/i.test(String(type)))) return 'segment';
+    if (STRONG_HINT.test(url) && !PROGRESSIVE.test(path)) return 'hint';
     return 'video';
+  };
+  const countKind = (kind) => {
+    let n = 0;
+    found.forEach(function (v) { if (v.kind === kind) n++; });
+    return n;
   };
   const add = (url, type, via) => {
     if (!isMedia(url, type)) return;
     const realMime = type && String(type).indexOf('/') !== -1;
+    const kind = kindOf(url, type);
     const existing = found.get(url);
     if (existing) {
-      if (realMime) existing.type = type;                  // guess -> real mime
-      if (viaRank[via] > viaRank[existing.via]) existing.via = via;
+      if (realMime) {
+        existing.type = type;
+        existing.kind = kind;
+      }
+      if ((viaRank[via] || 0) > (viaRank[existing.via] || 0)) existing.via = via;
+      scheduleRender();
       return;
     }
+    // A media playlist can list hundreds of fragments. Keep a handful as a
+    // last resort and always leave room for the manifest / container itself.
+    if (kind === 'segment' && countKind('segment') >= 3) return;
+    if (found.size >= 48 && kind !== 'manifest') return;
     found.set(url, {
       url,
       type: realMime ? type : guessType(url),
       via,
+      kind,
     });
-    render();
+    scheduleRender();
   };
 
-  // Pull media URLs out of an m3u8/mpd/JSON response body (relative paths
-  // resolved against the response URL). This is how we recover the real
-  // playlist/segment URLs when a site fetches an extension-less API endpoint.
-  // JSON bodies are parsed structurally (preferred: no regex noise); plain
-  // text falls back to a bounded absolute-URL scan.
-  const JSON_URL_KEYS = ['url','src','source','file','stream_url','play_url','video_url','audio_url','hls_url','dash_url','manifest','playlist'];
-  const scanJsonValue = (value, base, depth) => {
+  // Pull media URLs out of an m3u8/mpd/JSON response body. Relative paths
+  // are resolved against the response URL, which is how extension-less API
+  // endpoints still yield a real playlist. HLS media playlists are NOT expanded
+  // into every fragment — that floods the picker with hundreds of .ts URLs.
+  const KNOWN_KEYS = {
+    url: 1, src: 1, source: 1, file: 1, streamurl: 1, playurl: 1, videourl: 1,
+    audiourl: 1, hlsurl: 1, dashurl: 1, manifest: 1, playlist: 1, m3u8: 1,
+    m3u8url: 1, mp4: 1, mp4url: 1, downloadurl: 1, fileurl: 1, backupurl: 1,
+    videoplayurl: 1, hls: 1, dash: 1
+  };
+  const keyNorm = (key) => String(key || '').toLowerCase().replace(/[_\-\s]/g, '');
+  const pickGeneric = (u, source, base) => {
+    const url = resolveUrl(base || location.href, u);
+    if (!url) return;
+    add(url, null, source);
+  };
+  const considerString = (raw, base, key) => {
+    if (typeof raw !== 'string') return;
+    const s = raw.trim().replace(/\\\//g, '/');
+    if (!s || s.length > 4096) return;
+    const known = !!(key && KNOWN_KEYS[keyNorm(key)]);
+    const looks = PROGRESSIVE.test(s) || AUDIO_RE.test(s) || MANIFEST.test(s) || TS_SEGMENT.test(s) || RAW_SEGMENT.test(s) || STRONG_HINT.test(s);
+    if (!known && !looks) return;
+    if (s.length < 5) return;
+    pickGeneric(s, 'network', base);
+  };
+  const scanJsonValue = (value, base, depth, key) => {
     if (value == null || depth > 4) return;
     if (typeof value === 'string') {
-      const s = value.trim();
-      if (s.length > 16 && s.length < 4096 && ABSOLUTE.test(s)) pickGeneric(s, 'network');
+      considerString(value, base, key);
       return;
     }
     if (Array.isArray(value)) {
-      for (let i = 0; i < Math.min(value.length, 40); i++) scanJsonValue(value[i], base, depth + 1);
+      for (let i = 0; i < Math.min(value.length, 40); i++) scanJsonValue(value[i], base, depth + 1, key);
       return;
     }
     if (typeof value === 'object') {
       const keys = Object.keys(value);
       for (let i = 0; i < Math.min(keys.length, 60); i++) {
-        const raw = value[keys[i]];
-        if (typeof raw === 'string') {
-          const s = raw.trim();
-          // Prefer known player-config keys; anything else must carry a media
-          // extension hint. This keeps config/thumbnail noise out of the list.
-          const k = keys[i].toLowerCase();
-          if (s.length > 16 && s.length < 4096 && ABSOLUTE.test(s)
-              && (JSON_URL_KEYS.indexOf(k) >= 0 || /\.(mp4|m4v|webm|mkv|mov|m3u8|mpd|ts|mp3|m4a|aac|ogg|oga|opus|wav|flac)([?#]|$)/i.test(s))) {
-            pickGeneric(s, 'network');
-          }
-        } else {
-          scanJsonValue(raw, base, depth + 1);
-        }
+        scanJsonValue(value[keys[i]], base, depth + 1, keys[i]);
       }
     }
   };
-  const pickGeneric = (u, source) => {
-    const url = resolveUrl(location.href, u);
-    if (!url || found.has(url)) return;
-    const clean = url.split('?')[0].split('#')[0];
-    if (PROGRESSIVE.test(clean) || AUDIO_RE.test(clean) || MANIFEST.test(clean) || TS_SEGMENT.test(clean) || RAW_SEGMENT.test(clean)) {
-      add(url, null, source);
-    } else if (GENERIC_MEDIA_HINT.test(url)) {
-      add(url, null, source);
+  // Master/media playlist: record the playlist itself and any nested variant
+  // playlists. Keep a single fragment only when the body had no variant.
+  const scanHls = (text, base) => {
+    if (base) add(base, 'application/vnd.apple.mpegurl', 'body');
+    const lines = String(text).split(/\r?\n/);
+    let variants = 0;
+    let sample = '';
+    let pendingBw = 0;
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i].trim();
+      if (!line) continue;
+      if (line.charAt(0) === '#') {
+        if (/^#EXT-X-STREAM-INF/i.test(line)) {
+          const bw = line.match(/BANDWIDTH=(\d+)/i);
+          pendingBw = bw ? parseInt(bw[1], 10) || 0 : 0;
+        }
+        continue;
+      }
+      const abs = resolveUrl(base, line);
+      if (!abs || abs === base) { pendingBw = 0; continue; }
+      const path = pathOnly(abs);
+      if (MANIFEST.test(path) || /\.m3u8?$/i.test(path)) {
+        add(abs, 'application/vnd.apple.mpegurl', 'body');
+        const item = found.get(abs);
+        if (item && pendingBw) item.bandwidth = Math.max(item.bandwidth || 0, pendingBw);
+        variants++;
+      } else if (!sample) {
+        sample = abs;
+      }
+      pendingBw = 0;
+    }
+    if (!variants && sample) add(sample, null, 'body');
+  };
+  const scanMpd = (text, base) => {
+    if (base) add(base, 'application/dash+xml', 'body');
+    const re = /<BaseURL[^>]*>\s*([^<]+)\s*<\/BaseURL>/gi;
+    let m;
+    let n = 0;
+    while ((m = re.exec(text)) && n < 8) {
+      const abs = resolveUrl(base, m[1].trim());
+      if (!abs || abs === base) continue;
+      add(abs, null, 'body');
+      n++;
     }
   };
   const scanTextForUrls = (text, base) => {
     if (!text) return;
-    if (typeof text === 'string') {
-      let parsed = null;
-      try { parsed = JSON.parse(text); } catch (e) { parsed = null; }
-      if (parsed && typeof parsed === 'object') { scanJsonValue(parsed, base, 0); return; }
-      if (text.length > 512000) return;
+    text = String(text);
+    const absBase = resolveUrl(location.href, base) || String(base || location.href || '');
+    const head = text.slice(0, 80).replace(/^\uFEFF/, '').trimStart();
+    if (head.indexOf('#EXTM3U') === 0 || head.indexOf('#EXT-X-') === 0) {
+      scanHls(text, absBase);
+      return;
     }
-    String(text).split(/\r?\n/).forEach(function (line) {
-      if (!line || line.charAt(0) === '#' || line.charAt(0) === '<') return;
-      add(resolveUrl(base, line), null, 'body');
-    });
-    const re = /https?:\/\/[^\s"'<>\\]+/gi;
+    if (head.charAt(0) === '<' && /<MPD[\s>]/i.test(text.slice(0, 2500))) {
+      scanMpd(text, absBase);
+      return;
+    }
+    let parsed = null;
+    try { parsed = JSON.parse(text); } catch (e) { parsed = null; }
+    if (parsed && typeof parsed === 'object') { scanJsonValue(parsed, absBase, 0, ''); return; }
+    if (text.length > 512000) return;
+    const flat = text.indexOf('\\/') === -1 ? text : text.replace(/\\\//g, '/');
+    const re = /https?:\/\/[^\s"'<>]+/gi;
     let m;
     let guard = 0;
-    while ((m = re.exec(text)) && guard++ < 60) pickGeneric(m[0], 'body');
+    while ((m = re.exec(flat)) && guard++ < 60) pickGeneric(m[0], 'body', absBase);
   };
 
-  // Rank so the best/clearest stream surfaces first: a progressive container
-  // beats a manifest beats a raw segment; something the player used beats a
-  // background fetch; a higher resolution hint in the URL breaks ties.
+  // Rank so the best stream surfaces first: a progressive container beats a
+  // manifest beats a raw fragment; something the player used beats a background
+  // fetch; a resolution or HLS BANDWIDTH hint breaks ties.
   const scoreOf = (it) => {
-    const clean = it.url.split('?')[0];
+    const kind = it.kind || kindOf(it.url, it.type);
     let s = 0;
-    if (isManifestType(it.type) || MANIFEST.test(clean)) s += 40;
-    // Raw segments are last-resort crumbs: surface them, but never above a
-    // playable container or manifest.
-    else if (TS_SEGMENT.test(clean) || RAW_SEGMENT.test(clean)) s += 5;
-    else s += 60;                                          // progressive container
+    if (kind === 'video') s += 60;
+    else if (kind === 'manifest') s += 50;
+    else if (kind === 'audio') s += 45;
+    else if (kind === 'hint') s += 35;
+    else s += 5;
     if (it.via === 'player') s += 30;
-    else if (it.via === 'body') s += 10;
-    const h = clean.match(/(\d{3,4})[pP]/);
-    if (h) s += Math.min(parseInt(h[1], 10) || 0, 4000) / 100;
+    else if (it.via === 'body') s += 12;
+    const h = String(it.url).match(/(?:^|[^\d])(\d{3,4})p\b/i);
+    if (h) s += Math.min(parseInt(h[1], 10) || 0, 2160) / 100;
+    if (it.bandwidth) s += Math.min(it.bandwidth, 20000000) / 1000000;
     return s;
   };
 
@@ -383,13 +672,23 @@ const UGE_SCRIPT: &str = r##"
     window.location.replace('cobalt-uge://' + kind + '/?' + query);
   };
 
+  const requestUrl = (input) => {
+    if (!input) return '';
+    if (typeof input === 'string') return input;
+    try {
+      if (typeof URL !== 'undefined' && input instanceof URL) return input.href;
+    } catch (e) {}
+    if (typeof input.url === 'string') return input.url;
+    return '';
+  };
+  const shouldScanBody = (ct) => /mpegurl|dash\+xml|json|javascript|ecmascript|text\/plain|xml/i.test(String(ct || ''));
+
   try {
     const origFetch = window.fetch;
     window.fetch = function () {
       const args = Array.prototype.slice.call(arguments);
       try {
-        const input = args[0];
-        const url = typeof input === 'string' ? input : (input && input.url) || '';
+        const url = resolveUrl(location.href, requestUrl(args[0]));
         add(url, null, 'network');
         const result = origFetch.apply(this, args);
         if (result && result.then) {
@@ -397,9 +696,9 @@ const UGE_SCRIPT: &str = r##"
             try {
               const ct = res.headers.get('content-type');
               add(url, ct, 'network');
-              // HLS/DASH manifests are often fetched from extension-less API
-              // endpoints, so scan the body for the real playlist/segment URLs.
-              if (/mpegurl|dash\+xml|json|text\/plain/i.test(String(ct))) {
+              // Extension-less API endpoints often hide the real playlist in
+              // the body. Skip huge binary payloads (octet-stream video).
+              if (shouldScanBody(ct)) {
                 const clone = res.clone && res.clone();
                 if (clone && clone.text) {
                   clone.text().then(function (t) { scanTextForUrls(t, url); }).catch(function () {});
@@ -416,18 +715,16 @@ const UGE_SCRIPT: &str = r##"
   try {
     const origOpen = XMLHttpRequest.prototype.open;
     XMLHttpRequest.prototype.open = function (method, url) {
-      const rest = Array.prototype.slice.call(arguments, 3);
-      add(url, null, 'network');
+      const abs = resolveUrl(location.href, url);
+      add(abs, null, 'network');
       this.addEventListener('load', function () {
         try {
           const ct = this.getResponseHeader('content-type');
-          add(url, ct, 'network');
-          if (/mpegurl|dash\+xml|json|text\/plain/i.test(String(ct))) {
-            scanTextForUrls(this.responseText, url);
-          }
+          add(abs, ct, 'network');
+          if (shouldScanBody(ct)) scanTextForUrls(this.responseText, abs);
         } catch (e) {}
       });
-      return origOpen.call(this, method, url, rest);
+      return origOpen.apply(this, arguments);
     };
   } catch (e) {}
 
@@ -449,38 +746,68 @@ const UGE_SCRIPT: &str = r##"
 
   try {
     const po = new PerformanceObserver(function (list) {
-      list.getEntries().forEach(function (entry) { add(entry.name, null, 'resource'); });
-    });
-    po.observe({ type: 'resource', buffered: true });
-    performance.getEntriesByType('resource').forEach(function (e) { add(e.name, null, 'resource'); });
-  } catch (e) {}
-
-  const scanMedia = function () {
-    document.querySelectorAll('video,audio').forEach(function (el) {
-      if (el.currentSrc) {
-        if (/^blob:/i.test(el.currentSrc)) BLOB_ELEMENTS.add(el);
-        else add(el.currentSrc, null, 'player');
-      }
-      if (el.src && el.src !== el.currentSrc) {
-        if (/^blob:/i.test(el.src)) BLOB_ELEMENTS.add(el);
-        else add(el.src, null, 'player');
-      }
-      el.querySelectorAll('source').forEach(function (s) { if (s.src) add(s.src, s.type, 'player'); });
-      // <track> cues (WebVTT) often share the media prefix — an extra crumb.
-      el.querySelectorAll('track').forEach(function (t) { if (t.src) pickGeneric(t.src, 'player'); });
-    });
-    // Scan open shadow roots once per pass: several players bury their
-    // <video> inside a web component.
-    document.querySelectorAll('*').forEach(function (host) {
-      let root = null;
-      try { root = host.shadowRoot; } catch (e) { root = null; }
-      if (!root) return;
-      root.querySelectorAll('video,audio').forEach(function (el) {
-        if (el.currentSrc && !/^blob:/i.test(el.currentSrc)) add(el.currentSrc, null, 'player');
-        if (el.src && el.src !== el.currentSrc && !/^blob:/i.test(el.src)) add(el.src, null, 'player');
-        el.querySelectorAll('source').forEach(function (s) { if (s.src) add(s.src, s.type, 'player'); });
+      list.getEntries().forEach(function (entry) {
+        add(resolveUrl(location.href, entry.name), null, 'resource');
       });
     });
+    po.observe({ type: 'resource', buffered: true });
+    performance.getEntriesByType('resource').forEach(function (e) {
+      add(resolveUrl(location.href, e.name), null, 'resource');
+    });
+  } catch (e) {}
+
+  const noteElement = (el) => {
+    if (!el) return;
+    if (el.currentSrc) {
+      if (/^blob:/i.test(el.currentSrc)) BLOB_ELEMENTS.add(el);
+      else add(el.currentSrc, null, 'player');
+    }
+    if (el.src && el.src !== el.currentSrc) {
+      if (/^blob:/i.test(el.src)) BLOB_ELEMENTS.add(el);
+      else add(el.src, null, 'player');
+    }
+    el.querySelectorAll('source').forEach(function (s) { if (s.src) add(s.src, s.type, 'player'); });
+    el.querySelectorAll('track').forEach(function (t) { if (t.src) pickGeneric(t.src, 'player', location.href); });
+  };
+  // Open shadow roots and same-origin iframes. Nested roots are walked a few
+  // levels deep; closed shadow roots stay unreachable.
+  const visitRoot = (root, depth) => {
+    if (!root || depth > 3 || !root.querySelectorAll) return;
+    root.querySelectorAll('video,audio').forEach(noteElement);
+    root.querySelectorAll('*').forEach(function (host) {
+      let shadow = null;
+      try { shadow = host.shadowRoot; } catch (e) { shadow = null; }
+      if (shadow) visitRoot(shadow, depth + 1);
+    });
+    root.querySelectorAll('iframe').forEach(function (frame) {
+      try {
+        if (frame.contentDocument) visitRoot(frame.contentDocument, depth + 1);
+      } catch (e) {}
+    });
+  };
+  let emptyNote = '';
+  let scriptPasses = 0;
+  const scanInlineScripts = () => {
+    if (scriptPasses >= 8 || !document.querySelectorAll) return;
+    scriptPasses++;
+    document.querySelectorAll('script').forEach(function (s) {
+      if (s.src || !s.textContent) return;
+      const body = s.textContent;
+      if (body.length < 40 || body.length > 200000) return;
+      scanTextForUrls(body, location.href);
+    });
+  };
+  const scanMedia = function () {
+    if (!document.documentElement) return;
+    visitRoot(document, 0);
+    scanInlineScripts();
+    // Re-render the empty state only when it changes. Rendering mutates the
+    // DOM, which fires this observer; an unconditional schedule would loop.
+    const note = !found.size && (BLOB_ELEMENTS.size || BLOB_MIMES.length) ? 'mse' : '';
+    if (note && note !== emptyNote) {
+      emptyNote = note;
+      scheduleRender();
+    }
   };
   try {
     new MutationObserver(scanMedia).observe(document.documentElement, { childList: true, subtree: true });
@@ -519,15 +846,26 @@ const UGE_SCRIPT: &str = r##"
     return shadow;
   };
 
+  let renderTimer = 0;
+  function scheduleRender() {
+    if (renderTimer) return;
+    renderTimer = setTimeout(function () {
+      renderTimer = 0;
+      try { render(); } catch (e) {}
+    }, 80);
+  }
+
   const render = function () {
+    if (!document.documentElement) return;
     const shadow = ensurePanel();
+    if (!shadow) return;
     const list = shadow.getElementById('__cobalt_uge_list');
     const items = Array.from(found.values());
     if (!items.length) {
-      const blobCount = (typeof BLOB_ELEMENTS !== 'undefined' && BLOB_ELEMENTS.size) || 0;
-      const mseCount = (typeof BLOB_MIMES !== 'undefined' && BLOB_MIMES.length) || 0;
+      const blobCount = BLOB_ELEMENTS.size || 0;
+      const mseCount = BLOB_MIMES.length || 0;
       if (blobCount > 0 || mseCount > 0) {
-        list.innerHTML = '<div class="none">This player streams inside the browser (MSE/blob) — no direct file URL is visible. Try playing the video, or pick a manifest/segment below for yt-dlp.</div>';
+        list.innerHTML = '<div class="none">This player keeps the stream inside the browser (MediaSource/blob), so there is no file URL yet. Press play — a playlist will show up here if the page requests one.</div>';
       } else {
         list.innerHTML = '<div class="none">No media yet — try playing the video.</div>';
       }
@@ -535,8 +873,9 @@ const UGE_SCRIPT: &str = r##"
     }
     // Best stream first so the user usually only needs the top entry.
     items.sort(function (a, b) { return scoreOf(b) - scoreOf(a); });
+    const shown = items.slice(0, 24);
     list.innerHTML = '';
-    items.forEach(function (it, i) {
+    shown.forEach(function (it, i) {
       const div = document.createElement('div');
       div.className = 'item';
       const u = document.createElement('div');
@@ -544,24 +883,34 @@ const UGE_SCRIPT: &str = r##"
       u.textContent = (i === 0 ? '★ ' : '') + (it.url.length > 96 ? it.url.slice(0, 96) + '…' : it.url);
       const m = document.createElement('div');
       m.className = 'm';
-      const label = it.type && it.type.indexOf('/') !== -1 ? it.type.split('/')[1] : it.type;
-      m.textContent = label + ' · ' + it.via;
+      let label = it.type || '';
+      if (label.indexOf('/') !== -1) label = label.split('/')[1];
+      label = String(label).split(';')[0];
+      const kind = it.kind || 'video';
+      m.textContent = kind + ' · ' + label + ' · ' + it.via;
       div.appendChild(u);
       div.appendChild(m);
       div.onclick = function () {
-        report('resolved', { url: it.url, title: document.title || 'media' });
+        const mime = it.type && String(it.type).indexOf('/') !== -1 ? it.type : '';
+        report('resolved', { url: it.url, title: document.title || 'media', mime: mime, kind: kind });
       };
       list.appendChild(div);
     });
   };
+  scheduleRender();
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', scheduleRender);
+  }
 })();
 "##;
 
 #[cfg(test)]
 mod tests {
     use super::{
-        extension_from_url, extension_is_direct_media, is_candidate, is_manifest_url,
-        is_uge_media_url, parse_callback_url, safe_uge_filename,
+        classify_uge_url, extension_from_url, extension_is_direct_media, is_candidate,
+        is_manifest_url, is_non_media_extension, is_uge_media_url, needs_ytdlp_demux,
+        parse_callback_url, safe_uge_filename, UgeMediaClass, DIRECT_MEDIA_EXT, MANIFEST_EXT,
+        SEGMENT_EXT, UGE_SCRIPT,
     };
     use tauri::Url;
 
@@ -586,6 +935,11 @@ mod tests {
         );
         assert_eq!(extension_from_url("https://cdn.example.com/stream"), None);
         assert_eq!(extension_from_url("https://cdn.example.com/a.b.c"), None);
+        // A trailing slash must not hide the container.
+        assert_eq!(
+            extension_from_url("https://cdn.example.com/video.MP4/"),
+            Some("mp4".to_string())
+        );
     }
 
     #[test]
@@ -617,28 +971,70 @@ mod tests {
     fn manifest_and_segment_urls_are_pickable_media() {
         // The whole point of the UGE upgrade: HLS/DASH/TS are surfaced.
         assert!(is_uge_media_url("https://cdn.example.com/hls/index.m3u8"));
-        assert!(is_uge_media_url("https://cdn.example.com/hls/index.m3u8?token=abc"));
-        assert!(is_uge_media_url("https://cdn.example.com/dash/manifest.mpd"));
+        assert!(is_uge_media_url(
+            "https://cdn.example.com/hls/index.m3u8?token=abc"
+        ));
+        assert!(is_uge_media_url(
+            "https://cdn.example.com/dash/manifest.mpd"
+        ));
         assert!(is_uge_media_url("https://cdn.example.com/seg/00042.ts"));
         assert!(is_uge_media_url("https://cdn.example.com/v.mp4"));
         // fMP4/DASH init parts + raw segments recovered by later passes.
-        assert!(is_uge_media_url("https://cdn.example.com/seg/init.mp4?range=0-712"));
+        assert!(is_uge_media_url(
+            "https://cdn.example.com/seg/init.mp4?range=0-712"
+        ));
         assert!(is_uge_media_url("https://cdn.example.com/seg/chunk.m4s"));
         assert!(is_uge_media_url("https://cdn.example.com/seg/part.cmfv"));
         assert!(is_uge_media_url("https://cdn.example.com/a.weba"));
         assert!(is_uge_media_url("https://cdn.example.com/movie.mk3d"));
+        assert!(is_uge_media_url("https://cdn.example.com/hls/index.m3u"));
+        assert!(is_uge_media_url(
+            "https://cdn.example.com/live/manifest.f4m"
+        ));
+        assert!(is_uge_media_url("https://cdn.example.com/clip.avi"));
+        assert!(is_uge_media_url("https://cdn.example.com/video.mp4/"));
+        // Query-string filenames and format tokens, not just the path.
+        assert!(is_uge_media_url(
+            "https://cdn.example.com/download?file=clip.mp4"
+        ));
+        assert!(is_uge_media_url("https://cdn.example.com/live?format=m3u8"));
+        assert!(is_uge_media_url(
+            "https://cdn.example.com/videoplayback?id=abc&mime=video%2Fmp4"
+        ));
         assert!(!is_uge_media_url("https://cdn.example.com/page"));
         assert!(!is_uge_media_url("https://cdn.example.com/api/playlist"));
+        assert!(!is_uge_media_url("https://cdn.example.com/media/logo.png"));
+        assert!(!is_uge_media_url(
+            "https://cdn.example.com/thumb.jpg?format=mp4"
+        ));
         assert!(!is_uge_media_url("not a url"));
+        assert_eq!(
+            classify_uge_url("https://cdn.example.com/live?format=m3u8"),
+            Some(UgeMediaClass::Manifest)
+        );
+        assert_eq!(
+            classify_uge_url("https://cdn.example.com/seg/00001.ts"),
+            Some(UgeMediaClass::Segment)
+        );
+        assert!(is_non_media_extension("JPG"));
+        assert!(!is_non_media_extension("mp4"));
     }
 
     #[test]
     fn manifest_urls_are_detected_for_ytdlp_routing() {
         assert!(is_manifest_url("https://cdn.example.com/hls/index.m3u8"));
-        assert!(is_manifest_url("https://cdn.example.com/dash/manifest.mpd?token=x"));
+        assert!(is_manifest_url(
+            "https://cdn.example.com/dash/manifest.mpd?token=x"
+        ));
+        assert!(is_manifest_url("https://cdn.example.com/live?format=hls"));
+        assert!(is_manifest_url("https://cdn.example.com/p/master.m3u8/"));
         assert!(!is_manifest_url("https://cdn.example.com/v.mp4"));
         assert!(!is_manifest_url("https://cdn.example.com/seg/00042.ts"));
         assert!(!is_manifest_url("https://cdn.example.com/page"));
+        // A blog post that merely discusses the format is not a manifest.
+        assert!(!is_manifest_url(
+            "https://example.com/blog/what-is-an-m3u8-file"
+        ));
     }
 
     #[test]
@@ -646,11 +1042,21 @@ mod tests {
         // Playable containers pass; manifests/segments need yt-dlp demux.
         assert!(extension_is_direct_media("https://cdn.example.com/v.mp4"));
         assert!(extension_is_direct_media("https://cdn.example.com/a.weba"));
-        assert!(extension_is_direct_media("https://cdn.example.com/movie.mk3d"));
-        assert!(!extension_is_direct_media("https://cdn.example.com/hls/index.m3u8"));
-        assert!(!extension_is_direct_media("https://cdn.example.com/dash/manifest.mpd"));
-        assert!(!extension_is_direct_media("https://cdn.example.com/seg/00042.ts"));
-        assert!(!extension_is_direct_media("https://cdn.example.com/seg/chunk.m4s"));
+        assert!(extension_is_direct_media(
+            "https://cdn.example.com/movie.mk3d"
+        ));
+        assert!(!extension_is_direct_media(
+            "https://cdn.example.com/hls/index.m3u8"
+        ));
+        assert!(!extension_is_direct_media(
+            "https://cdn.example.com/dash/manifest.mpd"
+        ));
+        assert!(!extension_is_direct_media(
+            "https://cdn.example.com/seg/00042.ts"
+        ));
+        assert!(!extension_is_direct_media(
+            "https://cdn.example.com/seg/chunk.m4s"
+        ));
         assert!(!extension_is_direct_media("https://cdn.example.com/page"));
     }
 
@@ -666,9 +1072,14 @@ mod tests {
             safe_uge_filename("Movie", "https://cdn.example.com/manifest.mpd"),
             "Movie.mp4"
         );
+        // A fragment is saved as itself: renaming it to .mp4 makes it unplayable.
         assert_eq!(
             safe_uge_filename("Segment", "https://cdn.example.com/seg/00001.ts"),
-            "Segment.mp4"
+            "Segment.ts"
+        );
+        assert_eq!(
+            safe_uge_filename("Chunk", "https://cdn.example.com/seg/chunk.m4s"),
+            "Chunk.m4s"
         );
         // A genuine container extension is still preserved.
         assert_eq!(
@@ -686,6 +1097,72 @@ mod tests {
         let resolved = parse_callback_url(&callback).unwrap();
         assert_eq!(resolved.url, "https://cdn.example.com/v.mp4?e=1");
         assert_eq!(resolved.filename, "A_B_ C.mp4");
+        assert_eq!(resolved.media_class, UgeMediaClass::Direct);
+        assert!(!needs_ytdlp_demux(&resolved));
+    }
+
+    #[test]
+    fn extensionless_stream_needs_an_observed_media_mime() {
+        let sniffed = Url::parse(
+            "cobalt-uge://resolved/?url=https%3A%2F%2Fcdn.example.com%2Fget%3Fid%3D1&title=Show&mime=video%2Fmp4",
+        )
+        .unwrap();
+        let resolved = parse_callback_url(&sniffed).unwrap();
+        assert_eq!(resolved.media_class, UgeMediaClass::Direct);
+        assert_eq!(resolved.filename, "Show.mp4");
+
+        let playlist = Url::parse(
+            "cobalt-uge://resolved/?url=https%3A%2F%2Fcdn.example.com%2Fapi%2Fplaylist&title=Live&mime=application%2Fvnd.apple.mpegurl",
+        )
+        .unwrap();
+        let manifest = parse_callback_url(&playlist).unwrap();
+        assert_eq!(manifest.media_class, UgeMediaClass::Manifest);
+        assert!(needs_ytdlp_demux(&manifest));
+
+        let html = Url::parse(
+            "cobalt-uge://resolved/?url=https%3A%2F%2Fcdn.example.com%2Farticle&title=Hi&mime=text%2Fhtml",
+        )
+        .unwrap();
+        assert_eq!(
+            parse_callback_url(&html).unwrap_err(),
+            "Manual extraction returned a non-media URL"
+        );
+
+        // A jpeg is not promoted by a spoofed video mime.
+        let jpeg = Url::parse(
+            "cobalt-uge://resolved/?url=https%3A%2F%2Fcdn.example.com%2Fmedia%2Flogo.jpg&mime=video%2Fmp4",
+        )
+        .unwrap();
+        assert!(parse_callback_url(&jpeg).is_err());
+    }
+
+    #[test]
+    fn injected_script_lists_every_classified_extension() {
+        fn listed(ext: &str) -> bool {
+            let patterns = [
+                format!("({ext}|"),
+                format!("|{ext}|"),
+                format!("|{ext})"),
+                format!(".{ext}(\\"),
+            ];
+            patterns.iter().any(|pattern| UGE_SCRIPT.contains(pattern))
+        }
+        for ext in DIRECT_MEDIA_EXT
+            .iter()
+            .chain(MANIFEST_EXT.iter())
+            .chain(SEGMENT_EXT.iter())
+        {
+            assert!(listed(ext), "injected script is missing .{ext}");
+        }
+        assert!(UGE_SCRIPT.contains("origOpen.apply"));
+        assert!(UGE_SCRIPT.contains("mime: mime"));
+        assert!(UGE_SCRIPT.contains("#EXTM3U"));
+        assert!(UGE_SCRIPT.contains("if (!variants && sample)"));
+        assert!(UGE_SCRIPT.contains("visitRoot"));
+        // Broad path tokens were dropping thumbnails into the picker.
+        assert!(!UGE_SCRIPT.contains("\\/media\\/"));
+        assert!(!UGE_SCRIPT.contains("\\/video\\/"));
+        assert!(!UGE_SCRIPT.contains("GENERIC_MEDIA_HINT"));
     }
 
     #[test]
