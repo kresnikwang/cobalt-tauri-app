@@ -2191,7 +2191,13 @@ async fn try_local_ytdlp_download(
                 return Ok(true);
             }
             task.title = provisional_filename.clone();
-            task.status = "downloading".to_string();
+            // yt-dlp spends 15-30s resolving before the first `[download] X%`
+            // line exists (webpage + player API + JS challenge for YouTube).
+            // Reporting "downloading" here shows a frozen "0 B/s" bar that reads
+            // as a hang. "analyzing" shows the honest "connecting" state; the
+            // progress parser flips this to "downloading" on the first real
+            // progress line.
+            task.status = "analyzing".to_string();
             task.output_path = Some(provisional_path.to_string_lossy().into_owned());
             task.total_bytes = 0;
             task.progress = 0.0;
@@ -2223,7 +2229,12 @@ async fn try_local_ytdlp_download(
         remove_ytdlp_partial_files(&save_path, &output_stem);
     }
     write_resume_marker(&save_path, &output_stem, &fingerprint);
-    let cookie_attempts = configured_cookie_attempts(&settings, is_bilibili)?;
+    // YouTube now hard-gates playback behind a signed-in browser ("Sign in to
+    // confirm you're not a bot"), so an anonymous first attempt is a guaranteed
+    // failure that still burns a full extraction cycle (webpage + player API +
+    // JS challenge, ~15-30s). Put the logged-in browser first, exactly like
+    // Bilibili, so the first attempt succeeds instead of stalling.
+    let cookie_attempts = configured_cookie_attempts(&settings, is_bilibili || is_youtube)?;
     let mut last_error = String::from("Local yt-dlp download failed");
 
     for cookies in cookie_attempts {
