@@ -85,7 +85,7 @@ async function ensureYtDlp() {
   // git-ignored, so there is no local yt-dlp to verify. Download the
   // official static macOS arm64 build instead of failing the job.
   const overrideUrl = process.env.YT_DLP_URL?.trim();
-  const version = process.env.YT_DLP_VERSION?.trim() || "2025.11.12";
+  const version = process.env.YT_DLP_VERSION?.trim() || "2026.08.19";
   const platform = process.platform;
   const arch = process.arch;
   let url = overrideUrl;

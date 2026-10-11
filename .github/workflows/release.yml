@@ -28,7 +28,7 @@ jobs:
     timeout-minutes: 90
     env:
       CI: 'true'
-      YT_DLP_VERSION: '2025.11.12'
+      YT_DLP_VERSION: '2026.08.19'
       PYTHON_BUILD_TAG: '20261003'
       PYTHON_VERSION: '3.12.15'
       GALLERY_DL_VERSION: '1.32.16'
