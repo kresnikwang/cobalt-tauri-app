@@ -765,10 +765,10 @@ async fn probe_ytdlp_url(
     })
 }
 
-/// Ask yt-dlp whether a URL expands to a playlist / collection / multi-part
-/// video. `--flat-playlist` keeps this to a single request (no per-video
-/// resolution), which is what makes it cheap enough to run before every
-/// supported download. Returns `None` for ordinary single videos.
+/// Ask yt-dlp what a URL resolves to (`--flat-playlist --dump-single-json`,
+/// one cheap request, no per-video resolution). The full probe is returned for
+/// single videos too, so the caller gets the display title / output filename
+/// from the same process that decides playlist-vs-single.
 async fn probe_ytdlp_playlist(
     ytdlp_path: &std::path::Path,
     node_path: Option<&std::path::Path>,
@@ -805,8 +805,7 @@ async fn probe_ytdlp_playlist(
         return None;
     }
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
-    let probe = playlist::parse_probe(&json);
-    probe.is_playlist.then_some(probe)
+    Some(playlist::parse_probe(&json))
 }
 
 /// Expand a playlist task into one task per selected episode.
@@ -2100,6 +2099,7 @@ async fn try_local_ytdlp_download(
     app_handle: &tauri::AppHandle,
     generic_probe: Option<YtdlpProbe>,
     referer: Option<&str>,
+    probe_title: Option<&str>,
 ) -> Result<bool, String> {
     let playlist_item = {
         let state_lock = state.lock().unwrap_or_else(|error| error.into_inner());
@@ -2142,14 +2142,6 @@ async fn try_local_ytdlp_download(
         generic_probe.as_ref().map(|probe| probe.video_id.clone())
     }
     .unwrap_or_else(|| id.clone());
-    if let Some(probe) = generic_probe.as_ref() {
-        // Show the real video title instead of a bare file stem.
-        let mut state_lock = state.lock().unwrap_or_else(|error| error.into_inner());
-        if let Some(task) = state_lock.tasks.get_mut(&id) {
-            task.title = probe.title.clone();
-            let _ = app_handle.emit("task-updated", task.clone());
-        }
-    }
     let audio_format = ytdlp_audio_format(settings);
     let playlist_index = {
         let state_lock = state.lock().unwrap_or_else(|error| error.into_inner());
@@ -2163,12 +2155,55 @@ async fn try_local_ytdlp_download(
         std::fs::create_dir_all(&save_path).ok();
     }
 
+    // Name the output after the real video title whenever one is known: the
+    // metadata probe (single downloads), the generic extractor probe, or the
+    // name the episode picker already gave this task. Without one, the old
+    // engine+ID stem stays as the fallback.
+    let state_task_title = {
+        let state_lock = state.lock().unwrap_or_else(|error| error.into_inner());
+        state_lock.tasks.get(&id).map(|task| task.title.clone())
+    };
+    let mut display_title = probe_title
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            generic_probe
+                .as_ref()
+                .map(|probe| probe.title.trim())
+                .filter(|title| !title.is_empty())
+                .map(str::to_string)
+        });
+    if playlist_index.is_some() {
+        // Episodes were named by the picker (entry title or an "Episode N"
+        // fallback); fresh single tasks still carry the "Analyzing URL..."
+        // placeholder and must not name files after it.
+        let picker_title = state_task_title
+            .as_deref()
+            .map(str::trim)
+            .filter(|title| {
+                !title.is_empty()
+                    && !title.starts_with("Analyzing")
+                    && !title.starts_with("Extracting")
+            })
+            .map(str::to_string);
+        if picker_title.is_some() {
+            display_title = picker_title;
+        }
+    }
+
     // Use yt-dlp's %(ext)s so best-quality AV1/VP9 merges can land as mkv/webm, not forced .mp4.
     // An episode of a playlist keeps its position in the name so sibling episodes never
     // collide, and so re-queuing the same episode resumes its `.part` file.
-    let stem_base = match playlist_index {
-        Some(index) => format!("{}_{}_{}", source_prefix, index, video_id),
-        None => format!("{}_{}", source_prefix, video_id),
+    let title_stem = display_title
+        .as_deref()
+        .map(sanitize_title_component)
+        .filter(|stem| !stem.is_empty());
+    let stem_base = match (title_stem, playlist_index) {
+        (Some(title), Some(index)) => format!("{index:02} - {title}"),
+        (Some(title), None) => title,
+        (None, Some(index)) => format!("{}_{}_{}", source_prefix, index, video_id),
+        (None, None) => format!("{}_{}", source_prefix, video_id),
     };
     let output_stem = claim_ytdlp_stem(state, &save_path, &stem_base);
     let output_template = save_path.join(format!("{}.%(ext)s", output_stem));
@@ -2564,6 +2599,46 @@ async fn try_local_ytdlp_download(
 // -----------------------------------------------------------
 // gallery-dl (image / gallery engine)
 // -----------------------------------------------------------
+
+/// Turn a probed video title into a filename-safe component. Unicode letters
+/// and digits survive (a Chinese title must not degrade into underscores);
+/// filesystem-hostile characters (`/ \ : " * ? < > |`, control characters) and
+/// any other punctuation fall back to spaces, runs collapse, and the result is
+/// capped at 150 UTF-8 bytes so the ` (n)` / `.part` / subtitle sidecar
+/// suffixes still fit inside a 255-byte name. Empty output means "no usable
+/// title" and the caller keeps its ID-based fallback stem.
+fn sanitize_title_component(raw: &str) -> String {
+    const MAX_BYTES: usize = 150;
+    let mut cleaned = String::new();
+    let mut last_was_space = true;
+    for ch in raw.chars() {
+        let mapped = if ch.is_alphanumeric()
+            || matches!(
+                ch,
+                '-' | '_' | '.' | '(' | ')' | '[' | ']' | '\'' | '&' | '#' | '@' | '!' | '+' | '~' | ','
+            ) {
+            ch
+        } else {
+            ' '
+        };
+        if mapped == ' ' {
+            if !last_was_space && !cleaned.is_empty() {
+                cleaned.push(' ');
+                last_was_space = true;
+            }
+        } else if cleaned.len() + ch.len_utf8() <= MAX_BYTES {
+            cleaned.push(mapped);
+            last_was_space = false;
+        } else {
+            break;
+        }
+    }
+    cleaned
+        .trim()
+        .trim_end_matches('.')
+        .trim()
+        .to_string()
+}
 
 fn sanitize_path_component(raw: &str) -> String {
     let cleaned: String = raw
@@ -3383,7 +3458,11 @@ async fn run_download_task(id: String, state: Arc<Mutex<AppState>>, app_handle: 
                 .get(&id)
                 .and_then(|task| task.playlist_index)
         };
-        if should_offer_playlist(&settings, existing_index) {
+        // One metadata probe per download doubles as playlist detection and
+        // the source of the output filename's title. Episodes are already
+        // named by the picker, so they skip the extra process.
+        let mut probed_title: Option<String> = None;
+        if existing_index.is_none() {
             if let Some(ytdlp_path) = resolve_ytdlp_path(&app_handle) {
                 let node_path = resolve_node_path(&app_handle);
                 if let Some(probe) = probe_ytdlp_playlist(
@@ -3394,12 +3473,40 @@ async fn run_download_task(id: String, state: Arc<Mutex<AppState>>, app_handle: 
                 )
                 .await
                 {
-                    println!(
-                        "{}: '{}' expands to {} episodes; asking which to keep",
-                        local_source_name, probe.title, probe.count
-                    );
-                    resolve_playlist_selection(id, probe, &state, &app_handle).await;
-                    return;
+                    if probe.is_playlist {
+                        if should_offer_playlist(&settings, existing_index) {
+                            println!(
+                                "{}: '{}' expands to {} episodes; asking which to keep",
+                                local_source_name, probe.title, probe.count
+                            );
+                            resolve_playlist_selection(id, probe, &state, &app_handle).await;
+                            return;
+                        }
+                        // The picker is off: the `--no-playlist` download below
+                        // fetches one entry, so name the file after that exact
+                        // entry — the one the URL points at when it carries a
+                        // video id (`watch?v=X&list=…`), otherwise the first
+                        // (multi-part videos and bare playlist URLs).
+                        let url_video_id = if is_youtube_url(&url_to_download) {
+                            youtube_video_id(&url_to_download)
+                        } else if is_bilibili_url(&url_to_download) {
+                            bilibili_video_id(&url_to_download)
+                        } else {
+                            dailymotion_video_id(&url_to_download)
+                        };
+                        let entry = url_video_id
+                            .as_deref()
+                            .and_then(|vid| probe.entries.iter().find(|e| e.id == vid))
+                            .or_else(|| probe.entries.first());
+                        probed_title = entry
+                            .map(|e| e.title.clone())
+                            .filter(|title| !title.is_empty())
+                            .or_else(|| {
+                                (!probe.title.is_empty()).then(|| probe.title.clone())
+                            });
+                    } else if !probe.title.is_empty() {
+                        probed_title = Some(probe.title);
+                    }
                 }
             }
         }
@@ -3412,6 +3519,7 @@ async fn run_download_task(id: String, state: Arc<Mutex<AppState>>, app_handle: 
             &app_handle,
             None,
             None,
+            probed_title.as_deref(),
         )
         .await
         {
@@ -3457,6 +3565,7 @@ async fn run_download_task(id: String, state: Arc<Mutex<AppState>>, app_handle: 
             &settings,
             &state,
             &app_handle,
+            None,
             None,
             None,
         )
@@ -3641,12 +3750,15 @@ async fn run_download_task(id: String, state: Arc<Mutex<AppState>>, app_handle: 
                     )
                     .await
                     {
-                        println!(
-                            "Generic yt-dlp: '{}' expands to {} episodes; asking which to keep",
-                            playlist_probe.title, playlist_probe.count
-                        );
-                        resolve_playlist_selection(id, playlist_probe, &state, &app_handle).await;
-                        return;
+                        if playlist_probe.is_playlist {
+                            println!(
+                                "Generic yt-dlp: '{}' expands to {} episodes; asking which to keep",
+                                playlist_probe.title, playlist_probe.count
+                            );
+                            resolve_playlist_selection(id, playlist_probe, &state, &app_handle)
+                                .await;
+                            return;
+                        }
                     }
                 }
                 if let Some(probe) = probe_ytdlp_url(
@@ -3669,6 +3781,7 @@ async fn run_download_task(id: String, state: Arc<Mutex<AppState>>, app_handle: 
                         &state,
                         &app_handle,
                         Some(probe),
+                        None,
                         None,
                     )
                     .await
@@ -4690,6 +4803,24 @@ fn clear_completed(state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Vec<Downloa
         .collect()
 }
 
+/// The active task already downloading this exact URL, if any. Used to fold
+/// duplicate enqueues (a deep link reaching more than one listener, a clipboard
+/// toast racing its own link) into a single download. Settled tasks never
+/// match, so re-downloading a finished URL stays possible.
+fn find_active_duplicate<'a>(
+    tasks: &'a std::collections::HashMap<String, DownloadTask>,
+    url: &str,
+) -> Option<&'a DownloadTask> {
+    let url = url.trim();
+    tasks.values().find(|task| {
+        task.url.trim() == url
+            && matches!(
+                task.status.as_str(),
+                "queued" | "analyzing" | "downloading" | "merging"
+            )
+    })
+}
+
 /// Create and queue a download task. Shared by the UI, the tray menu and
 /// `cobalt://` deep links so every entry point behaves identically.
 fn enqueue_download(
@@ -4697,6 +4828,16 @@ fn enqueue_download(
     state: &Arc<Mutex<AppState>>,
     app_handle: &tauri::AppHandle,
 ) -> DownloadTask {
+    let trimmed_url = url.trim().to_string();
+    // The duplicate check and the insert share one lock acquisition, making
+    // this atomic against concurrent enqueues of the same URL.
+    {
+        let state_lock = state.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(existing) = find_active_duplicate(&state_lock.tasks, &trimmed_url) {
+            return existing.clone();
+        }
+    }
+
     let id = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -4705,7 +4846,7 @@ fn enqueue_download(
 
     let task = DownloadTask {
         id: id.clone(),
-        url: url.trim().to_string(),
+        url: trimmed_url,
         title: "Analyzing URL...".to_string(),
         status: "queued".to_string(),
         progress: 0.0,
@@ -4829,6 +4970,7 @@ async fn start_manual_extraction(
                             &app_handle,
                             Some(probe),
                             Some(page_url.as_str()),
+                            None,
                         )
                         .await
                         {
@@ -5673,8 +5815,9 @@ pub fn run() {
 mod tests {
     use super::{
         api_request_url, decode_wechat_file, deep_link_target_url, direct_body_rejection,
-        extractor_display_name, first_http_url, generic_extraction_is_playable, generic_video_id,
-        is_ytdlp_probe_blocked, migrate_legacy_api_url, remove_task_partial_files, request_origin,
+        extractor_display_name, find_active_duplicate, first_http_url,
+        generic_extraction_is_playable, generic_video_id, is_ytdlp_probe_blocked,
+        migrate_legacy_api_url, remove_task_partial_files, request_origin, sanitize_title_component,
         sponsorblock_args, xor_wechat_isaac64_prefix, ytdlp_dump_is_playlist, AppState,
         DownloadTask, Isaac64, Settings,
     };
@@ -5828,6 +5971,50 @@ mod tests {
             Some("https://example.com/a".to_string())
         );
         assert_eq!(first_http_url("no links here"), None);
+    }
+
+    #[test]
+    fn duplicate_active_tasks_are_folded_together() {
+        let mut tasks = HashMap::new();
+        tasks.insert("task-1".to_string(), test_task("downloading", None));
+        // Same URL while still active: fold the duplicate in.
+        assert_eq!(
+            find_active_duplicate(&tasks, "https://example.com/video/1").map(|t| t.id.as_str()),
+            Some("task-1")
+        );
+        // Whitespace differences must not defeat the check.
+        assert!(find_active_duplicate(&tasks, "  https://example.com/video/1 ").is_some());
+        // A different URL is never a duplicate.
+        assert!(find_active_duplicate(&tasks, "https://example.com/other").is_none());
+        // Settled states never match, so retrying a finished URL stays possible.
+        for status in ["completed", "failed", "cancelled"] {
+            let mut settled = HashMap::new();
+            settled.insert("task-1".to_string(), test_task(status, None));
+            assert!(find_active_duplicate(&settled, "https://example.com/video/1").is_none());
+        }
+    }
+
+    #[test]
+    fn title_components_are_sanitized_for_filenames() {
+        // Filesystem-hostile characters collapse; unicode letters survive.
+        assert_eq!(
+            sanitize_title_component("EP/3: \"为什么\" <实验>?"),
+            "EP 3 为什么 实验"
+        );
+        // Runs of separators collapse; leading/trailing noise and dots drop.
+        assert_eq!(
+            sanitize_title_component("  A/B\\C:D | E... "),
+            "A B C D E"
+        );
+        // A title made only of filesystem-hostile characters reports empty so
+        // the caller keeps its ID-based fallback stem.
+        assert_eq!(sanitize_title_component("///:::*?<>|"), "");
+        // Emoji are decoration, not letters: they become separators.
+        assert_eq!(sanitize_title_component("Video 🎬 HD"), "Video HD");
+        // Long titles cap at 150 bytes (50 CJK characters) instead of
+        // overflowing the filename once ` (n)` / `.part` suffixes append.
+        assert_eq!(sanitize_title_component(&"字".repeat(300)).len(), "字".repeat(50).len());
+        assert_eq!(sanitize_title_component(&"x".repeat(300)).len(), 150);
     }
 
     #[test]

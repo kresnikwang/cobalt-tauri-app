@@ -225,13 +225,10 @@
             // A background engine update landed: show the new version.
             refreshEngine();
           }),
-          listen('deep-link://new-url', (event) => {
-            const urls = (event.payload as unknown as string[]) ?? [];
-            for (const raw of urls) {
-              const target = deepLinkTarget(raw);
-              if (target) { handleDownload(target); }
-            }
-          }),
+          // Deep links are intentionally NOT handled here: the backend's
+          // register_deep_link enqueues them (it also covers a cold launch
+          // before this webview exists), and a second listener meant one link
+          // started two identical downloads.
         ].map(subscription => subscription.then(unlisten => {
           if (disposed) unlisten();
           else unlisteners.push(unlisten);
@@ -285,21 +282,6 @@
     const id = ++toastSeq;
     clipboardToasts = [...clipboardToasts, { id, url: clean }].slice(-TOAST_MAX);
     toastTimers.push(setTimeout(() => dismissToast(id), TOAST_TTL_MS));
-  }
-
-  // --- Actions ----------------------------------------------------------
-  /** Accept `cobalt://download?url=<encoded>` (browsers, Shortcuts, Alfred). */
-  function deepLinkTarget(raw: string): string | null {
-    const value = (raw ?? '').trim();
-    if (!value) return null;
-    if (/^https?:\/\//i.test(value)) return value;
-    try {
-      const parsed = new URL(value);
-      const target = parsed.searchParams.get('url');
-      return target && /^https?:\/\//i.test(target) ? target : null;
-    } catch {
-      return null;
-    }
   }
 
   // --- Playlist episode picker -----------------------------------------
